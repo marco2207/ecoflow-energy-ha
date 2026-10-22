@@ -1,0 +1,326 @@
+"""Delta 2 Max IoT-API JSON report parser.
+
+Parses JSON reports from the EcoFlow IoT platform for Delta-series devices.
+The IoT API sends individual reports per module:
+  {"typeCode": "pdStatus",   "params": {"soc": 85, "wattsInSum": 200, ...}}
+  {"typeCode": "invStatus",  "params": {"outputWatts": 109, ...}}
+  {"typeCode": "bmsStatus",  "params": {"vol": 52000, "temp": 40, ...}}
+  {"typeCode": "mpptStatus", "params": {"inWatts": 300, ...}}
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
+
+# --- State value mappings (numeric -> enum string) ---
+
+_DELTA_CHG_DSG_MAP: dict[int, str] = {
+    0: "idle",
+    1: "discharging",
+    2: "charging",
+}
+
+_DELTA_CHARGER_TYPE_MAP: dict[int, str] = {
+    0: "none",
+    1: "ac",
+    2: "solar",
+    3: "dc",
+    255: "unknown",
+}
+
+_DELTA_MPPT_CHG_MAP: dict[int, str] = {
+    0: "idle",
+    1: "charging",
+}
+
+# The EMS charge state carries a fourth value the battery's own charge and
+# discharge state has never been seen to use. A Delta 2 Max reports 3, and
+# what it means is open (#287).
+#
+# It was briefly shipped as "standby" and is withdrawn. The owner had
+# described his station that way and then corrected himself: his EcoFlow app
+# never showed that word, and the reading was his own description of a unit
+# on AC power that was neither charging nor discharging. His capture then
+# offered a different explanation for the same moment - `maxChargeSoc` at 60
+# with the pack sitting at 60 - so the state may be a battery at its charge
+# limit rather than a station at rest. One frame, two readings that fit, and
+# no way to choose between them yet.
+#
+# So it stays dropped. An entity that says nothing is recoverable; a wrong
+# label in somebody's dashboard and history is not, and this file already
+# says as much about the values it does name.
+#
+# What would settle it: the value observed while the pack is below its
+# charge limit on AC power. If 3 appears there too, it is a resting state;
+# if the reading is something else, 3 belongs to the limit.
+_DELTA_EMS_CHG_STATE_MAP: dict[int, str] = dict(_DELTA_CHG_DSG_MAP)
+
+_DELTA_ENUM_FIELDS: dict[str, dict[int, str]] = {
+    "chg_dsg_state": _DELTA_CHG_DSG_MAP,
+    "ems_chg_state": _DELTA_EMS_CHG_STATE_MAP,
+    "charger_type": _DELTA_CHARGER_TYPE_MAP,
+    "mppt_chg_state": _DELTA_MPPT_CHG_MAP,
+}
+
+# Field map: "typeCode.paramKey" -> destination key
+DELTA2MAX_FIELD_MAP: dict[str, str] = {
+    # --- pdStatus (pd.*) ---
+    "pdStatus.soc": "soc",
+    "pdStatus.wattsInSum": "watts_in_sum",
+    "pdStatus.wattsOutSum": "watts_out_sum",
+    "pdStatus.remainTime": "remain_time_min",
+    "pdStatus.usb1Watts": "usb1_w",
+    "pdStatus.usb2Watts": "usb2_w",
+    "pdStatus.qcUsb1Watts": "usb_qc1_w",
+    "pdStatus.qcUsb2Watts": "usb_qc2_w",
+    "pdStatus.typec1Watts": "typec1_w",
+    "pdStatus.typec2Watts": "typec2_w",
+    "pdStatus.dcOutState": "dc_out_enabled",
+    "pdStatus.carWatts": "car_out_w",
+    "pdStatus.chgDsgState": "chg_dsg_state",
+    "pdStatus.errCode": "pd_err_code",
+    "pdStatus.beepMode": "beep_mode_raw",
+    "pdStatus.newAcAutoOnCfg": "ac_auto_on",
+    "pdStatus.acAutoOutConfig": "ac_auto_on_legacy",
+    "pdStatus.standbyMin": "standby_timeout_min",
+    "pdStatus.brightLevel": "screen_brightness",
+    "pdStatus.lcdOffSec": "screen_timeout_sec",
+    "pdStatus.bpPowerSoc": "backup_reserve_soc",
+    "pdStatus.watchIsConfig": "backup_reserve_enabled",
+    # --- invStatus (inv.*) ---
+    "invStatus.inputWatts": "ac_in_w",
+    "invStatus.outputWatts": "ac_out_w",
+    "invStatus.invOutVol": "ac_out_vol_mv",
+    "invStatus.invOutAmp": "ac_out_amp_ma",
+    "invStatus.invOutFreq": "ac_out_freq_hz",
+    "invStatus.acInVol": "ac_in_vol_mv",
+    "invStatus.acInAmp": "ac_in_amp_ma",
+    "invStatus.acInFreq": "ac_in_freq_hz",
+    "invStatus.cfgAcEnabled": "ac_enabled",
+    "invStatus.cfgAcXboost": "ac_xboost",
+    "invStatus.outTemp": "inv_out_temp_c",
+    "invStatus.dcInVol": "dc_in_vol_mv",
+    "invStatus.dcInTemp": "dc_in_temp_c",
+    "invStatus.fanState": "inv_fan_state",
+    "invStatus.cfgAcOutVol": "ac_cfg_out_vol_mv",
+    "invStatus.chargerType": "charger_type",
+    "invStatus.acChgRatedPower": "ac_chg_rated_power_w",
+    # Configured AC charge speed (issue #95). The HTTP quota uses the
+    # capitalized keys (inv.FastChgWatts / inv.SlowChgWatts); both casings
+    # are mapped here since WSS report casing may differ per firmware.
+    "invStatus.FastChgWatts": "ac_fast_chg_watts",
+    "invStatus.SlowChgWatts": "ac_slow_chg_watts",
+    "invStatus.fastChgWatts": "ac_fast_chg_watts",
+    "invStatus.slowChgWatts": "ac_slow_chg_watts",
+    "invStatus.errCode": "inv_err_code",
+    # --- bmsStatus (bms.*) ---
+    "bmsStatus.vol": "batt_voltage_mv",
+    "bmsStatus.amp": "batt_current_ma",
+    "bmsStatus.temp": "batt_temp_raw",
+    "bmsStatus.soc": "bms_soc",
+    "bmsStatus.soh": "bms_soh_pct",
+    "bmsStatus.cycles": "bms_cycles",
+    "bmsStatus.maxCellTemp": "batt_max_cell_temp_c",
+    "bmsStatus.minCellTemp": "batt_min_cell_temp_c",
+    "bmsStatus.maxCellVol": "batt_max_cell_vol_mv",
+    "bmsStatus.minCellVol": "batt_min_cell_vol_mv",
+    "bmsStatus.maxMosTemp": "batt_max_mos_temp_c",
+    "bmsStatus.remainCap": "batt_remain_cap_mah",
+    "bmsStatus.fullCap": "batt_full_cap_mah",
+    "bmsStatus.designCap": "batt_design_cap_mah",
+    "bmsStatus.errCode": "bms_err_code",
+    "bmsStatus.f32ShowSoc": "bms_precise_soc",
+    # --- mpptStatus (mppt.*) ---
+    "mpptStatus.inWatts": "solar_in_w",
+    "mpptStatus.outWatts": "mppt_out_w",
+    "mpptStatus.inVol": "solar_in_vol_mv",
+    "mpptStatus.inAmp": "solar_in_amp_ma",
+    "mpptStatus.mpptTemp": "mppt_temp_c",
+    "mpptStatus.carOutWatts": "car_12v_out_w",
+    "mpptStatus.carState": "car_12v_enabled",
+    "mpptStatus.dcdc12vWatts": "dcdc_12v_w",
+    "mpptStatus.dcdc12vVol": "dcdc_12v_vol_dv",
+    "mpptStatus.pv2InWatts": "solar2_in_w",
+    "mpptStatus.pv2InVol": "solar2_in_vol_mv",
+    "mpptStatus.pv2InAmp": "solar2_in_amp_ma",
+    "mpptStatus.pv2MpptTemp": "solar2_mppt_temp_c",
+    "mpptStatus.carStandbyMin": "car_standby_min",
+    "mpptStatus.chgState": "mppt_chg_state",
+    "mpptStatus.faultCode": "mppt_fault_code",
+    # Legacy R331 (Delta 2 / Delta Max): AC/Beeper state can be reported under mppt.*
+    "mpptStatus.cfgAcEnabled": "ac_enabled_legacy",
+    "mpptStatus.cfgAcXboost": "ac_xboost_legacy",
+    "mpptStatus.cfgAcOutFreq": "ac_out_freq_hz_legacy",
+    "mpptStatus.beepState": "beep_mode_raw_legacy",
+    # --- emsStatus (ems.*) ---
+    "emsStatus.chgRemainTime": "chg_remain_time_min",
+    "emsStatus.dsgRemainTime": "dsg_remain_time_min",
+    "emsStatus.maxChargeSoc": "max_charge_soc",
+    "emsStatus.minDsgSoc": "min_discharge_soc",
+    "emsStatus.lcdShowSoc": "ems_lcd_soc",
+    "emsStatus.f32LcdShowSoc": "ems_precise_soc",
+    "emsStatus.chgState": "ems_chg_state",
+    "emsStatus.fanLevel": "fan_level",
+    "emsStatus.openUpsFlag": "ups_enabled",
+    # --- bmsSlaveStatus_1 (Slave Battery Pack 1) ---
+    "bmsSlaveStatus_1.soc": "slave1_soc",
+    "bmsSlaveStatus_1.vol": "slave1_voltage_mv",
+    "bmsSlaveStatus_1.amp": "slave1_current_ma",
+    "bmsSlaveStatus_1.temp": "slave1_temp_raw",
+    "bmsSlaveStatus_1.soh": "slave1_soh",
+    "bmsSlaveStatus_1.cycles": "slave1_cycles",
+    "bmsSlaveStatus_1.inputWatts": "slave1_in_w",
+    "bmsSlaveStatus_1.outputWatts": "slave1_out_w",
+    "bmsSlaveStatus_1.remainCap": "slave1_remain_cap_mah",
+    "bmsSlaveStatus_1.fullCap": "slave1_full_cap_mah",
+    "bmsSlaveStatus_1.maxCellVol": "slave1_max_cell_vol_mv",
+    "bmsSlaveStatus_1.minCellVol": "slave1_min_cell_vol_mv",
+    "bmsSlaveStatus_1.maxCellTemp": "slave1_max_cell_temp_c",
+    "bmsSlaveStatus_1.minCellTemp": "slave1_min_cell_temp_c",
+    "bmsSlaveStatus_1.maxMosTemp": "slave1_max_mos_temp_c",
+    "bmsSlaveStatus_1.errCode": "slave1_err_code",
+    # --- bmsSlaveStatus_2 (Slave Battery Pack 2) ---
+    "bmsSlaveStatus_2.soc": "slave2_soc",
+    "bmsSlaveStatus_2.vol": "slave2_voltage_mv",
+    "bmsSlaveStatus_2.amp": "slave2_current_ma",
+    "bmsSlaveStatus_2.temp": "slave2_temp_raw",
+    "bmsSlaveStatus_2.soh": "slave2_soh",
+    "bmsSlaveStatus_2.cycles": "slave2_cycles",
+    "bmsSlaveStatus_2.inputWatts": "slave2_in_w",
+    "bmsSlaveStatus_2.outputWatts": "slave2_out_w",
+    "bmsSlaveStatus_2.remainCap": "slave2_remain_cap_mah",
+    "bmsSlaveStatus_2.fullCap": "slave2_full_cap_mah",
+    "bmsSlaveStatus_2.maxCellVol": "slave2_max_cell_vol_mv",
+    "bmsSlaveStatus_2.minCellVol": "slave2_min_cell_vol_mv",
+    "bmsSlaveStatus_2.maxCellTemp": "slave2_max_cell_temp_c",
+    "bmsSlaveStatus_2.minCellTemp": "slave2_min_cell_temp_c",
+    "bmsSlaveStatus_2.maxMosTemp": "slave2_max_mos_temp_c",
+    "bmsSlaveStatus_2.errCode": "slave2_err_code",
+}
+
+
+def parse_delta_report(
+    payload: dict,
+    field_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Parse a Delta 2 Max IoT-API JSON report.
+
+    The IoT-API format is: {"typeCode": "pdStatus", "params": {"soc": 85, ...}}
+    field_map uses "typeCode.paramKey" as lookup key.
+    """
+    if field_map is None:
+        field_map = DELTA2MAX_FIELD_MAP
+
+    type_code = payload.get("typeCode", "")
+    params = payload.get("params", {})
+    if not isinstance(params, dict) or not type_code:
+        return {}
+
+    parsed: dict[str, Any] = {}
+    for param_key, value in params.items():
+        if not isinstance(value, (int, float)):
+            continue
+        lookup = f"{type_code}.{param_key}"
+        dest_key = field_map.get(lookup)
+        if dest_key is None:
+            continue
+        # Battery temperature: whole degrees Celsius, nothing to subtract.
+        # The -15 that sat here is refuted by the device itself - see the
+        # note in `delta_http.py`, which carried the same correction on the
+        # other path. Both are removed together: a reading that changed by
+        # 15 K depending on which path delivered it would be worse than
+        # either value alone.
+        if dest_key in ("batt_temp_raw", "slave1_temp_raw", "slave2_temp_raw"):
+            temp_key = dest_key.replace("_temp_raw", "_temp_c")
+            parsed[temp_key] = float(value)
+        # Beeper inversion: beepMode=0 means beeper ON (normal mode)
+        elif dest_key in ("beep_mode_raw", "beep_mode_raw_legacy"):
+            parsed["beep_enabled"] = 0 if float(value) else 1
+        else:
+            parsed[dest_key] = float(value)
+
+    # Legacy fallbacks: use legacy paths only when modern keys are absent.
+    if "ac_auto_on" not in parsed and "ac_auto_on_legacy" in parsed:
+        parsed["ac_auto_on"] = parsed["ac_auto_on_legacy"]
+    if "ac_enabled" not in parsed and "ac_enabled_legacy" in parsed:
+        parsed["ac_enabled"] = parsed["ac_enabled_legacy"]
+    if "ac_xboost" not in parsed and "ac_xboost_legacy" in parsed:
+        parsed["ac_xboost"] = parsed["ac_xboost_legacy"]
+    if "ac_out_freq_hz" not in parsed and "ac_out_freq_hz_legacy" in parsed:
+        parsed["ac_out_freq_hz"] = parsed["ac_out_freq_hz_legacy"]
+    parsed.pop("ac_auto_on_legacy", None)
+    parsed.pop("ac_enabled_legacy", None)
+    parsed.pop("ac_xboost_legacy", None)
+    parsed.pop("ac_out_freq_hz_legacy", None)
+
+    # --- Unit conversions ---
+
+    # Voltages: mV -> V
+    for mv_key, v_key in [
+        ("batt_voltage_mv", "batt_voltage_v"),
+        ("ac_out_vol_mv", "ac_out_vol_v"),
+        ("ac_in_vol_mv", "ac_in_vol_v"),
+        ("ac_cfg_out_vol_mv", "ac_cfg_out_vol_v"),
+        ("dc_in_vol_mv", "dc_in_vol_v"),
+        ("solar_in_vol_mv", "solar_in_vol_v"),
+        ("solar2_in_vol_mv", "solar2_in_vol_v"),
+        ("batt_max_cell_vol_mv", "batt_max_cell_vol_mv"),  # stays mV (cell level)
+        ("batt_min_cell_vol_mv", "batt_min_cell_vol_mv"),  # stays mV (cell level)
+        ("slave1_voltage_mv", "slave1_voltage_v"),
+        ("slave2_voltage_mv", "slave2_voltage_v"),
+    ]:
+        if mv_key in parsed and v_key != mv_key:
+            parsed[v_key] = parsed.pop(mv_key) / 1000.0
+
+    # Voltage: dV -> V (12 V output; factor unconfirmed).
+    # No captured frame covers this push report. The same device units feed the
+    # same entities as the quota parser, so it agrees with it: observed device
+    # frames of a Delta 2 Max report mV, mA, W and degC for the solar input and
+    # Solar 2 fields (inVol, pv2InVol, pv2InAmp, pv2InWatts, outWatts,
+    # pv2MpptTemp), so those take no tenth/hundredth factor. The carOut/dcdc12v
+    # factors are unconfirmed.
+    for dv_key, v_key in [
+        ("dcdc_12v_vol_dv", "dcdc_12v_vol_v"),
+    ]:
+        if dv_key in parsed:
+            parsed[v_key] = parsed.pop(dv_key) / 10.0
+
+    # Currents: mA -> A
+    for ma_key, a_key in [
+        ("batt_current_ma", "batt_current_a"),
+        ("ac_out_amp_ma", "ac_out_amp_a"),
+        ("ac_in_amp_ma", "ac_in_amp_a"),
+        ("solar_in_amp_ma", "solar_in_amp_a"),
+        ("solar2_in_amp_ma", "solar2_in_amp_a"),
+        ("slave1_current_ma", "slave1_current_a"),
+        ("slave2_current_ma", "slave2_current_a"),
+    ]:
+        if ma_key in parsed:
+            parsed[a_key] = parsed.pop(ma_key) / 1000.0
+
+    # Power: 12 V car output, amplified 10x -> W (unconfirmed)
+    if "car_12v_out_w" in parsed:
+        parsed["car_12v_out_w"] /= 10.0
+
+    # Power: amplified 100x -> W (unconfirmed)
+    if "dcdc_12v_w" in parsed:
+        parsed["dcdc_12v_w"] /= 100.0
+
+    # Enum state mappings (numeric -> string). Unknown values (e.g. new
+    # firmware states) are dropped: HA enum sensors raise ValueError for
+    # any state not in the declared options list.
+    for key, mapping in _DELTA_ENUM_FIELDS.items():
+        if key in parsed:
+            iv = int(parsed[key])
+            if iv in mapping:
+                parsed[key] = mapping[iv]
+            else:
+                _LOGGER.debug(
+                    "Unknown enum value for %s: %r (dropped)", key, parsed[key]
+                )
+                del parsed[key]
+
+    return parsed

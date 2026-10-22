@@ -1,0 +1,13 @@
+{
+  "domain": "ecoflow_energy",
+  "name": "EcoFlow Energy",
+  "after_dependencies": ["modbus"],
+  "codeowners": ["@marco2207", "@shuette42"],
+  "config_flow": true,
+  "documentation": "https://github.com/marco2207/ecoflow-energy-ha",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/marco2207/ecoflow-energy-ha/issues",
+  "requirements": [],
+  "version": "1.26.1"
+}

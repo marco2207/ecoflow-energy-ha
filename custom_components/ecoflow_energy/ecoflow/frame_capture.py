@@ -1,0 +1,1707 @@
+"""Raw frame capture for diagnostics.
+
+A device variant can only be diagnosed against the bytes it actually
+sends. Two callers need that: the coordinator, for a device that is
+routed but decodes wrongly, and the unrouted-device probe, for a device
+with no parser at all.
+
+Both store the same shape, so a diagnostics reader sees one format
+regardless of which path captured the frame.
+
+``TypedFrameBuffer`` adds the sampling policy the probe needs for long
+recordings - see its docstring for why a plain ring buffer is not enough.
+
+No Home Assistant dependencies - stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from collections.abc import Mapping
+from typing import Any, NamedTuple
+
+# Filler byte for masked identifiers. Replacing a secret with a run of the
+# same length keeps every byte offset in the frame intact, which is what a
+# field-layout analysis depends on.
+_MASK_BYTE = b"X"
+
+# EcoFlow serials are 16 alphanumeric upper-case characters and appear in
+# frames as plain ASCII. The caller can only name the identifiers it knows,
+# which is the device serial and the account id - a frame also carries the
+# serial of every battery pack and of any attached accessory, and those are
+# nobody's to publish either. This catches them by shape.
+_SERIAL_MIN_LEN = 15
+_SERIAL_RUN = re.compile(rb"[A-Z0-9]{%d,}" % _SERIAL_MIN_LEN)
+# A serial-shaped run that is the mask with fewer than this many other bytes
+# in it is a masked field and a tag; see `_mask_serial_run`.
+_SERIAL_FOREIGN_MIN = 3
+
+# The shape of a masked serial that a wire run spilled over: the mask byte at
+# least `_SERIAL_MIN_LEN` times, with at most one other byte on each side (the
+# length byte before it and the next field's tag after it). Matched against a
+# whole span, never searched inside one: a plain serial that sits beside such a
+# run must not borrow the run's evidence.
+_MASKED_SERIAL_SPAN = re.compile(
+    rb"[^%b]?%b{%d,}[^%b]?"
+    % (
+        re.escape(_MASK_BYTE),
+        re.escape(_MASK_BYTE),
+        _SERIAL_MIN_LEN,
+        re.escape(_MASK_BYTE),
+    )
+)
+
+# The shape of zero padding under the device's payload mask: the null byte at
+# least `_PAD_MIN_LEN` times, at most `_PAD_MARGIN` other bytes on each side.
+# A bytes field of nulls sent under key `K` is `K` repeated on the wire, and
+# for an alphanumeric `K` a run of them reads as a serial (`0x38` is `8`, and
+# twenty of them is a serial-shaped run). Matched against a whole span like
+# `_MASKED_SERIAL_SPAN`, for the same reason. The margin is the length byte in
+# front and the next field's tag behind, a byte more for a two-byte length;
+# every padding span measured has one byte or none (4 frames of the PowerPulse 2
+# fixture). It is kept that small because a literal `X` inside a plain serial
+# is left as it is by the mask and splits the rewritten span, so a tail of the
+# serial can sit beside the nulls: with a margin of eleven, `HJ31X` + eleven
+# serial characters + twelve key bytes was handed back (#464 review).
+_PAD_BYTE = b"\x00"
+_PAD_MIN_LEN = 12
+_PAD_MARGIN = 2
+_NULL_PADDING_SPAN = re.compile(
+    rb"[^%b]{0,%d}%b{%d,}[^%b]{0,%d}"
+    % (
+        re.escape(_PAD_BYTE),
+        _PAD_MARGIN,
+        re.escape(_PAD_BYTE),
+        _PAD_MIN_LEN,
+        re.escape(_PAD_BYTE),
+        _PAD_MARGIN,
+    )
+)
+
+# Identifiers shorter than a serial cannot be caught by shape alone. A run of
+# 12 upper-case alphanumerics appears in ordinary binary often enough that a
+# free-running pattern of that length would corrupt frames rather than clean
+# them, which is the failure `diagnostics.py` records: an over-broad mask once
+# came back with 25 of 25 captured frames destroyed.
+#
+# Protobuf gives the missing boundary for free. A length-delimited field
+# announces exactly how many bytes follow, so a candidate can be tested as a
+# whole value rather than as a lucky run inside one: tag byte with wire type
+# 2, a single length byte, then that many characters, all of them
+# `[A-Z0-9]`. Nothing shorter than `_IDENT_MIN` is masked, because below that
+# the field stops being an identifier and starts being a model name or a
+# status word.
+#
+# The STREAM AC 5000 carries a 12-character identifier this way, stable across
+# every frame of every capture on file, which the serial mask never reached.
+# It was found in a reporter's diagnostics download on 2026-08-26, in a file
+# he had attached to a public issue because this project asked him to.
+_IDENT_MIN = 12
+_IDENT_MAX = 32
+
+# A UUID is an identifier by definition and none of the passes above can see
+# one: it is lower case, it carries hyphens, and its runs of hex are shorter
+# than any threshold that would be safe to lower. Its own shape is the
+# boundary, so no length guess is needed and no ordinary binary matches it.
+#
+# Found on 2026-09-04 in a reporter's diagnostics download for #234, in a file
+# he had attached to a public issue because this project asked him to, and only
+# because the fixture sweep in `tests/test_fixture_identifiers.py` refused the
+# frame. The masking that ran over that download did not touch it. What such a
+# UUID identifies is not established here; masking it does not depend on the
+# answer, and a value nobody can explain is exactly the kind that should not
+# travel.
+_UUID_RUN = re.compile(
+    rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    rb"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+# A device also joins a short lower-case hex value to its own serial with a
+# hyphen inside one string field: `<hex>-<serial>`. Neither pass above can
+# see the hex half - lower case rules out `_SERIAL_RUN` and the delimited
+# pass below, and it has none of a UUID's hyphens for `_UUID_RUN` to match -
+# and the field is not a whole value the delimited pass could test either,
+# because the hyphen sits inside it. Widening that pass's alphabet was
+# measured and rejected: it would still not reach a value that is not a
+# whole field, and it matched nothing on file (PLAN-121, ADR-016).
+#
+# The serial half is the boundary instead: `[A-Z0-9]{15,}` right after the
+# hyphen is not a shape ordinary binary produces (0 hits in 1556 frames
+# outside the download this was found in), so anchoring on it is safe at a
+# width a free-running pattern would not be. A free-running `[0-9a-f]{12,}`
+# was measured too and rejected - it also matches 13-digit millisecond
+# timestamps inside JSON set frames, 29 of them across 27 frames in the
+# local capture corpus, which is exactly the kind of corpus damage the
+# narrow alphabet above exists to avoid.
+#
+# `_SERIAL_RUN` masks the serial half first, to a run of `X`, which still
+# satisfies `[A-Z0-9]{15,}` - so the order between the two passes does not
+# matter.
+#
+# Found 2026-09-04 in the same reporter's diagnostics download as
+# `_UUID_RUN`, in a header sub-message field, 8 occurrences in 8 frames,
+# never on its own. What the hex half identifies is not established here;
+# masking it does not depend on the answer.
+#
+# Two details the pattern depends on and which a later edit must not undo:
+#
+# The run has no upper bound. An earlier form capped it at 32, the width of
+# a UUID without its hyphens, and a cap masks the LAST 32 characters of a
+# longer run while leaving the front of it standing - a partial mask, which
+# is worse than none, because a 44-character run would leave 12 characters
+# behind and those are themselves an identifier-shaped run. The anchor
+# carries the safety here, not the width, so the width is not a second
+# safety and only costs that case. No run over 12 exists on file either
+# way, so this changes no byte of any recording.
+#
+# `_MASK_BYTE` must stay inside `[A-Z0-9]`. `_SERIAL_RUN` runs first and
+# replaces the serial half with mask bytes, and the anchor below still has
+# to match what it left behind. That holds for `X` and fails for any other
+# choice, which is why the two are not independent.
+_JOINED_HEX_RUN = re.compile(rb"[0-9a-f]{12,}(?=-[A-Z0-9]{15,})")
+
+# A device also reports the owner's time zone, as an IANA name like
+# `Europe/Budapest`. It is not an identifier and the pass above cannot see
+# it: lower case and a slash are outside that alphabet, by design, because
+# widening it would start masking model names.
+#
+# It is not dropped either. The region says which side of the world a device
+# is on, and that is worth having when a schedule behaves oddly. What goes is
+# the half that narrows it to a country: the region is kept and everything
+# after the first slash is masked, so `Europe/Budapest` becomes
+# `Europe/XXXXXXXX` and stays the same length.
+#
+# Found on 2026-08-26 in a diagnostics download attached to a public issue,
+# in the same week as the identifier below it. Serials were masked in that
+# file and this was not.
+# The region half is matched against the IANA area names rather than by
+# shape, so a model name with a slash in it cannot be mistaken for a place.
+_TIME_ZONE = re.compile(
+    rb"((?:Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia"
+    rb"|Europe|Indian|Pacific)/)([A-Za-z_/+-]{3,40})"
+)
+_IDENT_ALPHABET = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+_WIRE_TYPE_LENGTH_DELIMITED = 2
+
+
+def _mask_delimited_identifiers(payload: bytes) -> bytes:
+    """Mask length-delimited fields whose whole value looks like an identifier.
+
+    Walks byte by byte rather than parsing: a frame that failed to parse would
+    be masked incompletely, and a frame is at its most interesting exactly
+    when it does not parse. Reading a tag and a length wherever they appear
+    costs a false positive of roughly one in a hundred billion per position,
+    since a value only qualifies when every one of its 12 or more bytes lands
+    in a 36-character alphabet. Length is preserved, so byte offsets survive
+    for a field-layout analysis.
+    """
+    out = bytearray(payload)
+    index = 0
+    limit = len(payload) - 2
+    while index < limit:
+        if payload[index] & 0x07 != _WIRE_TYPE_LENGTH_DELIMITED:
+            index += 1
+            continue
+        length = payload[index + 1]
+        start = index + 2
+        end = start + length
+        if not _IDENT_MIN <= length <= _IDENT_MAX or end > len(payload):
+            index += 1
+            continue
+        if all(byte in _IDENT_ALPHABET for byte in payload[start:end]):
+            out[start:end] = _MASK_BYTE * length
+            index = end
+            continue
+        index += 1
+    return bytes(out)
+
+
+# A device also sends a record about a neighbour: a serial, and beside it a
+# short id and a name. On file the id is eight upper-case hex characters and
+# the name is `Ecoflow_` plus four digits - a lower-case run and an
+# underscore - so neither is reachable by any shape above: eight is under
+# `_IDENT_MIN`, and the alphabet the delimited pass tests is upper case only.
+# Widening that alphabet was measured and rejected: it costs a key string
+# (`plug_and_play`, nine times in the same device's frames) and still reaches
+# no name under twelve characters. A name an owner typed has no spelling to
+# catch at all.
+#
+# What such a record does have is the serial, and the serial is the boundary
+# (ADR-016). Within one protobuf message - the fields read from one delimited
+# span - a whole delimited field that is serial-shaped anchors the message,
+# and every other whole delimited field of eight or more characters from
+# `[A-Za-z0-9_-]` in that same message is masked. Nothing is masked in a
+# message without an anchor, so the key string above survives and so does
+# ordinary binary. Measured 2026-09-09 over 20,324 hex blobs of every family
+# on file: 18 of 18 values reached, 0 other fields touched. The other whole
+# fields that share a message with a serial anywhere on file are `ios`,
+# `android` (seven characters, which is why the floor is eight), `V0.0.0`
+# (the dot stays outside the alphabet for it), `Europe/Berlin` (the slash
+# likewise) and fields that are not printable at all.
+#
+# The walk descends into every delimited span as if it were a message, to
+# `_ANCHOR_DEPTH` levels below the payload it receives, because the record
+# sits three levels down (frame, header, `pdata`, record list) and the
+# collateral above was measured at six. A candidate has no upper bound: a
+# cap would mask the tail of a long value and leave its front standing,
+# which is worse than either choice (ADR-016, amendment).
+#
+# This pass runs before the free-running ones, right after the named
+# secrets, and the order is load-bearing. `_SERIAL_RUN` is greedy and knows
+# nothing about fields: when the byte after a serial is itself in
+# `[A-Z0-9]` it is swallowed too, and for a length-delimited field that byte
+# is the tag - fields 6, 8, 9, 10 and 11 carry the tags `2`, `B`, `J`, `R`
+# and `Z`. A tag turned to `X` reads as a varint, and the walk loses the
+# rest of that message, name included. Measured: a name at field 8 after
+# the serial survived when this pass ran last, and is masked when it runs
+# first. Every pass is `X` for `X` idempotent, so the order costs nothing.
+#
+# Two couplings remain, both already relied on by `_JOINED_HEX_RUN`: the
+# anchor accepts a run of `X` as well as a real serial - a named secret
+# masked one line earlier, or a fixture already masked on disk, still
+# anchors, and the fixture gate walks masked files with this same helper -
+# which holds only because `_MASK_BYTE` is inside `[A-Z0-9]`; and a
+# 12-character identifier this pass masks is what the delimited pass would
+# have masked anyway, `X` for `X`.
+#
+# A field that holds a whole sub-message is a candidate too when every one
+# of its bytes happens to fall in the alphabet, and would be masked whole,
+# children included. No such field exists on file; it is recorded rather
+# than guarded against, because a guard would need to parse the value to
+# decide, and a value that parses as a message is exactly what a name
+# cannot be told from.
+#
+# Found 2026-09-09 in a reporter's diagnostics downloads, in message `2/133`
+# of a PowerPulse 2: 9 frames in two downloads, 18 occurrences of four
+# distinct values, while the serial beside them was masked (PLAN-133,
+# ADR-025).
+_ANCHORED_STRING = re.compile(rb"[A-Za-z0-9_-]{8,}")
+_ANCHOR_DEPTH = 6
+
+
+def _delimited_spans_by_message(payload: bytes) -> list[list[tuple[int, int]]]:
+    """The whole delimited fields of every message the walk can read.
+
+    One inner list per message, each entry a `(start, end)` span into
+    `payload` itself, so a caller can test and mask in place. The payload is
+    depth 0; every delimited span is read as a message of its own down to
+    `_ANCHOR_DEPTH`, and a span below the cap is not descended into. Each
+    descent is into a strictly shorter span, so the walk ends, and the cap
+    bounds it at `_ANCHOR_DEPTH + 1` visits per byte.
+
+    Within a message the walk is tolerant the way `_header_fields` is: it
+    reads fields until the first one it cannot read and keeps what it read,
+    because a frame is at its most interesting when it does not parse, and
+    a truncated later field must not cost an intact earlier one its record.
+    A field number of zero is not valid protobuf and ends the message too,
+    which is what keeps a string read as a message from yielding much.
+    Wrapped so a malformed payload can never raise: on any failure the
+    messages read so far are returned, and a capture path never affects
+    ingest.
+    """
+    from .proto.decoder import _read_varint
+
+    messages: list[list[tuple[int, int]]] = []
+    try:
+        mv = memoryview(payload)
+        pending: list[tuple[int, int, int]] = [(0, len(mv), 0)]
+        while pending:
+            start, end, depth = pending.pop()
+            spans: list[tuple[int, int]] = []
+            i = start
+            while i < end:
+                key, i = _read_varint(mv, i)
+                if key is None:
+                    break
+                fn, wt = key >> 3, key & 0x07
+                if fn == 0:
+                    break
+                if wt == 0:
+                    val, i = _read_varint(mv, i)
+                    if val is None:
+                        break
+                elif wt == 2:
+                    length, i = _read_varint(mv, i)
+                    if length is None:
+                        break
+                    field_end = i + length
+                    if field_end > end:
+                        break
+                    spans.append((i, field_end))
+                    if depth < _ANCHOR_DEPTH and length:
+                        pending.append((i, field_end, depth + 1))
+                    i = field_end
+                elif wt == 1:
+                    i += 8
+                elif wt == 5:
+                    i += 4
+                else:
+                    break
+            if spans:
+                messages.append(spans)
+    except Exception:  # noqa: BLE001
+        pass
+    return messages
+
+
+def _anchored_string_fields(payload: bytes) -> list[tuple[int, int]]:
+    """Spans of every string that sits beside a serial in its own message.
+
+    A message is anchored when one of its whole delimited fields matches
+    `_SERIAL_RUN`; an anchor is never itself a candidate. In an anchored
+    message every other whole delimited field that matches
+    `_ANCHORED_STRING` is returned. A message without an anchor yields
+    nothing, whatever it carries. The fixture gate imports this so it sees
+    exactly what the product sees.
+    """
+    found: list[tuple[int, int]] = []
+    for spans in _delimited_spans_by_message(payload):
+        anchored = any(_SERIAL_RUN.fullmatch(payload, s, e) for s, e in spans)
+        if not anchored:
+            continue
+        for s, e in spans:
+            if _SERIAL_RUN.fullmatch(payload, s, e):
+                continue
+            if _ANCHORED_STRING.fullmatch(payload, s, e):
+                found.append((s, e))
+    return found
+
+
+def _mask_anchored_strings(payload: bytes) -> bytes:
+    """Mask every string `_anchored_string_fields` finds, length preserved."""
+    spans = _anchored_string_fields(payload)
+    if not spans:
+        return payload
+    out = bytearray(payload)
+    for start, end in spans:
+        out[start:end] = _MASK_BYTE * (end - start)
+    return bytes(out)
+
+
+# A Smart Home Panel 2 (`HD31`) reports where it is installed as one text
+# field of its plain settings frame: a country, a town, an empty part, then
+# longitude and latitude with fourteen decimals, e.g.
+# `United States Springfield,,-71.12345678901234,42.12345678901234` (a
+# made-up place; the real one reached a public diagnostics download on
+# 2026-10-02, #464). None of the passes above can see it: it has spaces and
+# lower case, so it is no identifier, and a coordinate pair is no shape any
+# of them knows.
+#
+# The pair is the anchor, because the address text around it varies. Two
+# decimals of at least two places each, joined by `,` or `;` and up to two
+# spaces or a tab: the fixed-point shape the device uses, and a shape a version
+# string, an address on a network or a single reading does not have. Two places
+# still name a neighbourhood, and the cost is lopsided: a false hit masks one
+# string in a download, a miss leaves the whole address, so the floor is low
+# (the corpus holds the same nine frames at two places as at four). A decimal
+# comma is accepted only beside a `;`, where it cannot be a list separator.
+_COORDINATE_DOT = rb"-?\d{1,3}\.\d{2,}"
+_COORDINATE_COMMA = rb"-?\d{1,3},\d{2,}"
+_COORDINATE_PAIR = re.compile(
+    rb"%b[,;][ \t]{0,2}%b|%b;[ \t]{0,2}%b"
+    % (_COORDINATE_DOT, _COORDINATE_DOT, _COORDINATE_COMMA, _COORDINATE_COMMA)
+)
+# What the fallback below stops at when it walks over text next to a pair:
+# control bytes and the characters that structure JSON, so a text frame holding
+# a pair in an array is not masked from its start, plus a quote that is not
+# escaped (`\u00fc` and `\"` stay inside the string). Bytes from 0x80 on do not
+# stop it: a town name is UTF-8.
+_ADDRESS_STOP = frozenset(range(0x20)) | frozenset(b"\x7f{}[]:")
+_QUOTE = 0x22
+_BACKSLASH = 0x5C
+_ADDRESS_START = re.compile(rb"[A-Za-z\x80-\xff]")
+# What may follow a pair before more of the same text carries on: the
+# separators the pair itself uses. A letter or a digit there is more likely the
+# next field's tag.
+_ADDRESS_GAP = frozenset(b",; ")
+# What the shape passes see in place of an address while they run. They must
+# not read its digits, which join the next tag byte into a serial-shaped run.
+_NEUTRAL_BYTE = b"x"
+
+
+def _stops_address_text(payload: bytes, i: int) -> bool:
+    """Whether the byte at `i` ends the run of text a pair sits in."""
+    byte = payload[i]
+    if byte in _ADDRESS_STOP:
+        return True
+    return byte == _QUOTE and (i == 0 or payload[i - 1] != _BACKSLASH)
+
+
+def _read_message(
+    payload: bytes, start: int, end: int, strict: bool
+) -> tuple[list[tuple[int, int]], bool] | None:
+    """Read one message: its length-delimited fields, and whether it has others.
+
+    Returns the `(start, end)` span of every length-delimited field and a flag
+    that is true when the message also carries a varint or a fixed-width field.
+
+    `strict` demands that the bytes read as a message exactly: every tag a
+    known wire type, every length inside the span, the last field ending on
+    `end`. A span that does not returns `None`. Without `strict` the fields
+    read before the first one that cannot be read are returned, which is how
+    a frame that did not parse is still walked as far as it goes.
+    """
+    from .proto.decoder import _read_varint
+
+    spans: list[tuple[int, int]] = []
+    scalar = False
+
+    def give_up() -> tuple[list[tuple[int, int]], bool] | None:
+        return None if strict else (spans, scalar)
+
+    mv = memoryview(payload)
+    i = start
+    while i < end:
+        key, i = _read_varint(mv, i)
+        if key is None or key >> 3 == 0 or i > end:
+            return give_up()
+        wire_type = key & 0x07
+        if wire_type == 0:
+            value, i = _read_varint(mv, i)
+            if value is None or i > end:
+                return give_up()
+            scalar = True
+        elif wire_type == _WIRE_TYPE_LENGTH_DELIMITED:
+            length, i = _read_varint(mv, i)
+            if length is None or i + length > end:
+                return give_up()
+            spans.append((i, i + length))
+            i += length
+        elif wire_type in (1, 5):
+            i += 8 if wire_type == 1 else 4
+            if i > end:
+                return give_up()
+            scalar = True
+        else:
+            return give_up()
+    return spans, scalar
+
+
+def _delimited_fields(
+    payload: bytes, start: int, end: int, strict: bool
+) -> list[tuple[int, int]] | None:
+    """The `(start, end)` span of every length-delimited field in one message.
+
+    See `_read_message` for `strict`; `None` is a span that does not read.
+    """
+    read = _read_message(payload, start, end, strict)
+    return None if read is None else read[0]
+
+
+def _coordinate_fields(payload: bytes) -> list[tuple[int, int]]:
+    """Spans of every string field that holds a coordinate pair.
+
+    The frame is read as a message, and so is every field that holds a pair,
+    for as long as it reads as a message exactly (`_delimited_fields` with
+    `strict`) and one of its own fields holds the pair. The field where that
+    stops is the string. A message that wraps the string is therefore never
+    returned, and its tag and length bytes stay intact even when they are
+    printable (`:` and `<` are field 7 and a length of 60).
+
+    The one thing the walk can misread is a text string that happens to parse
+    as a message, with a sub-field that holds the pair: masking only that
+    sub-field would leave the country and the town in front of it. A wrapper
+    is told from such a string by its contents. Where the path down to the
+    pair has a field with no byte below 0x20 that also reads as a message with
+    a varint or a fixed-width field in it, the outermost one is returned. A
+    wrapper has a control byte in a tag or a length of some field, and one
+    that is all printable text bytes is all length-delimited fields.
+
+    A message that does not read exactly is returned whole, with its other
+    fields: one stray byte after an otherwise valid pdata masks all of it. That
+    leaks nothing and is not worth guessing around, since a retry that reads a
+    string's bytes as fields would be the misreading again.
+
+    The depth is capped like `_delimited_spans_by_message`, and nothing raises:
+    a capture path never affects ingest. The fallback in `_coordinate_spans`
+    still catches what the walk does not return.
+    """
+    found: list[tuple[int, int]] = []
+    try:
+        pending: list[
+            tuple[list[tuple[int, int]] | None, int, tuple[int, int] | None]
+        ] = [(_delimited_fields(payload, 0, len(payload), strict=False), 0, None)]
+        while pending:
+            fields, depth, text_root = pending.pop()
+            for start, end in fields or ():
+                if _COORDINATE_PAIR.search(payload, start, end) is None:
+                    continue
+                read = (
+                    _read_message(payload, start, end, strict=True)
+                    if depth < _ANCHOR_DEPTH
+                    else None
+                )
+                inner, scalar = read if read else (None, False)
+                root = text_root
+                if root is None and scalar and min(payload[start:end]) >= 0x20:
+                    root = (start, end)
+                if inner and any(
+                    _COORDINATE_PAIR.search(payload, s, e) for s, e in inner
+                ):
+                    pending.append((inner, depth + 1, root))
+                else:
+                    found.append(root or (start, end))
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
+def _coordinate_spans(payload: bytes) -> list[tuple[int, int]]:
+    """Every span of `payload` that holds an installation address.
+
+    The whole string field goes, not only the pair: the town and country in
+    front of it are the address, and so is text behind it. A pair is placed
+    when it starts inside a field `_coordinate_fields` returned, by its start
+    and not its end: the match runs on through a digit-valued tag byte after
+    the field, and that is no reason to treat the pair as unplaced. A pair the
+    walk does not place - a frame cut off inside the string, or one that was
+    never protobuf - is masked from the first letter of the text run in front
+    of it, and on past it while the pair's own separators carry on. That
+    cannot leave the town behind, but it may overwrite a printable tag, which
+    is why it is the fallback and not the rule.
+
+    Not handled: an address split over two fields, with the pair in the second.
+    No device is known to send one.
+    """
+    pairs = [m.span() for m in _COORDINATE_PAIR.finditer(payload)]
+    if not pairs:
+        return []
+    fields = _coordinate_fields(payload)
+    spans = list(fields)
+    for pair_start, pair_end in pairs:
+        if any(start <= pair_start < end for start, end in fields):
+            continue
+        run_start = pair_start
+        while run_start > 0 and not _stops_address_text(payload, run_start - 1):
+            run_start -= 1
+        letter = _ADDRESS_START.search(payload, run_start, pair_start)
+        start = letter.start() if letter else pair_start
+        end = pair_end
+        if end < len(payload) and payload[end] in _ADDRESS_GAP:
+            while end < len(payload) and not _stops_address_text(payload, end):
+                end += 1
+        spans.append((start, end))
+    return spans
+
+
+def _fill_spans(payload: bytes, spans: list[tuple[int, int]], fill: bytes) -> bytes:
+    """Overwrite every span with `fill`, length preserved."""
+    if not spans:
+        return payload
+    out = bytearray(payload)
+    for start, end in spans:
+        out[start:end] = fill * (end - start)
+    return bytes(out)
+
+
+def _mask_serial_run(match: re.Match[bytes]) -> bytes:
+    """Mask one serial-shaped run, unless it is a mask with a tag stuck to it.
+
+    A run that is the mask byte with fewer than three other bytes in it is a
+    field that was masked already, and a tag or length byte beside it. Growing
+    the mask over those two bytes is what made a second pass over a masked
+    frame differ from the first.
+    """
+    run = match.group()
+    if len(run.strip(_MASK_BYTE)) < _SERIAL_FOREIGN_MIN:
+        return run
+    return _MASK_BYTE * len(run)
+
+
+def _plain_passes(payload: bytes, secrets: list[str]) -> bytes:
+    """Every mask this module applies, over bytes that are already plain.
+
+    Named identifiers are masked first, then any string that shares a
+    protobuf message with a serial, then anything else shaped like a
+    serial, then anything written as a UUID, then a lower-case hex run a
+    hyphen joins to a serial-shaped run, then the city half of any time zone
+    the device reports, then anything a device presents as a whole
+    length-delimited field of identifier-shaped characters, and last every
+    span `_coordinate_spans` found. The second pass
+    catches what no shape can: a neighbour's name and short id, by their
+    position beside its serial - and it runs before the free-running passes
+    because those can mask the tag byte after a serial and blind a walk
+    that reads fields. The third matters because a frame also carries the
+    serial of every battery pack and of any attached accessory, and the
+    caller cannot name what it has not discovered yet. The fourth and fifth
+    catch identifiers too short, or too oddly shaped, for the third to risk
+    matching: a UUID by its own hyphenated shape, and a hex run by the
+    serial it is joined to - which is how a 12-character one reached a
+    public issue attachment before anyone noticed. Masking preserves
+    length, so byte offsets survive every pass and a field-layout analysis
+    still works.
+
+    The coordinate spans are found on the incoming bytes, before any pass
+    runs, and every pass sees them as lower-case filler until the last one
+    writes the mask. The pair is fourteen digits and the byte after the string
+    is often a tag that spells a digit or a capital, so the serial pass would
+    otherwise take the digits for a serial, break the pair, and leave the town
+    and the country in clear (#464). Writing the mask last is also what keeps
+    the delimited-identifier walk from reading a masked field and the tag and
+    length bytes in front of it as one identifier-shaped window.
+
+    "Plain" is the operative word: none of these passes can see a string
+    once the device has XOR-masked it. `sanitize_frame` is what runs this
+    over both the frame at large and the one region a header may declare
+    encrypted.
+    """
+    spans = _coordinate_spans(payload)
+    sanitized = _fill_spans(payload, spans, _NEUTRAL_BYTE)
+    for secret in secrets:
+        if not secret:
+            continue
+        for variant in {secret, secret.upper(), secret.lower()}:
+            raw = variant.encode("ascii", "ignore")
+            if raw and raw in sanitized:
+                sanitized = sanitized.replace(raw, _MASK_BYTE * len(raw))
+    sanitized = _mask_anchored_strings(sanitized)
+    sanitized = _SERIAL_RUN.sub(_mask_serial_run, sanitized)
+    sanitized = _UUID_RUN.sub(lambda m: _MASK_BYTE * len(m.group()), sanitized)
+    sanitized = _JOINED_HEX_RUN.sub(lambda m: _MASK_BYTE * len(m.group()), sanitized)
+    sanitized = _TIME_ZONE.sub(
+        lambda m: m.group(1) + _MASK_BYTE * len(m.group(2)), sanitized
+    )
+    sanitized = _mask_delimited_identifiers(sanitized)
+    return _fill_spans(sanitized, spans, _MASK_BYTE)
+
+
+# The device does not always send a string plainly. Some commands mark their
+# header `enc_type == 1` and XOR every byte of that header's `pdata` (or, on
+# a single-header frame with no `pdata`, the whole field-2 payload) with the
+# low byte of that header's own `seq`. None of the passes above can see a
+# string once this mask sits on top of it - it is neither the shape of a
+# serial, a UUID, a hex run, a time zone, nor a delimited identifier, because
+# XOR with a non-zero key does not preserve the alphabet a byte started in.
+_ENC_TYPE_XOR = 1
+_HDR_FIELD_PDATA = 1
+_HDR_FIELD_ENC_TYPE = 6
+_HDR_FIELD_SEQ = 14
+
+
+class _EncRegion(NamedTuple):
+    """One byte span a header declares XOR-masked.
+
+    ``key`` is ``None`` when the header set ``enc_type`` but named no
+    ``seq`` - the span exists but there is nothing to derive a key from, so
+    the region is walked and then left alone rather than guessed at.
+    """
+
+    start: int
+    end: int
+    key: int | None
+
+
+def _header_fields(mv: memoryview, start: int, end: int) -> dict[str, Any]:
+    """Walk one header submessage span, reading its enc_type, seq and pdata span.
+
+    ``start``/``end`` and the returned ``pdata_span`` are all offsets into
+    ``mv`` itself - the full frame, not a copy of the header - so a caller
+    can slice the region straight out of the original payload.
+    """
+    from .proto.decoder import _read_varint
+
+    out: dict[str, Any] = {}
+    i = start
+    while i < end:
+        key, i = _read_varint(mv, i)
+        if key is None:
+            break
+        fn, wt = key >> 3, key & 0x07
+        if wt == 0:
+            val, i = _read_varint(mv, i)
+            if val is None:
+                break
+            if fn == _HDR_FIELD_ENC_TYPE:
+                out["enc_type"] = val
+            elif fn == _HDR_FIELD_SEQ:
+                out["seq"] = val
+        elif wt == 2:
+            length, i = _read_varint(mv, i)
+            if length is None:
+                break
+            field_end = i + length
+            if field_end > end:
+                break
+            if fn == _HDR_FIELD_PDATA:
+                out["pdata_span"] = (i, field_end)
+            i = field_end
+        elif wt == 1:
+            i += 8
+        elif wt == 5:
+            i += 4
+        else:
+            break
+    return out
+
+
+def _encrypted_regions(payload: bytes) -> list[_EncRegion]:
+    """Byte spans of every payload a header declares XOR-masked.
+
+    Walks the outer frame exactly as `decode_header_message` does - field 1
+    (wire type 2) is a repeatable header submessage, field 2 (wire type 2)
+    is the payload, everything else is skipped by wire type - but records
+    byte spans instead of decoded values, because `sanitize_frame` needs to
+    slice and splice at those offsets rather than read them.
+
+    A region is emitted only when a header's `enc_type` is
+    `_ENC_TYPE_XOR`: its own `pdata` span if that field is present and
+    non-empty, else the frame's field-2 payload span if this is the only
+    header the frame carries (a shared payload with more than one header is
+    undecidable and gets no region at all). The frame analyzer this project
+    uses applies the same fallback, so the sanitizer and the analyzer agree
+    on what a frame is.
+
+    Wrapped so a malformed frame can never raise here: on any failure this
+    returns `[]` and the frame keeps the plain passes' behaviour, mirroring
+    the guarantee `decode_cmd_headers` makes for the same reason - a capture
+    path must never affect ingest.
+    """
+    try:
+        from .proto.decoder import _read_varint
+
+        mv = memoryview(payload)
+        n = len(mv)
+        i = 0
+        header_spans: list[tuple[int, int]] = []
+        payload_span: tuple[int, int] | None = None
+        while i < n:
+            field_key, i = _read_varint(mv, i)
+            if field_key is None:
+                break
+            fn, wt = field_key >> 3, field_key & 0x07
+            if fn == 1 and wt == 2:
+                length, i = _read_varint(mv, i)
+                if length is None:
+                    break
+                end = i + length
+                if end > n:
+                    break
+                header_spans.append((i, end))
+                i = end
+            elif fn == 2 and wt == 2:
+                length, i = _read_varint(mv, i)
+                if length is None:
+                    break
+                end = i + length
+                if end > n:
+                    break
+                payload_span = (i, end)
+                i = end
+            elif wt == 0:
+                val, i = _read_varint(mv, i)
+                if val is None:
+                    break
+            elif wt == 1:
+                i += 8
+            elif wt == 2:
+                length, i = _read_varint(mv, i)
+                if length is None:
+                    break
+                i += length
+            elif wt == 5:
+                i += 4
+            else:
+                break
+
+        regions: list[_EncRegion] = []
+        for start, end in header_spans:
+            fields = _header_fields(mv, start, end)
+            if fields.get("enc_type") != _ENC_TYPE_XOR:
+                continue
+            seq = fields.get("seq")
+            region_key = (seq & 0xFF) if isinstance(seq, int) else None
+            pdata_span = fields.get("pdata_span")
+            if pdata_span is not None and pdata_span[1] > pdata_span[0]:
+                regions.append(_EncRegion(pdata_span[0], pdata_span[1], region_key))
+            elif len(header_spans) == 1 and payload_span is not None:
+                regions.append(_EncRegion(payload_span[0], payload_span[1], region_key))
+        return regions
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _xor(blob: bytes, key: int) -> bytes:
+    """Apply the device's payload mask. Its own inverse; key 0 is a no-op."""
+    return blob if not key else bytes(value ^ key for value in blob)
+
+
+def _wire_masked_region(
+    ciphertext: bytes,
+    on_the_wire: bytes,
+    inner: bytes,
+    cleaned: bytes,
+    key: int,
+) -> bytes:
+    """Return the bytes that replace one XOR-declared region in the output.
+
+    `ciphertext` is the region as the device sent it, `on_the_wire` the same
+    span after the plain passes ran over the whole frame, `inner` the
+    ciphertext under the region's key and `cleaned` that plaintext after the
+    plain passes ran over it. A header that declares a key does not always
+    carry one: `_pdata_candidates` keeps a fallback for exactly that, so the
+    bytes may be ciphertext or plain, and the output has to hide an
+    identifier under either reading.
+
+    One rule serves both outcomes of the plaintext pass. The region starts
+    from `_xor(cleaned, key)`: the plaintext masks put back under the key,
+    which is the ciphertext itself when the passes found nothing in it. Then
+    every span the plain passes rewrote on the wire (where `on_the_wire`
+    differs from `ciphertext`) keeps the wire-side mask, because the wire is
+    where a plain serial is found, and a rebuild from `cleaned` alone would
+    write it back: a header that declares a key but sends plain bytes, with a
+    plain serial beside bytes that are `A ^ key`, was handed its serial again
+    by that rebuild (PLAN-167; the corpus holds no such header, so this is
+    hardening). A byte the plaintext pass masked as well keeps that mask
+    instead: the ciphertext of a real serial can itself be serial-shaped
+    (`test_a_region_the_raw_pass_touched_is_read_from_the_original`), and
+    there the region has to unmask to the mask byte, not to `X ^ key`.
+
+    Applied to its own output, a frame that declares a key and sends plain
+    data is left alone under 221 of the 255 keys. Under the other 34, where
+    `X ^ key` is alphanumeric (0x1e is `F`, 0x61 is `9`), the wire's mask
+    reads as a serial-shaped run under the key, the plaintext pass masks it,
+    and the second pass is the last that changes the frame. Nothing of a
+    serial comes back at any pass.
+
+    The wire mask can reach one byte past an identifier into the next field,
+    and that byte now stays masked where the rebuild used to restore it. It
+    happens on a header that declares a key and sends plain bytes (18 of
+    20,000 generated frames), and on a real encrypted frame whose serial and
+    the tag after it are both alphanumeric under the key (67 of 102,000
+    generated frames; none of the recorded frames, re-keyed under every key).
+    That is kept on purpose: excusing such a span would hand a serial
+    character back on the declared-key reading
+    (`test_the_accepted_spill_is_what_keeps_a_plain_serial_hidden`).
+
+    Where the plaintext under a whole rewritten span is already the mask byte,
+    the region was masked before and the rewrite corrupts it: `X ^ key` is
+    itself alphanumeric for many keys (0x1e gives F, 0x0a gives R), so the
+    product's own output, sanitized a second time, came back with `F` where
+    `X` had been (measured 2026-09-11 on the PowerPulse 2 settings-report
+    fixture). Such a span keeps the region's own bytes. The decision is per
+    span, never per byte: a header can declare a mask it does not carry, and
+    there a real identifier sits on the wire whose bytes equal `X ^ key` only
+    by coincidence, one here and one there; restoring those would hand back
+    one letter of it per frame. Any span whose plaintext is not all mask
+    bytes keeps the wire-side mask.
+
+    A span also keeps the region's own bytes when its plaintext is a masked
+    serial and nothing more: the mask byte at least `_SERIAL_MIN_LEN` times
+    with at most one other byte on each side (`_MASKED_SERIAL_SPAN`). The wire
+    run can reach past the mask into the length byte or the next field's tag,
+    which under the key is alphanumeric too (`" " ^ 0x61` is `A`, measured on
+    the DELTA Pro Ultra fixture, #464), and that one byte must not decide for
+    the sixteen beside it. The match is anchored on the whole span. A header
+    that only declares a key can send plain bytes, and there `inner` is not
+    plaintext: `cleaned == inner` says nothing about the wire, and a plain
+    serial lying beside a run of `X ^ key` bytes is a span with a long foreign
+    stretch around its mask bytes. A search for the run anywhere inside the
+    span would hand that serial back.
+
+    A span whose plaintext is zero padding keeps the region's own bytes as
+    well (`_NULL_PADDING_SPAN`): twelve or more nulls with at most two other
+    bytes on each side. Nulls under key `K` are `K` on the wire, and `0x38` is
+    `8`, so twenty bytes of padding read as a serial, were overwritten, and
+    came back as `0x60` on the next decode (header 254.32 of the Smart Home
+    Panel 2 fixture, #464). A null run cannot hide a serial behind a margin
+    that small. A plain byte only becomes a null where it equals the key, so a
+    serial without the key byte is all foreign under the key, and a span holds
+    at most two of those beside the nulls. One that does carry the key byte
+    has to repeat it around a run of twelve. The span is not always the whole
+    serial, though: a literal `X` in a plain serial is not rewritten and
+    splits the span, which is why the margin is two and not the eleven a
+    serial would still fit under (`HJ31X` + eleven characters + twelve key
+    bytes).
+    """
+    region = bytearray(_xor(cleaned, key))
+    offset = 0
+    length = len(ciphertext)
+    while offset < length:
+        if ciphertext[offset] == on_the_wire[offset]:
+            offset += 1
+            continue
+        span_start = offset
+        while offset < length and ciphertext[offset] != on_the_wire[offset]:
+            offset += 1
+        span_plain = inner[span_start:offset]
+        if (
+            all(byte == _MASK_BYTE[0] for byte in span_plain)
+            or _MASKED_SERIAL_SPAN.fullmatch(span_plain) is not None
+            or _NULL_PADDING_SPAN.fullmatch(span_plain) is not None
+        ):
+            continue
+        for position in range(span_start, offset):
+            if cleaned[position] == inner[position]:
+                region[position] = on_the_wire[position]
+    return bytes(region)
+
+
+def sanitize_frame(payload: bytes, secrets: list[str]) -> bytes:
+    """Mask identifying strings inside a raw frame.
+
+    Protobuf frames carry the device serial and, on some commands, the
+    account user id as plain ASCII. Each is replaced by a filler of equal
+    length, in every case variant the payload might use. `_plain_passes`
+    holds the full set of masks this applies to bytes that are already
+    plain; see its docstring for what each one catches and why.
+
+    Some commands do not send a string plainly. A header whose `enc_type`
+    field (proto field 6) is 1 has XOR-masked its `pdata` (or, on a
+    single-header frame with no `pdata`, the shared field-2 payload) with
+    the low byte of that same header's own `seq` field (proto field 14) -
+    the key lives beside the ciphertext it protects, in the same header, and
+    nowhere else. None of the plain passes can see a string once this mask
+    sits on top of it, because XOR with a non-zero key does not preserve any
+    of the alphabets those passes look for. So every region a header
+    declares masked this way is un-XOR-ed, run back through the same plain
+    passes, and - only if that changed anything - XOR-ed again and spliced
+    back at the same offsets, except where the plain passes had already
+    masked the same bytes on the wire (`_wire_masked_region`). A region
+    nobody could derive a key for is walked and then left untouched rather
+    than guessed at.
+
+    Measured across the capture corpus and the tracked fixtures: 40 regions
+    in 40 frames carried a string this way with nothing to catch it - 36
+    serial numbers and 4 time zones, 3 of the time zones inside fixtures
+    this repo tracks and ships.
+
+    Three properties a later edit must not undo, each pinned by a test in
+    `tests/test_frame_capture.py`:
+
+    - The ciphertext for a region is always sliced from `payload`, the
+      **original** argument, never from `sanitized` - a region spliced
+      earlier in the loop must not corrupt a later one's input.
+    - The splice writes back at the same offsets it read from, and every
+      pass preserves length, so `len(sanitized) == len(payload)` always.
+    - Regions are walked from `payload` too, so an earlier splice can never
+      move a later region's offsets out from under it.
+    """
+    sanitized = _plain_passes(payload, secrets)
+    for region in _encrypted_regions(payload):
+        if region.key is None:
+            continue
+        ciphertext = payload[region.start : region.end]
+        inner = _xor(ciphertext, region.key)
+        cleaned = _plain_passes(inner, secrets)
+        on_the_wire = sanitized[region.start : region.end]
+        if cleaned == inner and on_the_wire == ciphertext:
+            continue
+        sanitized = (
+            sanitized[: region.start]
+            + _wire_masked_region(ciphertext, on_the_wire, inner, cleaned, region.key)
+            + sanitized[region.end :]
+        )
+    return sanitized
+
+
+def is_proto_frame(payload: bytes) -> bool:
+    """Return whether a payload looks like a protobuf frame.
+
+    Mirrors the check the ingest path uses to decide between the JSON and
+    the protobuf branch, so capture and parsing never disagree about what
+    a frame is.
+    """
+    return b"\x0a" in payload[:4]
+
+
+def frame_budget(
+    cmds: list[Any], message_max: int, bundle_max: int, bundle_cap: int
+) -> int:
+    """Return how many bytes of a frame to keep.
+
+    The two kinds of frame a device sends differ by an order of magnitude,
+    so one number for both is the wrong shape. A change is pushed as a
+    single message - 41 to 587 B across every capture in the corpus - while
+    the answer to a get bundles the whole state into one frame: 1434 to
+    1465 B in six messages on a STREAM AC 5000, 1009 B in two on a
+    PowerOcean. A budget that fits the pushes cuts every bundle, and the
+    bundle is the frame a field layout is read from.
+
+    Deciding per frame rather than raising one constant keeps the cost
+    where the bytes are: a device that never bundles is bounded by
+    ``message_max``, and only a frame that demonstrably carries several
+    messages may claim more.
+
+    How much more follows from the frame as well. A fixed bundle budget was
+    too small twice, most recently against an Ocean 2 whose battery report
+    bundles 12 to 14 messages at 4956 to 5899 B - every bundle in a 16 hour
+    capture cut, and the count moving between frames on the same unit. A
+    bundle of n messages may therefore claim n message budgets, so the
+    budget grows with the width the frame itself declares rather than with
+    the next device that surprises us. ``bundle_max`` stays as the floor,
+    because a narrow bundle of wide messages was already covered by it and
+    must not come out worse, and ``bundle_cap`` bounds the claim.
+
+    A frame whose headers did not decode counts as one message. Nothing
+    proves it carries more, and the entry says it was cut if it was.
+    """
+    if len(cmds) <= 1:
+        return message_max
+    return min(bundle_cap, max(bundle_max, len(cmds) * message_max))
+
+
+# How many of a buffer's type slots stay available for writes and their
+# replies, whatever telemetry arrived first. `_topic_class` already gives a
+# write its own bucket so telemetry cannot share it - but the slots
+# themselves were handed out first-come, which defeated that intent the
+# moment a device had more telemetry types than slots. Measured 2026-08-27
+# on a PowerOcean with two accessories: 20 of 20 slots taken by telemetry,
+# and every user write of the session (241/100, 241/102, 96/127, 96/145,
+# 96/22, each with its reply) evicted with nothing kept but a name and a
+# count. A capture opened to record what a user changed then holds
+# everything except that.
+#
+# Four writes with their replies is what a settings session looks like, so
+# eight slots is the reserve. Telemetry keeps the rest.
+WRITE_CLASS_RESERVE = 8
+
+# A write type that has repeated this often is not a person pressing a
+# button, it is the vendor app talking to itself. The 2026-08-28 beta.24
+# capture (#247) held 96/97 1157 times in six hours - once every eighteen
+# seconds while the app was open - and it had taken a reserve slot before the
+# reporter changed anything. His mode change, 241/102, arrived twice and was
+# dropped. Four presses on a button in a settings session stay far below
+# this, so a genuine write never gives way to another.
+_PERIODIC_WRITE_MIN_SEEN = 20
+
+_WRITE_CLASSES = ("set", "set_reply")
+
+
+def _is_write_key(key: str) -> bool:
+    """Whether a bucket key belongs to a write or its reply.
+
+    `frame_key` puts the topic class in front, so the prefix is the class.
+    """
+    return key.split(":", 1)[0] in _WRITE_CLASSES
+
+
+def _topic_class(topic: str) -> str:
+    """Return the bucket a topic belongs to.
+
+    Four classes rather than two. `frame_key` puts the class in front of
+    the message type, so a write gets its own bucket and cannot be crowded
+    out of the capture by telemetry - which outnumbers it by four orders of
+    magnitude on a live device.
+
+    `set_reply` is not a write and does not share its bucket. It is the
+    device answering one, which is the half that says whether a write was
+    accepted rather than merely sent, and it is worth its own place for the
+    same reason the write is.
+    """
+    if "get_reply" in topic:
+        return "get_reply"
+    if topic.endswith("/set_reply"):
+        return "set_reply"
+    if topic.endswith("/set"):
+        return "set"
+    return "property"
+
+
+def build_frame_entry(
+    topic: str,
+    payload: bytes,
+    secrets: list[str],
+    max_bytes: int,
+    parsed_keys: int | None = None,
+) -> dict[str, Any]:
+    """Build one diagnostics entry for a raw frame.
+
+    The frame is masked first and truncated second, so truncation can
+    never cut a mask in half and leave a fragment of a serial behind.
+    `size` reports the original length.
+
+    A cut frame carries ``truncated``. `size` alone technically said the
+    same thing - it disagrees with the length of the stored hex - but
+    nobody read it that way: three STREAM AC 5000 downloads went through
+    analysis with their full-state frames cut to a third, and the missing
+    fields were reported as fields the device does not send. A flag that
+    has to be derived is a flag that gets missed, so this one is written
+    down. It is absent rather than false on a whole frame, which also
+    dates the entry: a capture whose frames never carry the key predates
+    the marker and has to be checked by hand.
+    """
+    sanitized = sanitize_frame(payload, secrets)
+    entry: dict[str, Any] = {
+        "ts": time.time(),
+        "topic": _topic_class(topic),
+        "size": len(payload),
+        "hex": sanitized[:max_bytes].hex(),
+    }
+    if len(sanitized) > max_bytes:
+        entry["truncated"] = True
+    if parsed_keys is not None:
+        entry["parsed_keys"] = parsed_keys
+    return entry
+
+
+def decode_cmd_headers(payload: bytes) -> list[dict[str, Any]]:
+    """Return the (cmd_func, cmd_id) pairs a frame carries.
+
+    Used for diagnostics readability only: knowing which commands a device
+    sends is the first thing a field-layout analysis needs. A frame that
+    does not decode yields an empty list rather than raising, because a
+    capture path must never affect ingest.
+    """
+    from .proto.decoder import decode_header_message
+
+    try:
+        headers, _ = decode_header_message(payload)
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        {"cmd_func": header.get("cmd_func"), "cmd_id": header.get("cmd_id")}
+        for header in (headers or [])
+        if isinstance(header, dict)
+    ]
+
+
+# A discriminator read out of a payload is device-controlled input. Keys end up
+# in a diagnostics dump and in a dict that is capped by key count, so the value
+# is length-limited before it becomes part of a key.
+_KEY_VALUE_MAX_CHARS = 32
+
+# JSON discriminators, in the order they are tried. Every device family that
+# pushes JSON marks its message type with one of these: Delta 2 uses
+# ``typeCode``, Delta 3 and the Smart Plug use ``cmdFunc``/``cmdId``, and SET
+# echoes carry ``operateType``/``moduleType``.
+_JSON_TYPE_FIELDS = ("typeCode", "operateType", "moduleType")
+
+
+def _key_value(value: Any) -> str:
+    """Return a discriminator value that is safe to use inside a key."""
+    return str(value)[:_KEY_VALUE_MAX_CHARS]
+
+
+def frame_key(entry: dict[str, Any], payload: bytes, secrets: list[str]) -> str:
+    """Return the message-type key a frame is bucketed under.
+
+    The key is the topic class plus the message type, because the same
+    message type means something different on ``get_reply`` (a full state
+    dump, answered on request) than on ``property`` (an incremental push),
+    and the full dump is the single most useful frame for building a
+    parser. Giving it its own bucket keeps a frequent push from crowding
+    it out.
+
+    For a protobuf frame the message type is the **first** ``(cmd_func,
+    cmd_id)`` header. A frame can bundle several commands, and the first
+    one is used because a bundle's composition is stable per message type
+    in every capture observed so far - keying on the whole list would
+    split one message type across buckets whenever a device appends an
+    optional command. The remaining headers stay visible in the entry's
+    ``cmds`` field, so nothing is lost for the reader.
+
+    For a JSON frame the message type is the payload's own type
+    discriminator. A payload that carries none falls back to a single
+    JSON bucket, which is the honest answer: without a discriminator
+    there is nothing to tell its messages apart by.
+
+    ``secrets`` is required rather than optional because that JSON
+    discriminator is a string copied out of the payload, and the key it
+    becomes is exported to diagnostics - which users are asked to attach
+    to public issue reports. The payload is masked first, exactly as the
+    stored frame is, so a device that puts an identifier where a type
+    marker belongs cannot smuggle it past the export as a dict key.
+    """
+    topic = str(entry.get("topic", "?"))
+    if entry.get("format") == "json":
+        return f"{topic}:{_json_key(sanitize_frame(payload, secrets))}"
+    cmds = entry.get("cmds") or []
+    if cmds and isinstance(cmds[0], dict):
+        head = cmds[0]
+        return f"{topic}:proto/{head.get('cmd_func')}.{head.get('cmd_id')}"
+    return f"{topic}:proto/undecoded"
+
+
+def _json_key(payload: bytes) -> str:
+    """Return the type discriminator of a JSON push, or a shared fallback."""
+    try:
+        data = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return "json/unparsed"
+    if not isinstance(data, dict):
+        return "json"
+    cmd_func = data.get("cmdFunc")
+    cmd_id = data.get("cmdId")
+    if cmd_func is not None or cmd_id is not None:
+        return f"json/{_key_value(cmd_func)}.{_key_value(cmd_id)}"
+    for field in _JSON_TYPE_FIELDS:
+        value = data.get(field)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            return f"json/{field}={_key_value(value)}"
+    return "json"
+
+
+class _Bucket:
+    """The frames kept for one message type.
+
+    Split in two on purpose. ``samples`` is the thinned history, one
+    frame per time slot across the whole recording. ``latest`` always
+    holds the newest frame of this type, so the end of the capture is
+    never a slot width stale - a reporter who downloads diagnostics right
+    after doing something on the device has to see that frame.
+    """
+
+    __slots__ = (
+        "first_ts",
+        "keys_seen",
+        "latest",
+        "novel",
+        "samples",
+        "seen",
+        "slot_s",
+    )
+
+    def __init__(self) -> None:
+        self.samples: list[tuple[int, dict[str, Any]]] = []
+        self.latest: tuple[int, dict[str, Any]] | None = None
+        self.first_ts = 0.0
+        # Width of one sampling slot in seconds. Zero means "keep every
+        # frame" and holds until the budget is first exceeded.
+        self.slot_s = 0.0
+        self.seen = 0
+        # What this message type has said before: the last value of every
+        # reading, and how many frames in a row it has held it. Both are
+        # needed - see TypedFrameBuffer for why a first appearance alone
+        # does not catch the case this exists for.
+        self.keys_seen: dict[str, tuple[Any, int]] = {}
+        self.novel: list[tuple[int, dict[str, Any]]] = []
+
+    def items(self) -> list[tuple[int, dict[str, Any]]]:
+        """Return every frame kept for this type, without repeating one.
+
+        A novel frame is also offered to the thinned history, so the two
+        lists can hold the same frame. They are merged on the arrival
+        sequence, which is unique per frame.
+        """
+        merged = dict(self.novel)
+        merged.update(self.samples)
+        if self.latest is not None:
+            merged[self.latest[0]] = self.latest[1]
+        return sorted(merged.items())
+
+
+class TypedFrameBuffer:
+    """Frame store that keeps a sample of every message type.
+
+    A single ring buffer is the wrong shape for this job, and a six-hour
+    recording proved it: a Stream Micro sent one message type every two
+    seconds, so the 24 slots held its last 199 seconds and nothing else.
+    The frames a parser actually needed - the battery report, the frames
+    carrying state of charge - had been pushed out by the most frequent
+    one. The recording was fine; the buffer threw it away.
+
+    Two rules fix that:
+
+    **One bucket per message type.** A rare type competes only with
+    itself, so a report that arrives once an hour can never be displaced
+    by one that arrives every two seconds. The number of buckets is
+    capped so a chatty device cannot grow the capture without bound;
+    frames beyond that cap are counted, not silently dropped.
+
+    **One frame per time slot; when the budget is full, double the slot
+    width and re-thin.** Slots are counted from the first frame of the
+    type, so slot zero - the start of the recording - is kept for as long
+    as the capture runs, and every later slot in which the device said
+    anything is represented by exactly one frame. Nothing in the middle
+    can be lost while the ends survive, because the rule never
+    distinguishes between old and new: doubling the width merges
+    neighbouring slots pairwise across the whole span at once. That is
+    the property a plain "drop every second frame" ring does not have -
+    there the freed slots refill at the arrival rate and the middle
+    empties out within minutes, which is how the first attempt at this
+    fix failed its own test.
+
+    Slots are measured on frame timestamps, which are wall clock, so an
+    NTP correction can hand a frame a timestamp older than the bucket's
+    first one. Such a frame shares slot 0 with the oldest frame instead of
+    getting a slot of its own below zero. That is not cosmetic: widening
+    merges neighbouring slots, and a below-zero slot sitting between two
+    zero slots is a pattern no widening can merge, so the loop that widens
+    until the budget holds would never reach it.
+
+    Not thread-safe by itself, and ``add`` is not atomic the way appending
+    to a deque is. Both callers write from the Paho thread and read on the
+    event loop, so each holds a lock of its own around every call: the
+    probe its capture lock, the coordinator its raw-frame lock. A third
+    caller has to bring one too.
+    """
+
+    def __init__(
+        self,
+        keys_max: int,
+        per_key_max: int,
+        write_reserve: int = WRITE_CLASS_RESERVE,
+    ) -> None:
+        self._keys_max = keys_max
+        self._per_key_max = per_key_max
+        # Writes get slots BESIDE the budget, not out of it. Taking them
+        # from `keys_max` would starve telemetry in a small buffer and, worse,
+        # break the guarantee this buffer exists for: that a rare type
+        # survives a flood of a frequent one. A reserve that costs an
+        # existing guarantee is not a fix.
+        self._write_reserve = max(write_reserve, 0)
+        # One slot of every type's budget is reserved for the newest frame.
+        self._samples_max = max(per_key_max - 1, 1)
+        # Novel frames are kept on top of that budget rather than out of it:
+        # taking their slots from the thinned history would trade the shape
+        # of the recording for its contents, and the sampling exists so that
+        # a six-hour capture still has a middle.
+        self._novel_max = _NOVEL_PER_KEY_MAX
+        # Insertion-ordered: the first message types a device sends are the
+        # ones that get a bucket.
+        self._buckets: dict[str, _Bucket] = {}
+        self._dropped_frames = 0
+        # Which types were turned away, not only how many frames. A bare
+        # count cannot answer "was the message I am looking for among
+        # them", which is the only question a saturated capture ever
+        # raises. Names carry no payload, so recording them costs nothing
+        # a reader could not already see.
+        self._dropped_per_key: dict[str, int] = {}
+        self._dropped_keys_untracked = 0
+        # Write types that gave their reserve slot to a rarer write, with how
+        # often they had been seen. Named in the download so a reader can
+        # tell "this write never happened" from "this write was periodic and
+        # made room".
+        self._write_keys_evicted: dict[str, int] = {}
+        self._seq = 0
+
+    def add(
+        self,
+        key: str,
+        entry: dict[str, Any],
+        readings: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Store one frame under its message-type key.
+
+        ``readings`` are what the parser took out of this frame, names and
+        values. They decide whether the frame said something its message
+        type has not said before, which is the one thing the thinned
+        history cannot preserve on its own.
+        """
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            if (
+                not self._has_slot_for(key)
+                and _is_write_key(key)
+                and key not in self._write_keys_evicted
+            ):
+                # The reserve is full. A slot held by a write that repeats
+                # like telemetry is worth less than the one that just
+                # arrived, because the newcomer is by definition the rarer
+                # of the two, and rare writes are what the reserve is for.
+                # A key that already gave up its slot does not get to buy
+                # it back: it was evicted for repeating, so it is the one
+                # write guaranteed to come back, and eighteen seconds later
+                # it would look like a new type and spend a second eviction
+                # on itself. Once out, it is counted like any other dropped
+                # type from then on.
+                self._evict_periodic_write()
+            if not self._has_slot_for(key):
+                # No budget left for a new type. Counted rather than ignored,
+                # so a reader can tell a saturated capture from a complete one.
+                self._dropped_frames += 1
+                self._note_dropped(key)
+                return
+            bucket = self._buckets[key] = _Bucket()
+            bucket.first_ts = _entry_ts(entry)
+        bucket.seen += 1
+        self._seq += 1
+        if bucket.latest is not None:
+            # The frame that was newest until now competes for a sampling
+            # slot; the incoming one takes over the reserved newest slot.
+            self._sample(bucket, bucket.latest)
+        bucket.latest = (self._seq, entry)
+        if readings is not None:
+            self._note_novelty(bucket, (self._seq, entry), readings)
+
+    def _has_slot_for(self, key: str) -> bool:
+        """Whether a new message type can still get a bucket.
+
+        Two independent ceilings. Telemetry fills `keys_max` as it always
+        did; writes and their replies draw on a reserve of their own beside
+        it. They cannot take each other's slots in either direction, which
+        is the point: telemetry arrives first on every device, and
+        first-come over one shared budget is what emptied the reserve.
+        """
+        if _is_write_key(key):
+            writes = sum(1 for k in self._buckets if _is_write_key(k))
+            return writes < self._write_reserve
+        telemetry = sum(1 for k in self._buckets if not _is_write_key(k))
+        return telemetry < self._keys_max
+
+    def _evict_periodic_write(self) -> None:
+        """Free one reserve slot held by a write that repeats like telemetry.
+
+        Picks the write bucket seen most often, and only when it has been
+        seen at least `_PERIODIC_WRITE_MIN_SEEN` times; below that every
+        write in the reserve counts as a person's action and none gives way.
+        The evicted type keeps its name and count in the dropped list, which
+        is what the reserve's first shape recorded for every write - the
+        difference is that now it happens to the app's heartbeat instead of
+        the reporter's setting.
+
+        Writing `dropped_per_key` directly here is safe against the bound
+        `_note_dropped` enforces: an evicted key was already a tracked
+        bucket, so at most `write_reserve` keys can ever enter this way.
+
+        A `set` and the `set_reply` of the same type are judged on their
+        own counts, not as a pair. Only a periodic half is eligible, the
+        first-come reserve had already split such pairs (in the reporter's
+        capture 96/97 had no reply tracked and 96/112 no write), and both
+        halves stay pairable by name in the dropped list. Pairing them
+        would cost two slots per eviction and buy nothing.
+        """
+        busiest: str | None = None
+        for key, bucket in self._buckets.items():
+            if not _is_write_key(key) or bucket.seen < _PERIODIC_WRITE_MIN_SEEN:
+                continue
+            if busiest is None or bucket.seen > self._buckets[busiest].seen:
+                busiest = key
+        if busiest is None:
+            return
+        seen = self._buckets.pop(busiest).seen
+        self._write_keys_evicted[busiest] = (
+            self._write_keys_evicted.get(busiest, 0) + seen
+        )
+        self._dropped_frames += seen
+        self._dropped_per_key[busiest] = self._dropped_per_key.get(busiest, 0) + seen
+
+    def _note_dropped(self, key: str) -> None:
+        """Record the name of a type that found no bucket.
+
+        Bounded the same way the buckets are, because the keys come off
+        the wire and a device that saturates the budget is exactly the one
+        that might keep inventing names. Past the cap only the count of
+        further distinct names is kept, so a reader still knows the list
+        is partial instead of reading it as complete.
+        """
+        counted = self._dropped_per_key.get(key)
+        if counted is not None:
+            self._dropped_per_key[key] = counted + 1
+        elif len(self._dropped_per_key) < self._keys_max:
+            self._dropped_per_key[key] = 1
+        else:
+            self._dropped_keys_untracked += 1
+
+    def _note_novelty(
+        self,
+        bucket: _Bucket,
+        item: tuple[int, dict[str, Any]],
+        readings: Mapping[str, Any],
+    ) -> None:
+        """Keep a frame that said something its message type had not said.
+
+        A configuration readback is the case this exists for. It rides the
+        same message type as the telemetry around it and arrives once, so
+        the one frame a recording was opened for competes with a push that
+        repeats every two seconds, and loses.
+
+        Two things count as new, because the first alone is not enough. A
+        reading the type has never carried is the obvious one. A reading
+        whose value changed after holding still is the one that matters for
+        a setting somebody just moved in the vendor app, and the first
+        appearance of that key will usually have been its **old** value.
+
+        Holding still is what separates a setting from telemetry, and it is
+        why the second rule does not simply keep every change. Grid power
+        moves on every frame and would claim a slot on every frame, which
+        is the crowding the sampling exists to prevent. A value that has
+        been the same for `_STABLE_RUN` frames and then moves is a setting
+        on any device this integration talks to.
+
+        Novelty is judged per message type rather than per device. The same
+        reading can arrive both in an answer to a get and in an incremental
+        push, and those are different buckets on purpose: that a full dump
+        once carried a field says nothing about whether the device ever
+        pushes it on its own, which is the question a control needs
+        answered.
+
+        The keys a type has carried are bounded by the parser's key space,
+        so the record cannot grow without bound. Values are kept only to be
+        compared with the next one, never exported. The frames kept are
+        capped separately, keeping the most recent: the first frames of a
+        recording introduce every key a device reports, and those are
+        already kept as the start of the thinned history.
+        """
+        novel = False
+        for name, value in readings.items():
+            key = str(name)
+            previous = bucket.keys_seen.get(key)
+            if previous is None:
+                novel = True
+                bucket.keys_seen[key] = (value, 1)
+                continue
+            last, run = previous
+            if _same_reading(last, value):
+                bucket.keys_seen[key] = (last, run + 1)
+                continue
+            if run >= _STABLE_RUN:
+                novel = True
+            bucket.keys_seen[key] = (value, 1)
+        if not novel:
+            return
+        bucket.novel.append(item)
+        if len(bucket.novel) > self._novel_max:
+            del bucket.novel[0]
+
+    def _sample(self, bucket: _Bucket, item: tuple[int, dict[str, Any]]) -> None:
+        """Offer one frame to the thinned history of its type."""
+        if bucket.samples and _slot(item, bucket) == _slot(bucket.samples[-1], bucket):
+            return
+        bucket.samples.append(item)
+        # A loop, not a single doubling: an arrival burst can overshoot the
+        # budget by more than one factor of two, and the invariant
+        # len(samples) <= samples_max has to hold on the way out regardless.
+        while len(bucket.samples) > self._samples_max:
+            span = _entry_ts(bucket.samples[-1][1]) - bucket.first_ts
+            bucket.slot_s = (
+                bucket.slot_s * 2
+                if bucket.slot_s > 0
+                else max(span / self._samples_max, _MIN_SLOT_S)
+            )
+            before = len(bucket.samples)
+            widest = max(
+                _entry_ts(item[1]) - bucket.first_ts for item in bucket.samples
+            )
+            bucket.samples = _thin_to_slots(bucket.samples, bucket)
+            if len(bucket.samples) >= before and bucket.slot_s > max(
+                widest, _MIN_SLOT_S
+            ):
+                # Unreachable while slots stay non-negative and monotonic in
+                # the timestamp: once a slot is wider than the whole span,
+                # every sample falls into slot 0 and thinning leaves one. It
+                # stays as a backstop because the alternative is a loop that
+                # never ends, on the Paho thread and under the caller's lock,
+                # which stops ingest outright and blocks the next diagnostics
+                # read behind the same lock.
+                del bucket.samples[0]
+
+    def frames(self) -> list[dict[str, Any]]:
+        """Return every kept frame, oldest first.
+
+        Sorted by the timestamp the reader sees, with arrival order as the
+        tie-break so frames captured within the same clock tick keep the
+        sequence they arrived in.
+        """
+        merged = [item for bucket in self._buckets.values() for item in bucket.items()]
+        merged.sort(key=lambda item: (_entry_ts(item[1]), item[0]))
+        return [entry for _, entry in merged]
+
+    def stats(self) -> dict[str, Any]:
+        """Return what was heard versus what was kept.
+
+        Without this a reader cannot tell a quiet device from a saturated
+        capture: both show a short frame list. ``span_s`` covers the whole
+        capture window rather than one type, because the first and the
+        newest frame of every type are always kept.
+        """
+        kept = self.frames()
+        timestamps = [ts for ts in map(_entry_ts, kept) if ts > 0]
+        return {
+            "frames_seen": (
+                sum(bucket.seen for bucket in self._buckets.values())
+                + self._dropped_frames
+            ),
+            "frames_kept": len(kept),
+            "span_s": (
+                round(timestamps[-1] - timestamps[0], 1)
+                if len(timestamps) > 1
+                else None
+            ),
+            "keys_tracked": len(self._buckets),
+            "keys_max": self._keys_max,
+            # Named in the download so a reader can tell a capture that
+            # protected its writes from one taken before this existed.
+            "write_slots_reserved": self._write_reserve,
+            "per_key_max": self._per_key_max,
+            "frames_dropped_key_budget": self._dropped_frames,
+            "dropped_per_key": dict(self._dropped_per_key),
+            "dropped_keys_untracked": self._dropped_keys_untracked,
+            "write_keys_evicted": dict(self._write_keys_evicted),
+            "per_key": {
+                key: {
+                    "seen": bucket.seen,
+                    "kept": len(bucket.items()),
+                    # Frames held for carrying a reading this type had not
+                    # carried before. A zero here on a type that clearly
+                    # changed during the recording says the parser never saw
+                    # the change, which is a different fault from a thinned
+                    # capture and needs a different answer.
+                    "novel": len(bucket.novel),
+                }
+                for key, bucket in self._buckets.items()
+            },
+        }
+
+
+# Floor for the sampling slot, used when a type's first frames all carry the
+# same timestamp and the observed span is therefore zero.
+_MIN_SLOT_S = 0.001
+
+# How many frames a message type may keep for having said something new.
+# Four rather than one because a single change in the vendor app can move
+# several settings at once, and rather than many because these sit on top of
+# the per-type budget instead of inside it. Worst case for a whole capture is
+# therefore keys_max * (per_key_max + 4) frames rather than
+# keys_max * per_key_max: 280 rather than 200 at the coordinator's settings.
+# The write reserve raises the type count the same way, beside the budget
+# rather than inside it: (keys_max + WRITE_CLASS_RESERVE) * (per_key_max + 4),
+# 392 rather than 280 at those settings.
+_NOVEL_PER_KEY_MAX = 4
+
+# How many frames a reading must hold one value before a change to it is
+# worth a slot. Telemetry moves on nearly every frame and never reaches this;
+# a setting holds for as long as nobody touches it. Five is deliberately low:
+# the cost of a false positive is one kept frame, the cost of a false negative
+# is the frame the recording was opened for.
+_STABLE_RUN = 5
+
+
+def _same_reading(previous: Any, current: Any) -> bool:
+    """Return whether a reading is unchanged, tolerating unhashable values.
+
+    Values come out of a parser and are mostly numbers, but a list or a dict
+    reaches here too. Equality is compared rather than identity, and anything
+    that refuses to compare counts as changed - which costs at most one kept
+    frame and never hides one.
+    """
+    try:
+        return bool(previous == current)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _slot(item: tuple[int, dict[str, Any]], bucket: _Bucket) -> int:
+    """Return which sampling slot a frame falls into."""
+    if bucket.slot_s <= 0:
+        # Every frame gets its own slot until the budget is first exceeded.
+        return item[0]
+    # Clamped at zero: a frame older than the bucket's first one would other-
+    # wise take a negative slot, and _thin_to_slots compares each frame only
+    # against its predecessor, so [0, -1, 0] survives every doubling.
+    offset = _entry_ts(item[1]) - bucket.first_ts
+    return int(offset // bucket.slot_s) if offset > 0 else 0
+
+
+def _thin_to_slots(
+    items: list[tuple[int, dict[str, Any]]], bucket: _Bucket
+) -> list[tuple[int, dict[str, Any]]]:
+    """Keep the earliest frame of each slot, discarding the rest."""
+    thinned: list[tuple[int, dict[str, Any]]] = []
+    last_slot: int | None = None
+    for item in items:
+        slot = _slot(item, bucket)
+        if slot != last_slot:
+            thinned.append(item)
+            last_slot = slot
+    return thinned
+
+
+def _entry_ts(entry: dict[str, Any]) -> float:
+    """Return the entry timestamp, tolerating a missing or odd value."""
+    ts = entry.get("ts")
+    return (
+        float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0
+    )

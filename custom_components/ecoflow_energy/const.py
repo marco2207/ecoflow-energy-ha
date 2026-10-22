@@ -1,0 +1,10397 @@
+"""Constants for the EcoFlow Energy integration."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Literal, Protocol
+
+from homeassistant.const import Platform
+
+# Four names below (DEVICE_TYPE_UNKNOWN, device_log_tag, get_device_name,
+# get_device_type) are re-exported for callers that import them from this
+# top-level const module (e.g. coordinator/core.py, config_flow_setup.py)
+# rather than from .ecoflow.const directly. They are unused in this file's
+# own body, hence the per-line noqa instead of deleting them - and no
+# __all__ (that would change what `import *` exposes from this module).
+from .ecoflow.const import (  # noqa: E402
+    DEVICE_TYPE_DELTA,
+    DEVICE_TYPE_DELTA3,
+    DEVICE_TYPE_DELTA_PRO_ULTRA,
+    DEVICE_TYPE_OCEAN2,
+    DEVICE_TYPE_POWEROCEAN,
+    DEVICE_TYPE_POWERPULSE2,
+    DEVICE_TYPE_POWERSTREAM,
+    DEVICE_TYPE_SMART_HOME_PANEL_2,
+    DEVICE_TYPE_SMART_METER,
+    DEVICE_TYPE_SMART_PANEL_40,
+    DEVICE_TYPE_SMARTPLUG,
+    DEVICE_TYPE_SOLAR_TRACKER,
+    DEVICE_TYPE_STREAM,
+    DEVICE_TYPE_STREAM_AC5000,
+    DEVICE_TYPE_UNKNOWN,  # noqa: F401
+    DEVICE_TYPE_WAVE3,
+    POWEROCEAN_FEED_SCHEDULE_POWER_MAX_DEFAULT_W,
+    POWEROCEAN_FEED_SCHEDULE_POWER_MIN_W,
+    POWEROCEAN_SCHEDULE_POWER_MAX_DEFAULT_W,
+    POWEROCEAN_SCHEDULE_POWER_MIN_W,
+    POWEROCEAN_SCHEDULE_POWER_STEP_W,
+    POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS,
+    device_log_tag,  # noqa: F401
+    get_device_name,  # noqa: F401
+    get_device_type,  # noqa: F401
+)
+from .ecoflow.energy_stream import (  # noqa: E402
+    POWERGLOW_TARGET_TEMP_C_MAX,
+    POWERGLOW_TARGET_TEMP_C_MIN,
+)
+from .ecoflow.parsers.delta_pro_ultra_proto import (
+    MAX_PACKS as DELTAPROULTRA_MAX_PACKS,  # noqa: E402
+)
+from .ecoflow.parsers.hr61_proto import (
+    CIRCUIT_COUNT as SMARTPANEL40_CIRCUIT_COUNT,  # noqa: E402
+)
+from .ecoflow.parsers.ocean2_proto import (
+    MAX_MODULES as OCEAN2_MAX_MODULES,  # noqa: E402
+)
+from .ecoflow.parsers.ocean2_proto import (  # noqa: E402
+    OCEAN2_CONTROL_MODES,
+    OCEAN2_WORK_MODES,
+)
+from .ecoflow.parsers.powerocean import (  # noqa: E402
+    EMS_WORK_STATES,
+    PARALLEL_UNIT_MAX,
+)
+from .ecoflow.parsers.powerocean_proto import SCHEDULE_MAX_INDEX  # noqa: E402
+from .ecoflow.parsers.smart_home_panel_2_proto import (
+    CIRCUIT_COUNT as SMARTHOMEPANEL2_CIRCUIT_COUNT,  # noqa: E402
+)
+from .ecoflow.parsers.smart_home_panel_2_proto import (
+    STORAGE_CHANNEL_COUNT as SMARTHOMEPANEL2_STORAGE_CHANNEL_COUNT,  # noqa: E402
+)
+
+DOMAIN = "ecoflow_energy"
+
+# Top-level hass.data key for per-entry lists of skipped (unsupported)
+# devices. Kept separate from hass.data[DOMAIN] (which is keyed by
+# entry_id and holds coordinators) so a reserved string key cannot
+# collide with an entry_id.
+DATA_SKIPPED_DEVICES = "ecoflow_energy_skipped_devices"
+# Listen-only probes capturing raw data of devices that have no parser yet.
+DATA_DEVICE_PROBES = "ecoflow_energy_device_probes"
+
+PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.CLIMATE,
+    Platform.BUTTON,
+]
+
+# A local Modbus entry: the readings, plus the one control switch, the two
+# writable settings and the diagnostic that shows whether the unit accepted
+# control. Nothing else of the cloud platform list applies to it.
+LOCAL_PLATFORMS: list[Platform] = [
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.NUMBER,
+    Platform.BINARY_SENSOR,
+]
+
+# Config entry keys
+CONF_UNIT_ID = "unit_id"
+# Register map of a Local entry (three_phase or single_phase); absent on
+# entries made before the single-phase map existed, which are three-phase.
+CONF_MODBUS_VARIANT = "modbus_variant"
+CONF_ACCESS_KEY = "access_key"
+CONF_SECRET_KEY = "secret_key"
+CONF_DEVICES = "devices"
+CONF_MODE = "mode"
+CONF_VEHICLE_ENERGY = "powerpulse_vehicle_energy"
+CONF_EMAIL = "email"
+CONF_PASSWORD = "password"
+CONF_USER_ID = "user_id"
+CONF_AUTH_METHOD = "auth_method"
+
+# The volunteer capture. Off unless the user turns it on, and it turns itself
+# off again: it costs an extra listen-only connection per device without a
+# parser, and a deeper frame buffer for every device that has one, so it must
+# never become a permanent background load in someone's installation.
+CONF_RAW_CAPTURE = "raw_capture"
+CONF_RAW_CAPTURE_UNTIL = "raw_capture_until"
+# Wall-clock, not monotonic: the deadline has to survive a restart.
+RAW_CAPTURE_DURATION_S = 24 * 60 * 60
+
+
+def raw_capture_window_open(data: Mapping[str, Any]) -> bool:
+    """Return whether the volunteer capture is on and inside its window.
+
+    One definition for three readers - setup, the options form and the
+    coordinator's buffer depth. The boolean alone is not the answer: a window
+    that has passed its deadline reads as closed here even while the flag is
+    still stored, which is what keeps a stale flag from acting.
+
+    Pure on purpose. Switching an expired flag off is a side effect that
+    belongs to setup, which owns the config entry, not to a predicate three
+    callers share.
+    """
+    if not data.get(CONF_RAW_CAPTURE):
+        return False
+    return time.time() < data.get(CONF_RAW_CAPTURE_UNTIL, 0)
+
+
+# Auth methods
+AUTH_METHOD_DEVELOPER = "developer"
+AUTH_METHOD_APP = "app"
+
+# Device modes
+MODE_STANDARD = "standard"
+MODE_ENHANCED = "enhanced"
+# Local Modbus/TCP read-only mode: no account, no keys, no cloud.
+MODE_LOCAL = "local"
+
+# Local Modbus: one poll every 2 s. The device moves its power readings about
+# once a second (median 1.1 s over 40 s, measured), and one poll holds its
+# single client slot for a few milliseconds. Five failed polls in a row (about
+# 10 s) mark the device unavailable, the tolerance three polls gave at 10 s.
+LOCAL_MODBUS_POLL_INTERVAL_S = 2
+LOCAL_MODBUS_TIMEOUT_S = 3.0
+LOCAL_MODBUS_FAILURES_UNAVAILABLE = 5
+# Control heartbeat: a beat every 15 s; the unit hands control back to the app
+# after 60 s without an acknowledged one, so the integration stops there too.
+LOCAL_MODBUS_HEARTBEAT_INTERVAL_S = 15
+LOCAL_MODBUS_HEARTBEAT_LAPSE_S = 60
+
+# Coordinator - Stale detection
+STALE_THRESHOLD_S = (
+    35.0  # MQTT data older than this → trigger reconnect + HTTP fallback
+)
+SMARTPLUG_STALE_THRESHOLD_S = (
+    180.0  # Smart Plug app-auth: tolerate sparse telemetry bursts
+)
+# WAVE 3 in standby pushes its full status every 120 s and nothing in between.
+# Under the 35 s default the coordinator re-sent its initial requests every
+# stale interval, so the unit answered a full state every ~40 s instead of
+# being listened to (measured 2026-09-07, #161). Two idle uploads plus margin,
+# and the soft threshold moved with it so the stale band keeps its width, as
+# the Smart Plug pair above does. Both apply in standby only: a running unit
+# pushes every 2 s and keeps the default watch, so a silent session while it
+# runs is repaired as fast as on any other device.
+WAVE3_STALE_THRESHOLD_S = 270.0
+WAVE3_SOFT_UNAVAILABLE_S = 540.0
+# The PowerPulse 2 pushes when something changes and otherwise stays quiet,
+# charging or not. Measured over a complete 7 h capture (one session, no
+# disconnect, 83 pushes): the median gap is 50 s, 16 gaps exceed 10 min, 5
+# exceed 20 min and the longest is 50 min. Under the defaults the coordinator
+# would re-request and then reconnect through every quiet spell and mark the
+# wallbox unavailable for most of an idle hour. Stale at 20 min re-requests
+# a handful of times a day, soft at 40 min, and hard above the longest
+# silence on record, so a quiet wallbox is listened to rather than declared
+# gone. All three apply always: the unit is Enhanced-only and has no fast
+# cadence to fall back to.
+POWERPULSE2_STALE_THRESHOLD_S = 1200.0
+POWERPULSE2_SOFT_UNAVAILABLE_S = 2400.0
+POWERPULSE2_HARD_UNAVAILABLE_S = 3600.0
+# ADR-009 decision 4: the confirmation window per action. Both above twice
+# the relayed latency on file (7 s stop->finishing, 10 s start->charging)
+# and the values the contributor's own integration tested live against real
+# hardware, so the first hardware run from this integration compares like
+# for like.
+POWERPULSE2_CHARGE_ACTION_WINDOW_S: dict[str, float] = {"stop": 15.0, "start": 30.0}
+# ADR-009 decision 5: the wallbox status an action may be sent from. Start
+# only from "finishing" (the only start transition observed on file). Stop
+# from "charging" and, as amended for #515, from "suspended_charger": a start
+# waiting for solar surplus can be cancelled. The app enables its stop in
+# that state and sends the same command; confirmation still needs a fresh
+# "finishing" or "available".
+POWERPULSE2_CHARGE_ACTION_PRECONDITION: dict[str, frozenset[str]] = {
+    "start": frozenset({"finishing"}),
+    "stop": frozenset({"charging", "suspended_charger"}),
+}
+# ADR-009 decision 4: the `ev_charge_status` that confirms the action once it
+# arrives on the wallbox's own heartbeat. As amended for #515, a start also
+# confirms on "suspended_charger": a Solar-mode start without PV surplus is
+# accepted and the wallbox then reports the pause instead of charging. "preparing"
+# does not confirm a start.
+POWERPULSE2_CHARGE_ACTION_CONFIRMED: dict[str, frozenset[str]] = {
+    "start": frozenset({"charging", "suspended_charger"}),
+    "stop": frozenset({"finishing", "available"}),
+}
+# PLAN-146: the confirmation window for a maximum-current write. Measured 1-2 s
+# on the wallbox's own settings report (ParamReport 2/34) over the ten writes
+# with an echo on file (seven on 2026-08-24, three on 2026-09-10); the
+# heartbeat alone can take up to ~60 s, so a wallbox that stops sending the
+# settings report fails loudly rather than silently.
+POWERPULSE2_MAX_CURRENT_WINDOW_S: float = 20.0
+# The one confirmed round trip (write to echo) measured 358 ms; 20 s is the
+# same generous Home Assistant service-call allowance as the maximum-current
+# window above, for the same reason - not a measured worst case.
+POWERPULSE2_CHARGE_CURRENT_WINDOW_S: float = 20.0
+# PLAN-190: the confirmation window for a PowerGlow heating rod write. The rod
+# reports the new value on its next 212/8 report; the read-back measured 0.5 to
+# 5.1 s over the recorded writes, so 20 s leaves the same generous Home
+# Assistant service-call allowance as the PowerPulse windows above.
+POWERGLOW_WRITE_WINDOW_S: float = 20.0
+# PLAN-146: the maximum current range, the owner's sweep on #7 covered end to
+# end (2026-09-10).
+POWERPULSE2_MAX_CURRENT_RANGE_A: tuple[int, int] = (6, 16)
+# PLAN-188: the display brightness numbers step from one allowed value to the next.
+POWERPULSE2_DISPLAY_BRIGHTNESS_STEP_PCT: int = (
+    POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS[1] - POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS[0]
+)
+# PLAN-147: the charging-mode options and the wire values
+# `EDevPileParamSet.work_mode` uses for each - the app's own labels,
+# confirmed byte-for-byte against five mode writes and their heartbeat
+# echoes (issue #7, 2026-09-13).
+POWERPULSE2_CHARGE_MODE_OPTIONS: tuple[str, ...] = ("fast", "solar", "custom", "smart")
+POWERPULSE2_CHARGE_MODE_WIRE: dict[str, int] = {
+    "fast": 1,
+    "solar": 2,
+    "custom": 3,
+    "smart": 4,
+}
+# PLAN-172: the confirmation window for the settings writes the wallbox
+# reports in its own settings block (Solar minimum current, Custom current,
+# phase setting, and the three settings switches Continuous Charging, Block
+# Battery Discharge and Plug-and-Play). A generous service-call allowance, not
+# a measured worst case: a wallbox that sends its settings report itself sends
+# it about once a second, so a wallbox that stops sending it fails loudly
+# instead of silently.
+POWERPULSE2_SETTINGS_WINDOW_S: float = 20.0
+# #553: the PowerOcean relays the settings block less often than a wallbox
+# sends its own once-a-second report. The 2026-10-14 diagnostics counted 46
+# relayed settings messages in 429 s and 36 in 305 s (about one every 9 s),
+# and part of them are the app's acknowledgement copies, which the parser
+# ignores. The kept frames of that recording are thinned by the diagnostics
+# buffer, so gaps between them are not the device's cadence. A settings write
+# on a relayed report waits up to 60 s for the PowerOcean's next report: the
+# read-back of a write arrived within 2 s in the 2026-10-15 retest, so this is
+# a generous allowance rather than a measured worst case.
+#
+# #566: the oldest relayed report a write may be built on. In a quiet stretch
+# the PowerOcean relays far less often than on average: the diagnostics
+# counter of the longest gap between relayed reports read 40.5 s on
+# 2026-10-14 and 214 s on 2026-10-15, so a 60 s limit refused writes made
+# after a quiet stretch as "too old" although nothing had changed. A change
+# is relayed promptly: in the #553 recording every app display write whose
+# result was kept is followed by a relayed report carrying it within 2 to
+# 27 s. A relayed report that is still the latest after that is therefore
+# not older than the wallbox's settings, and 300 s covers the measured gap
+# with margin. The own-report route keeps the 10 s / 20 s values above.
+POWERPULSE2_RELAYED_SETTINGS_MAX_AGE_S: float = 300.0
+POWERPULSE2_RELAYED_SETTINGS_WINDOW_S: float = 60.0
+# PLAN-172: the oldest settings report a switch-bits write may be built on.
+# The cadence is about one report per second, so 10 s is ten missed reports;
+# a Continuous write is rebuilt from the latest report's switch byte, and a
+# report older than this may already disagree with the wallbox.
+POWERPULSE2_SETTINGS_MAX_AGE_S: float = 10.0
+# #495: how long a settings write waits for the next settings report before it
+# refuses a missing or stale one. The report arrives about once a second, so five
+# seconds is several reports; a write that finds none in that time is refused as
+# before. Nothing is sent while it waits.
+POWERPULSE2_SETTINGS_FRESH_WAIT_S: float = 5.0
+# PLAN-172: bit 4 (0x10) of the settings switch bits is the app's
+# "Continuous charging" toggle (2026-10-04 write recordings, issue #481).
+POWERPULSE2_SWITCH_BIT_CONTINUOUS: int = 0x10
+# PLAN-187: the other two app toggles that live in the same byte (write tests
+# of 2026-10-08, issues #490 and #493). Bit 0 is "Battery discharge block" and
+# reads ON when the wallbox is blocked from discharging the home battery, the
+# app's own polarity; bit 1 is "Plug and Play", ON when enabled.
+POWERPULSE2_SWITCH_BIT_BATTERY_DISCHARGE_BLOCK: int = 0x01
+POWERPULSE2_SWITCH_BIT_PLUG_AND_PLAY: int = 0x02
+# PLAN-172: the phase-setting options and the wire values field 5 of
+# `EDevPileParamSet` carries for each (0 Auto, 1 one phase, 2 three phases).
+POWERPULSE2_PHASE_SETTING_OPTIONS: tuple[str, ...] = (
+    "auto",
+    "one_phase",
+    "three_phases",
+)
+POWERPULSE2_PHASE_SETTING_WIRE: dict[str, int] = {
+    "auto": 0,
+    "one_phase": 1,
+    "three_phases": 2,
+}
+MQTT_HEALTH_CHECK_INTERVAL_S = (
+    5.0  # Run stale/reconnect health checks independently from stale threshold
+)
+
+# Graduated availability degradation thresholds (app-auth only).
+# Entities remain available with last-known values until HARD_UNAVAILABLE.
+# Observed PowerOcean telemetry has gaps up to 613s (cmd_id=33).
+# The old 95s hard cutoff (35s stale + 60s grace) was too aggressive.
+#
+# Stages: healthy -> stale -> degraded -> unavailable
+#   stale: age > STALE_THRESHOLD_S (reconnect attempts start)
+#   degraded: age > SOFT_UNAVAILABLE_S (data is old but entities still visible)
+#   unavailable: age > HARD_UNAVAILABLE_S (entities go unavailable in HA)
+SOFT_UNAVAILABLE_S = 300.0  # 5 min: data old, entities visible but stale
+SMARTPLUG_SOFT_UNAVAILABLE_S = 360.0  # 6 min: SmartPlug tolerates longer gaps
+HARD_UNAVAILABLE_S = 600.0  # 10 min: entities go unavailable
+SMARTPLUG_HARD_UNAVAILABLE_S = 600.0  # 10 min: SmartPlug hard cutoff
+HTTP_FALLBACK_INTERVAL_S = 30
+
+# Raw protobuf frame capture for diagnostics (app-auth push path), bucketed
+# by message type. A shared ring holds whatever arrives most often: a
+# PowerOcean pushes its live telemetry every few seconds while a command such
+# as the EMS report arrives minutes apart, so 24 shared slots are the last
+# minute of the frequent one and the rare command is never in a download.
+#
+# The key budget is derived from what one device actually produces, not
+# picked for size, and the number comes from a measurement rather than from
+# the command table: a ten minute listen-only recording of a PowerOcean
+# (HJ31, 2026-08-01) delivered 60 frames in twelve distinct message types on
+# `property` alone - cmd_func 96 with ids 1, 3, 7, 8, 13, 33 and 34, plus
+# 53.14, 241.5, 241.36, 209.51 and 224.38. The decoded command list would
+# have suggested seven. The `get_reply` topic class adds those types a
+# second time, an unmapped command becomes a key of its own, and so does an
+# attached accessory's report.
+#
+# Buckets are claimed in arrival order and never evicted, so a budget that
+# merely matches the observed count is spent by the frequent pushes within
+# seconds, and the rare reports - the ones this bucketing exists to keep -
+# are dropped at the key gate minutes later, which is the failure the shared
+# ring had in a different place. Twenty is the measured twelve plus room for
+# the second topic class and for what a ten minute window did not show.
+#
+# Tightened against the unsupported-device probe below on the per-key axis
+# instead, because that is the axis that costs bytes without costing
+# coverage: three frames still hold the first, one middle and the newest
+# frame of every type. This buffer is not opt-in and not time-limited - it
+# runs on every device in Enhanced Mode for as long as the integration is
+# loaded.
+#
+# The byte budget is decided per frame, from what the frame carries. A flat
+# 512 B kept every incremental push whole and cut every bundled full state
+# to a third: nineteen such frames across three STREAM AC 5000 downloads,
+# each 1434 to 1448 B in six messages, each stored as 512 B. Two thirds of
+# the device's state never reached a download, and the fields above the cut
+# were then read as fields the device does not send.
+#
+# Worst case with the split: 20 * 3 * 16384 B = 983 040 B (960 KiB) of frame
+# payload per device, roughly double that as hex text in the download, and
+# only for a device that bundles on all twenty of its message types, each of
+# them sixteen messages wide.
+# A device that never bundles is bounded at 20 * 3 * 1024 B = 61 440 B
+# (60 KiB). A budget is a ceiling rather than an allocation, so a device
+# whose frames stay under 512 B stores exactly what it stored before, and a
+# real PowerOcean bundles on one message type rather than twenty.
+RAW_FRAME_LOG_KEYS_MAX = 20
+RAW_FRAME_LOG_PER_KEY_MAX = 3
+# One message, or none that decoded. The largest single-message frames in
+# the corpus are 587 B on a Delta 3 and 527 B on a PowerOcean, both above
+# the 512 B this replaces - so both were being cut, in silence, on devices
+# nobody was looking at.
+RAW_FRAME_MAX_BYTES = 1024
+# Several messages in one frame. Sized against the widest get-all observed,
+# not against the widest one known when the constant was written: 2048 B came
+# from a 1465 B STREAM AC 5000 fixture and a PowerOcean bundles far more. One
+# J327 download (#225) carried a 2906 B get_reply, 42 percent past that cap,
+# and the eight command types in its tail - 96/10, 96/11, 96/13, 96/14,
+# 96/22, 224/1, 240/2, 241/1 - reached the download only as names in the
+# frame's own `cmds` list, with no bytes behind them. A third of that
+# device's command surface was invisible in the file whose purpose is to
+# show it.
+#
+# The truncation was never silent - the entry says `truncated` - but a flag
+# that fires on every PowerOcean get-all is a cap set too low, not a warning.
+# 4096 B carries the observed 2906 B with room for a unit that reports more
+# packs or more strings.
+#
+# It is a floor rather than the whole answer. This constant has now been too
+# small twice - 2048 raised to 4096 after #225, and 4096 cut every bundle an
+# Ocean 2 sends - because a fixed number cannot know how many messages a frame
+# carries. The first RE11 capture (#145, 16 h) holds nine bundles of 12 to 14
+# messages at 4956 to 5899 B, every one of them cut, and the message count
+# moves from frame to frame on the same unit.
+RAW_FRAME_BUNDLE_MAX_BYTES = 4096
+# So a frame that demonstrably carries n messages may claim n message budgets,
+# and this caps that claim. A bundle is a get-all rather than a stream, so the
+# number of messages in it is the honest measure of how wide the device's
+# state is; raising the floor again would only move the next cut to the next
+# device.
+#
+# 16384 B is sixteen messages at full single-message width, against the widest
+# bundle observed anywhere: 14 messages averaging 421 B. A device would have to
+# both bundle wider than any seen and fill every message to the ceiling to
+# reach it. The worst cases it sets are written down at the two buffers that
+# carry them, below.
+RAW_FRAME_BUNDLE_HARD_CAP = 16384
+
+# Undeclared protobuf field numbers: how many commands are tracked at once.
+# The same twenty message types the frame capture budgets for would be the
+# consistent number, but only the commands with a typed binding can report
+# unknown fields at all, and no device class has more than a handful of those.
+# Twelve leaves room for a device that surprises us.
+UNKNOWN_FIELD_CMDS_MAX = 12
+
+# And how many distinct field numbers are kept per command. This is the cap
+# that actually bounds the memory: the per-message limit in the decoder only
+# limits one message, and the summary accumulates across every message a
+# device ever sends. Without this a device whose field numbers vary - a fault,
+# or a decode that lands on the wrong message type - adds entries for as long
+# as the integration is loaded, and both the process and the diagnostics
+# download grow with it. Measured: 10 000 messages of 40 varying numbers reach
+# 400 000 entries and a 5 MB download.
+#
+# Two hundred is well above the gap this exists to expose. A Delta 3 status
+# frame declares 306 fields in our binding; a schema gap of more than 200
+# further numbers is not "a setting is missing", it is the wrong binding.
+UNKNOWN_FIELD_NUMBERS_MAX = 200
+
+# Unsupported-device probe: budget per message type instead of one shared ring.
+# A device that pushes one message type every two seconds fills a shared ring
+# with its own tail within minutes, and everything a parser is built from is
+# gone. Bucketing by message type makes a rare report compete only with itself.
+#
+# Same per-frame budget as above, and this is the buffer that proved it was
+# needed: the three STREAM AC 5000 captures came through here.
+# Worst case 12 * 10 * 16384 B = 1 966 080 B (1920 KiB) of frame payload,
+# roughly double that as hex text in the download. That ceiling rose with the
+# bundle budget twice, and it is reached only by a device that bundles every
+# one of its twelve message types at full width - none observed does. The
+# widest real capture is the RE11 one that forced the last raise: 53 KiB of
+# frame across nine bundles, on one bundling message type out of four.
+# A device that never bundles is bounded at 12 * 10 * 1024 B = 122 880 B
+# (120 KiB). What it costs in practice is far below either: the busiest of
+# the three captures holds 25 515 B of frame where the flat 512 B cap kept
+# 13 481 B, and it is the whole evidence base for a device the Developer API
+# refuses.
+RAW_FRAME_KEYS_MAX = 12
+RAW_FRAME_PER_KEY_MAX = 10
+
+# How often the capture checks that its listen-only session is still up. The
+# broker refuses a client id that has already been used, so a dropped session
+# can only be restored by building a new one, and nothing else does that for a
+# device that has no coordinator. Sixty seconds is well inside what the client
+# backs off to on repeated failure, so the check costs nothing when the link is
+# healthy and does not add a second retry schedule of its own.
+PROBE_WATCHDOG_INTERVAL_S = 60
+HTTP_SUPPLEMENT_INTERVAL_S = (
+    60  # Enhanced Mode: HTTP supplement poll for detail sensors
+)
+ENERGY_STREAM_KEEPALIVE_S = 20  # Re-send EnergyStreamSwitch every 20s
+QUOTAS_KEEPALIVE_S = 30  # latestQuotas poll interval (app-level keepalive)
+# min interval between auto-sync SETs that mirror EmsParamChangeReport.dev_soc into the
+# EMS sysBatBackupRatio
+APP_SURPLUS_SYNC_MIN_INTERVAL_S = 30.0
+APP_SURPLUS_SYNC_USER_GRACE_S = (
+    5.0  # ignore discrepancy briefly after a user SET to wait for the device echo
+)
+# How long an arming flag this integration just wrote is held against a device
+# frame that disagrees with it. The device acknowledges a scheduled-task write
+# in about 0.2 s and its task list already carries the change by then, so the
+# only frame that can still hold the old flag is one that left the device
+# before the write arrived. This window has to outlive such a frame and
+# nothing more; it matches the entity-side optimistic lock so both expire
+# together. A frame that agrees with the write clears it immediately.
+POWEROCEAN_SCHEDULE_ARMED_LATCH_S = 5.0
+# How long a linked STREAM unit's own connection is preferred over a per-unit
+# block a sibling hands over on its behalf (PLAN-145, #401): own wins for this
+# long after it last delivered the block, then a relayed copy is let through.
+STREAM_OWN_UNIT_ENTRY_HOLD_S = 60.0
+# coalesce slider-drag SETs into one frame; the device cannot keep up with 5%-step sets
+# at 100ms cadence and the EMS/App-layer fields desync
+POWEROCEAN_SOC_DEBOUNCE_S = 0.3
+# The two state keys the PowerOcean SoC sliders write. They are sent as one
+# frame, so a failed write has to undo both. Kept next to the debounce window
+# because the snapshot and the rollback have to agree on exactly this pair -
+# they did not in v1.16.0-beta.10, and the rollback restored the failed value.
+POWEROCEAN_SOC_STATE_KEYS = ("ems_discharge_lower_limit_pct", "ems_app_surplus_pct")
+PING_KEEPALIVE_S = 60  # MQTT ping heartbeat interval
+SMARTPLUG_GET_ALL_KEEPALIVE_S = (
+    120.0  # Smart Plug app-auth: periodic full-state refresh
+)
+# STREAM AC 5000: how often a full-state request goes out while this unit's
+# battery power is unsigned (#568). The pushes carry the per-unit reading as a
+# magnitude only, and when a second unit moves power at the same time nothing
+# in a push gives it a sign, so the reading holds its last value. Only a
+# `get_reply` carries the signed `f50.1.4`, and without a request of our own
+# the next one came when somebody opened the EcoFlow app - hours later.
+STREAM_AC5000_UNSIGNED_GET_ALL_S = 60.0
+CREDENTIAL_REFRESH_CHECK_S = (
+    43200.0  # Check every 12h whether credentials need proactive refresh
+)
+CREDENTIAL_MAX_AGE_S = 72000.0  # Proactively refresh credentials older than 20h
+
+DEVICE_TYPE_DISPLAY_NAMES: dict[str, str] = {
+    DEVICE_TYPE_POWEROCEAN: "PowerOcean",
+    DEVICE_TYPE_DELTA: "Delta 2 Max",
+    DEVICE_TYPE_DELTA3: "Delta 3 Series",
+    DEVICE_TYPE_SMARTPLUG: "Smart Plug",
+    DEVICE_TYPE_STREAM: "Stream",
+    DEVICE_TYPE_STREAM_AC5000: "STREAM AC 5000",
+    DEVICE_TYPE_POWERSTREAM: "PowerStream",
+    DEVICE_TYPE_SMART_METER: "Smart Meter",
+    DEVICE_TYPE_SOLAR_TRACKER: "Solar Tracker",
+    DEVICE_TYPE_WAVE3: "WAVE 3",
+    DEVICE_TYPE_POWERPULSE2: "PowerPulse 2",
+    DEVICE_TYPE_OCEAN2: "Ocean 2",
+    DEVICE_TYPE_SMART_PANEL_40: "OCEAN Smart Electrical Panel 40",
+    DEVICE_TYPE_DELTA_PRO_ULTRA: "DELTA Pro Ultra",
+    DEVICE_TYPE_SMART_HOME_PANEL_2: "Smart Home Panel 2",
+}
+
+# Device types that only report over the account channel (app-auth WSS).
+# Membership means: a Developer Key entry would set the device up and never
+# receive a reading from it, so the config/options flow must reject picking
+# one of these types unless the entry is running in Enhanced Mode.
+ENHANCED_ONLY_DEVICE_TYPES: frozenset[str] = frozenset(
+    {
+        DEVICE_TYPE_SMART_METER,
+        DEVICE_TYPE_SOLAR_TRACKER,
+        DEVICE_TYPE_WAVE3,
+        DEVICE_TYPE_POWERPULSE2,
+        DEVICE_TYPE_OCEAN2,
+        DEVICE_TYPE_SMART_PANEL_40,
+        DEVICE_TYPE_DELTA_PRO_ULTRA,
+        DEVICE_TYPE_SMART_HOME_PANEL_2,
+        # ES22 and ES21 only. The type has a protobuf parser and no HTTP one,
+        # so a Developer Key entry could never fill it.
+        DEVICE_TYPE_STREAM_AC5000,
+    }
+)
+
+# Delta write/profile variants.
+# R351: newer Delta 2 Max-style operateType naming.
+# R331: legacy Delta/Delta Max-style operateType naming.
+DELTA_PROFILE_R351 = "r351"
+DELTA_PROFILE_R331 = "r331"
+
+
+def get_delta_profile(product_name: str, device_sn: str = "") -> str:
+    """Return Delta command/profile variant for write/read compatibility."""
+    name = product_name.lower()
+    sn = device_sn.upper()
+
+    if sn.startswith("R331"):
+        return DELTA_PROFILE_R331
+    if sn.startswith("R351"):
+        return DELTA_PROFILE_R351
+
+    if "delta 2 max" in name:
+        return DELTA_PROFILE_R351
+    if "delta max" in name or "deltamax" in name or "delta 2" in name:
+        return DELTA_PROFILE_R331
+
+    return DELTA_PROFILE_R351
+
+
+# =====================================================================
+# Entity definition dataclasses
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class EcoFlowSensorDef:
+    key: str
+    name: str
+    unit: str | None = None
+    device_class: str | None = None
+    state_class: str | None = None
+    icon: str | None = None
+    entity_category: str | None = None
+    enhanced_only: bool = False
+    suggested_display_precision: int | None = None
+    disabled_by_default: bool = False
+    options: list[str] | None = None
+    # Display name lookup, where it must differ from the key. The key stays the
+    # entity's identity - it builds the unique_id, so changing it would orphan
+    # every existing entity - while the translation decides only the label. Set
+    # this where one reading means different things on different devices, as
+    # `solar_w` does: the unit's own MPPT power on a PowerOcean, the app's
+    # inferred third-party figure on an ES2x. Defaults to the key.
+    translation_key: str | None = None
+    # Optional accessory reading (e.g. the PowerGlow heating rod on a
+    # PowerOcean). The base device exists without it, so the entity is only
+    # created once the device has actually reported the key. See
+    # _watch_for_accessory() in sensor.py.
+    accessory: bool = False
+    # Create the accessory entity only once the reading has been non-zero.
+    # Needed where the key must be published as an explicit zero to keep it
+    # from latching: without this, the first zero would create the entity on
+    # every device. Only set it where zero genuinely means "not fitted", never
+    # where zero is a legitimate reading.
+    accessory_needs_nonzero: bool = False
+    # Entity name built from a per-device label, for readings that repeat per
+    # slot and that the owner names in the app (the Smart Panel 40's
+    # circuits). The translation carries `{label}`; the entity fills it with
+    # `label`, followed by the text the device reports under `label_key` when
+    # it has one ("12 Oven"), or `label` alone ("12"). One translation serves
+    # every slot instead of one per slot.
+    label: str | None = None
+    label_key: str | None = None
+
+
+@dataclass(frozen=True)
+class EcoFlowBinarySensorDef:
+    key: str
+    name: str
+    device_class: str | None = None
+    icon: str | None = None
+    entity_category: str | None = None
+    disabled_by_default: bool = False
+    # Same meaning as on the sensor, number and select definitions: the value
+    # only exists on the app channel, so with developer keys the entity would
+    # be created and never fill.
+    enhanced_only: bool = False
+    # Same meaning as on the sensor definition: a reading the base device does
+    # not have, so the entity is only created once the device has actually
+    # reported the key. See _watch_for_accessory() in binary_sensor.py.
+    accessory: bool = False
+    # Display name lookup where it must differ from the key, as on the
+    # sensor definition. Defaults to the key.
+    translation_key: str | None = None
+    # Same meaning as on the sensor definition.
+    label: str | None = None
+    label_key: str | None = None
+
+
+@dataclass(frozen=True)
+class EcoFlowSwitchDef:
+    key: str
+    name: str
+    state_key: str
+    icon: str | None = None
+    # Same meaning as on the sensor, binary sensor and number definitions: the
+    # read-back only exists on the app channel, so with developer keys the
+    # switch would be created and never learn the device's actual position.
+    enhanced_only: bool = False
+    # Control over something the device only sometimes has, so the entity is
+    # created on the first report that carries its state key rather than on
+    # every device. See _watch_for_accessory() in switch.py.
+    accessory: bool = False
+    # PowerPulse 2 settings switches (PLAN-172, PLAN-187): the one bit of the
+    # settings switch byte this switch stands for. The switch decodes it from
+    # `state_key` and writes it through the one coordinator write
+    # `async_set_powerpulse_switch_bit`, so a further toggle in the same byte
+    # is one definition. A PowerPulse 2 switch without a bit mask (PLAN-188,
+    # the Screen and LED Indicator switches) reads a plain on/off value from
+    # `state_key` and writes it through `async_set_powerpulse_display`, keyed
+    # by `key`.
+    bit_mask: int | None = None
+    # Same meaning as on the number and select definitions: "config" or
+    # "diagnostic", set on a switch that is a device setting rather than a
+    # day-to-day control (the Ocean 2 Storm Guard, PLAN-192).
+    entity_category: str | None = None
+
+
+@dataclass(frozen=True)
+class EcoFlowButtonDef:
+    key: str
+    name: str
+    action: str
+    state_key: str
+    icon: str | None = None
+    # Same meaning as on the switch, sensor and number definitions: the
+    # descriptor this button depends on only exists on the app channel.
+    enhanced_only: bool = True
+    # Created once its gate reading has been reported: the descriptor
+    # state_key with a sibling PowerOcean in the entry, the wallbox's own
+    # charge status without one. See _gate_key() in button.py.
+    accessory: bool = True
+
+
+@dataclass(frozen=True)
+class EcoFlowNumberDef:
+    key: str
+    name: str
+    state_key: str
+    unit: str | None = None
+    icon: str | None = None
+    min_value: float = 0
+    max_value: float = 100
+    step: float = 1
+    enhanced_only: bool = False
+    # Same meaning as on the switch definition: created on the first report
+    # that carries the state key. See _watch_for_accessory() in number.py.
+    accessory: bool = False
+    # Restricts a PowerPulse 2 number to one write route (PLAN-140/146): "sibling"
+    # only exists with the write evidenced through a PowerOcean, "own" only on
+    # the wallbox's own channel. None (every other number in the app) means no
+    # restriction. See _get_number_defs() / async_setup_entry() in number.py.
+    powerpulse_route: Literal["sibling", "own"] | None = None
+    # Same meaning as on the sensor and binary sensor definitions ("config" or
+    # "diagnostic"). Both number platforms, cloud and local, apply it.
+    entity_category: str | None = None
+    # Show a slider instead of an input box. A slider only offers values inside
+    # the current range, so it cannot produce one the device would reject.
+    slider: bool = False
+
+
+@dataclass(frozen=True)
+class EcoFlowSelectDef:
+    """Select entity definition - maps a state value to user-facing options."""
+
+    key: str
+    name: str
+    state_key: str
+    options: tuple[str, ...]
+    icon: str | None = None
+    enhanced_only: bool = False
+    # Wire value -> option, for settings the device reports as a number rather
+    # than as a label. The parser keeps the raw value so a diagnostics download
+    # shows what the device actually said; the translation lives here. A value
+    # outside the map leaves the entity unknown, which is the honest state for
+    # a setting some other client put out of range.
+    value_map: Mapping[int, str] | None = None
+    # Same meaning as on the number definition: created on the first report
+    # that carries the state key, so a setting the device never reports gets
+    # no select. See _watch_for_accessory() in select.py.
+    accessory: bool = False
+    # Same meaning as on the number definition ("config" or "diagnostic").
+    entity_category: str | None = None
+
+
+# =====================================================================
+# PowerOcean sensor definitions (from ha_discovery.py)
+# =====================================================================
+
+POWEROCEAN_SENSORS: list[EcoFlowSensorDef] = [
+    # --- Core Power (measurement) ---
+    EcoFlowSensorDef(
+        "solar_w",
+        "Solar Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "home_w",
+        "Home Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_power_w",
+        "Battery Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_power_w",
+        "Battery Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_import_power_w",
+        "Grid Import Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_power_w",
+        "Grid Export Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=0,
+    ),
+    # --- SOC ---
+    EcoFlowSensorDef(
+        "soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    # --- Battery Detail ---
+    EcoFlowSensorDef(
+        "bp_soh_pct",
+        "Battery SOH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "bp_cycles",
+        "Battery Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:battery-sync",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "bp_remain_watth",
+        "Battery Remaining Capacity",
+        "Wh",
+        "energy_storage",
+        "measurement",
+        "mdi:battery-clock",
+        suggested_display_precision=0,
+    ),
+    # --- Energy Dashboard (total_increasing, kWh) ---
+    # All 6 energy sensors available in Standard Mode via Riemann sum integration
+    EcoFlowSensorDef(
+        "solar_energy_kwh",
+        "Solar Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "home_energy_kwh",
+        "Home Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_import_energy_kwh",
+        "Grid Import Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_energy_kwh",
+        "Grid Export Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_energy_kwh",
+        "Battery Charge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-charging",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_energy_kwh",
+        "Battery Discharge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery",
+        suggested_display_precision=2,
+    ),
+    # --- Battery Diagnostics ---
+    EcoFlowSensorDef(
+        "bp_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "bp_current_a",
+        "Battery Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "bp_max_cell_temp_c",
+        "Battery Max Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-up",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_min_cell_temp_c",
+        "Battery Min Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-down",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_env_temp_c",
+        "Battery Environment Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_max_mos_temp_c",
+        "Battery Max MOSFET Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_cell_max_vol_mv",
+        "Battery Cell Max Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_cell_min_vol_mv",
+        "Battery Cell Min Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_real_soc_pct",
+        "Battery Real SOC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_real_soh_pct",
+        "Battery Real SOH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_down_limit_soc_pct",
+        "Battery Min SOC Limit",
+        "%",
+        None,
+        None,
+        "mdi:battery-low",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_up_limit_soc_pct",
+        "Battery Max SOC Limit",
+        "%",
+        None,
+        None,
+        "mdi:battery-high",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Inverter / PCS Diagnostics ---
+    EcoFlowSensorDef(
+        "pcs_ac_freq_hz",
+        "Grid Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    # EMS heartbeat only. PowerOcean has no MQTT push in Standard Mode and the
+    # HTTP quota carries no NTC reading, so with developer keys this would be
+    # a visible sensor that never fills.
+    EcoFlowSensorDef(
+        "ems_ntc_temp_max_c",
+        "EMS Max Internal Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ems_bp_alive_num",
+        "Battery Packs Online",
+        None,
+        None,
+        "measurement",
+        "mdi:battery-check",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # PowerGlow heating rod: an optional accessory, so these four are created
+    # only after the device has reported them at least once (#7). Enabled by
+    # default since 1.25.0: only a PowerOcean that reports a rod gets them, so
+    # they never clutter a system without one. An entity already registered as
+    # disabled keeps that state.
+    EcoFlowSensorDef(
+        "heating_rod_power_w",
+        "Heating Rod Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:water-boiler",
+        "diagnostic",
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "heating_rod_water_temp_c",
+        "Heating Rod Water Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-water",
+        "diagnostic",
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "heating_rod_target_power_w",
+        "Heating Rod Target Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:water-boiler",
+        "diagnostic",
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "heating_rod_target_temp_c",
+        "Heating Rod Target Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-up",
+        "diagnostic",
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_online_sum",
+        "Battery Packs Online (EMS)",
+        None,
+        None,
+        "measurement",
+        "mdi:battery-check",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv1_power_w",
+        "MPPT String 1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv1_voltage_v",
+        "MPPT String 1 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv1_current_a",
+        "MPPT String 1 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv2_power_w",
+        "MPPT String 2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv2_voltage_v",
+        "MPPT String 2 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv2_current_a",
+        "MPPT String 2 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    # PowerOcean Plus exposes additional live PV inputs. String 3 is confirmed
+    # on R374 hardware and string 4 matches the parser ceiling. Both stay
+    # disabled by default: ordinary PowerOcean units have two strings, and an
+    # entity created for a key the device never sends would sit at "unknown"
+    # forever on the majority of installations.
+    EcoFlowSensorDef(
+        "mppt_pv3_power_w",
+        "MPPT String 3 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv3_voltage_v",
+        "MPPT String 3 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv3_current_a",
+        "MPPT String 3 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv4_power_w",
+        "MPPT String 4 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv4_voltage_v",
+        "MPPT String 4 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_pv4_current_a",
+        "MPPT String 4 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_a_voltage_v",
+        "Grid Phase A Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_voltage_v",
+        "Grid Phase B Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_voltage_v",
+        "Grid Phase C Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    # --- Per-Phase Active Power & Current (3-phase monitoring) ---
+    EcoFlowSensorDef(
+        "grid_phase_a_active_power_w",
+        "Grid Phase A Active Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_active_power_w",
+        "Grid Phase B Active Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_active_power_w",
+        "Grid Phase C Active Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_a_current_a",
+        "Grid Phase A Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_current_a",
+        "Grid Phase B Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_current_a",
+        "Grid Phase C Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    # --- Per-Phase Reactive & Apparent Power (3-phase monitoring) ---
+    EcoFlowSensorDef(
+        "grid_phase_a_reactive_power_var",
+        "Grid Phase A Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_reactive_power_var",
+        "Grid Phase B Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_reactive_power_var",
+        "Grid Phase C Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_a_apparent_power_va",
+        "Grid Phase A Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_apparent_power_va",
+        "Grid Phase B Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_apparent_power_va",
+        "Grid Phase C Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- PV Inverter Link ---
+    EcoFlowSensorDef(
+        "pv_inverter_power_w",
+        "PV Inverter Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- EMS State & Control ---
+    EcoFlowSensorDef(
+        "ems_feed_mode",
+        "EMS Feed Mode",
+        None,
+        "enum",
+        None,
+        "mdi:cog",
+        "diagnostic",
+        options=["off", "no_limit", "zero", "limit"],
+    ),
+    EcoFlowSensorDef(
+        "ems_work_mode",
+        "EMS Work Mode",
+        None,
+        "enum",
+        None,
+        "mdi:cog",
+        "diagnostic",
+        options=[
+            "self_use",
+            "time_of_use",
+            "backup",
+            "debug",
+            "ac_makeup",
+            "drm",
+            "remote_schedule",
+            "standby",
+            "soc_calibration",
+            "timer",
+            "fcr",
+            "third_party",
+            "ai_schedule",
+            "kraken",
+        ],
+    ),
+    EcoFlowSensorDef(
+        "pcs_run_state",
+        "PCS Running State",
+        None,
+        "enum",
+        None,
+        "mdi:power",
+        "diagnostic",
+        disabled_by_default=True,
+        options=["standby", "running", "stopped"],
+    ),
+    EcoFlowSensorDef(
+        "grid_status",
+        "Grid Status",
+        None,
+        "enum",
+        None,
+        "mdi:transmission-tower",
+        "diagnostic",
+        options=["not_detected", "ok"],
+    ),
+    EcoFlowSensorDef(
+        "pcs_power_factor",
+        "Power Factor",
+        None,
+        "power_factor",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_feed_power_limit_w",
+        "Feed Power Limit",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_feed_ratio_pct",
+        "Feed Ratio",
+        "%",
+        None,
+        "measurement",
+        "mdi:percent",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_discharge_state",
+        "Battery Charge/Discharge State",
+        None,
+        "enum",
+        None,
+        "mdi:battery-sync",
+        "diagnostic",
+        options=["standby", "discharging", "charging"],
+    ),
+    # --- PowerPulse 1 wallbox (AC31, accessory) ---
+    # Forwarded by the PowerOcean on cmd_func 209, so these only exist once a
+    # wallbox has actually reported. Every value describes the current
+    # charging session and resets when the next one opens - which is why the
+    # session energy is `total` and never `total_increasing`.
+    #
+    # The PowerPulse 2 (`C376`) once shared these definitions, over the
+    # PowerOcean's 241 relay. It has its own device type and its own list
+    # since PLAN-132, and the relay is retired - but the `AC31` still reports
+    # here and would lose every wallbox entity if these went with it. The
+    # keys are the same on both lists on purpose: one physical quantity, two
+    # physical wallboxes, and a unique id carries the serial of the device it
+    # belongs to.
+    EcoFlowSensorDef(
+        "ev_charge_power_w",
+        "Wallbox Charging Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:ev-station",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "ev_session_energy_wh",
+        "Wallbox Session Energy",
+        "Wh",
+        "energy",
+        "total",
+        "mdi:ev-plug-type2",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "ev_session_duration_s",
+        "Wallbox Session Duration",
+        "s",
+        "duration",
+        "measurement",
+        "mdi:timer-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "ev_charge_status",
+        "Wallbox Charging Status",
+        None,
+        "enum",
+        None,
+        "mdi:ev-station",
+        None,
+        enhanced_only=True,
+        accessory=True,
+        options=[
+            "none",
+            "available",
+            "preparing",
+            "charging",
+            "suspended_charger",
+            "suspended_vehicle",
+            "finishing",
+            "faulted",
+        ],
+    ),
+    EcoFlowSensorDef(
+        "ev_vehicle_id",
+        "Wallbox Vehicle",
+        None,
+        None,
+        None,
+        "mdi:car-electric",
+        "diagnostic",
+        enhanced_only=True,
+        accessory=True,
+    ),
+    # --- EMS / System extended sensors (diagnostic, disabled by default) ---
+    EcoFlowSensorDef(
+        "ems_charge_upper_limit_pct",
+        "EMS Charge Upper Limit",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-charging-high",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_discharge_lower_limit_pct",
+        "EMS Discharge Lower Limit",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-alert-variant-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_keep_soc_pct",
+        "EMS Keep SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-lock",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_backup_ratio_pct",
+        "EMS Backup Ratio",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-lock-open",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt1_fault_code",
+        "MPPT 1 Fault Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt2_fault_code",
+        "MPPT 2 Fault Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # Unlike the fault codes above, the MPPT *warning* codes have no HTTP
+    # quota entry - they ride the protobuf EMS messages only.
+    EcoFlowSensorDef(
+        "mppt1_warning_code",
+        "MPPT 1 Warning Code",
+        None,
+        None,
+        None,
+        "mdi:alert-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt2_warning_code",
+        "MPPT 2 Warning Code",
+        None,
+        None,
+        None,
+        "mdi:alert-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pcs_ac_error_code",
+        "PCS AC Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pcs_dc_error_code",
+        "PCS DC Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pcs_ac_warning_code",
+        "PCS AC Warning Code",
+        None,
+        None,
+        None,
+        "mdi:alert-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "wifi_status",
+        "WiFi Status",
+        None,
+        "enum",
+        None,
+        "mdi:wifi",
+        "diagnostic",
+        disabled_by_default=True,
+        options=["disconnected", "connected"],
+    ),
+    EcoFlowSensorDef(
+        "ethernet_status",
+        "Ethernet Status",
+        None,
+        "enum",
+        None,
+        "mdi:ethernet",
+        "diagnostic",
+        disabled_by_default=True,
+        options=["disconnected", "connected"],
+    ),
+    EcoFlowSensorDef(
+        "cellular_status",
+        "4G Status",
+        None,
+        "enum",
+        None,
+        "mdi:signal-4g",
+        "diagnostic",
+        disabled_by_default=True,
+        options=["disconnected", "connected"],
+    ),
+    EcoFlowSensorDef(
+        "ems_led_brightness",
+        "EMS LED Brightness",
+        None,
+        None,
+        "measurement",
+        "mdi:brightness-6",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_work_state",
+        "EMS Work State",
+        None,
+        "enum",
+        None,
+        "mdi:cog",
+        "diagnostic",
+        disabled_by_default=True,
+        options=[
+            "none",
+            "init",
+            "idle",
+            "startup_ext_bp",
+            "startup_inner_bp",
+            "startup_pv",
+            "startup_grid",
+            "running",
+            "stop",
+            "maintain",
+        ],
+    ),
+    EcoFlowSensorDef(
+        "ems_total_battery_capacity_wh",
+        "Total Battery Capacity",
+        "Wh",
+        "energy_storage",
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pcs_max_output_power_w",
+        "PCS Max Output Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pcs_max_input_power_w",
+        "PCS Max Input Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_max_charge_power_w",
+        "Battery Max Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bp_max_discharge_power_w",
+        "Battery Max Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Run state and safety diagnostics (EMS change report, cmd_id=17) ---
+    # Raw device codes: the value ranges are not documented anywhere we can
+    # verify, so they stay numeric instead of being dressed up as enums with
+    # invented labels. All disabled by default - they only matter when
+    # something is wrong, and then the user enables them deliberately.
+    # All of these ride the protobuf EMS messages (cmd 8 and cmd 17), which
+    # only exist on the app channel - hence enhanced_only. Disabled by default
+    # is not enough on its own: it only delays the empty sensor until somebody
+    # enables it, and by then the registry entry is permanent.
+    EcoFlowSensorDef(
+        "afci_self_test_result",
+        "AFCI Self-Test Result",
+        None,
+        None,
+        None,
+        "mdi:flash-alert",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_self_check_state",
+        "EMS Self-Check State",
+        None,
+        None,
+        None,
+        "mdi:clipboard-check-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "sys_heat_state",
+        "System Heating State",
+        None,
+        None,
+        None,
+        "mdi:radiator",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "sys_calibration_state",
+        "SoC Calibration State",
+        None,
+        None,
+        None,
+        "mdi:tune-variant",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "parallel_mode",
+        "Parallel Mode",
+        None,
+        None,
+        None,
+        "mdi:call-split",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_limit_reason",
+        "Battery Limit Reason",
+        None,
+        None,
+        None,
+        "mdi:battery-alert",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_sg_ready_state",
+        "SG Ready State",
+        None,
+        None,
+        None,
+        "mdi:home-lightning-bolt",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+]
+
+
+def _build_po_pack_sensors(pack_num: int) -> list[EcoFlowSensorDef]:
+    """Build sensor definitions for a PowerOcean battery pack.
+
+    Pack 1: 7 core sensors enabled, 17 diagnostic disabled.
+    Packs 2-5: all 24 sensors disabled by default.
+    """
+    p = f"pack{pack_num}"
+    enabled = pack_num == 1  # Only Pack 1 core sensors enabled by default
+
+    core = [
+        EcoFlowSensorDef(
+            f"{p}_soc",
+            f"Pack {pack_num} SoC",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery",
+            suggested_display_precision=0,
+            disabled_by_default=not enabled,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_power_w",
+            f"Pack {pack_num} Power",
+            "W",
+            "power",
+            "measurement",
+            "mdi:flash",
+            suggested_display_precision=0,
+            disabled_by_default=not enabled,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_soh",
+            f"Pack {pack_num} SoH",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery-heart-variant",
+            suggested_display_precision=0,
+            disabled_by_default=not enabled,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_cycles",
+            f"Pack {pack_num} Cycles",
+            None,
+            None,
+            "total_increasing",
+            "mdi:battery-sync",
+            suggested_display_precision=0,
+            disabled_by_default=not enabled,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_voltage_v",
+            f"Pack {pack_num} Voltage",
+            "V",
+            "voltage",
+            "measurement",
+            "mdi:flash-triangle",
+            suggested_display_precision=1,
+            disabled_by_default=not enabled,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_current_a",
+            f"Pack {pack_num} Current",
+            "A",
+            "current",
+            "measurement",
+            "mdi:current-dc",
+            suggested_display_precision=2,
+            disabled_by_default=not enabled,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_remain_watth",
+            f"Pack {pack_num} Remaining Capacity",
+            "Wh",
+            "energy_storage",
+            "measurement",
+            "mdi:battery-clock",
+            suggested_display_precision=0,
+            disabled_by_default=not enabled,
+        ),
+    ]
+
+    diagnostic = [
+        EcoFlowSensorDef(
+            f"{p}_max_cell_temp_c",
+            f"Pack {pack_num} Max Cell Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-chevron-up",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_min_cell_temp_c",
+            f"Pack {pack_num} Min Cell Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-chevron-down",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_env_temp_c",
+            f"Pack {pack_num} Environment Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_calendar_soh",
+            f"Pack {pack_num} Calendar SoH",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery-heart-variant",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_cycle_soh",
+            f"Pack {pack_num} Cycle SoH",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery-heart-variant",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_accu_chg_energy_kwh",
+            f"Pack {pack_num} Lifetime Charge Energy",
+            "kWh",
+            "energy",
+            "total_increasing",
+            "mdi:battery-charging",
+            "diagnostic",
+            suggested_display_precision=2,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_accu_dsg_energy_kwh",
+            f"Pack {pack_num} Lifetime Discharge Energy",
+            "kWh",
+            "energy",
+            "total_increasing",
+            "mdi:battery",
+            "diagnostic",
+            suggested_display_precision=2,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_max_mos_temp_c",
+            f"Pack {pack_num} Max MOSFET Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-alert",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_hv_mos_temp_c",
+            f"Pack {pack_num} HV MOSFET Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-alert",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_lv_mos_temp_c",
+            f"Pack {pack_num} LV MOSFET Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-alert",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_bus_voltage_v",
+            f"Pack {pack_num} Bus Voltage",
+            "V",
+            "voltage",
+            "measurement",
+            "mdi:flash-triangle",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_ptc_temp_c",
+            f"Pack {pack_num} PTC Heater Temp",
+            "\u00b0C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_cell_max_vol_mv",
+            f"Pack {pack_num} Max Cell Voltage",
+            "mV",
+            "voltage",
+            "measurement",
+            "mdi:sine-wave",
+            "diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_cell_min_vol_mv",
+            f"Pack {pack_num} Min Cell Voltage",
+            "mV",
+            "voltage",
+            "measurement",
+            "mdi:sine-wave",
+            "diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_design_cap_mah",
+            f"Pack {pack_num} Design Capacity",
+            "mAh",
+            None,
+            "measurement",
+            "mdi:battery",
+            "diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_full_cap_mah",
+            f"Pack {pack_num} Full Capacity",
+            "mAh",
+            None,
+            "measurement",
+            "mdi:battery",
+            "diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+        ),
+        EcoFlowSensorDef(
+            f"{p}_error_code",
+            f"Pack {pack_num} Error Code",
+            None,
+            None,
+            None,
+            "mdi:alert-circle-outline",
+            "diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+        ),
+    ]
+
+    return core + diagnostic
+
+
+# Append per-pack sensors (5 packs x 24 sensors = 120 sensors)
+for _pack_num in range(1, 6):
+    POWEROCEAN_SENSORS.extend(_build_po_pack_sensors(_pack_num))
+
+POWEROCEAN_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    # Fault flags from the EMS change report (cmd_id=17). Off is the normal
+    # state; each one turns on only when the device reports that condition.
+    # That report is protobuf on the app channel, so all five are
+    # enhanced_only - with developer keys they would never leave "unknown".
+    EcoFlowBinarySensorDef(
+        "afci_fault_ch1",
+        "AFCI Fault String 1",
+        "problem",
+        "mdi:flash-alert",
+        "diagnostic",
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowBinarySensorDef(
+        "afci_fault_ch2",
+        "AFCI Fault String 2",
+        "problem",
+        "mdi:flash-alert",
+        "diagnostic",
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowBinarySensorDef(
+        "battery_line_off",
+        "Battery Line Disconnected",
+        "problem",
+        "mdi:power-plug-off",
+        "diagnostic",
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowBinarySensorDef(
+        "battery_relay_fault",
+        "Battery Relay Fault",
+        "problem",
+        "mdi:electric-switch",
+        "diagnostic",
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowBinarySensorDef(
+        "ems_sg_ready_enabled",
+        "SG Ready Enabled",
+        None,
+        "mdi:home-lightning-bolt-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+]
+
+
+# --- Scheduled charge tasks ---
+#
+# A PowerOcean has a schedule only when its owner created one in the app, and
+# most owners never do. The device reports its whole task list, so a slot that
+# exists produces schedule_N_* keys and a slot that does not produces nothing
+# at all. Both readings are therefore accessory-gated: the entity appears on
+# the first report that carries its index, and a schedule deleted later leaves
+# the entity unknown rather than frozen on its last reading, because the list
+# retracts the keys it stops mentioning.
+#
+# The upper bound comes from the parser that produces the keys, so the two
+# sides cannot drift apart. It is a guard against a malformed list, not an
+# assumption about how many slots the hardware has - only slot 1 has ever been
+# observed.
+#
+# Two things stay open and neither blocks these readings. The power the device
+# accepts has only ever been seen at 1000 and 1500 W, so the range the write
+# validates against is ours rather than the firmware's; and the three
+# recurrence fields are echoed back exactly as the device reported them,
+# never composed here, so the days and times an owner set in the app cannot
+# be rewritten from Home Assistant.
+#
+# Both the task list and the command that changes it live on the app channel,
+# so with developer keys these would be created and never fill.
+#
+# The feed-to-grid schedule below is the TOU task family (96/14 list, 96/143
+# write): the same shape as the charge schedule above, sent to a separate
+# device task list with its own index space (ADR-027 addendum, #381), and
+# gated the same way. Creating and deleting a task both stay in the app, for
+# the same reason as the charge schedule.
+#
+# The single registration of which key prefixes are a PowerOcean schedule
+# slot - both the entity loops below and the switch/number platforms read
+# from here rather than repeating the two strings.
+POWEROCEAN_SCHEDULE_PREFIXES: tuple[str, ...] = ("schedule", "feed_schedule")
+
+for _schedule_index in range(1, SCHEDULE_MAX_INDEX + 1):
+    POWEROCEAN_SENSORS.append(
+        EcoFlowSensorDef(
+            f"schedule_{_schedule_index}_window",
+            f"Schedule {_schedule_index} Window",
+            None,
+            None,
+            None,
+            "mdi:calendar-clock",
+            None,
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+    POWEROCEAN_BINARY_SENSORS.append(
+        EcoFlowBinarySensorDef(
+            f"schedule_{_schedule_index}_running",
+            f"Schedule {_schedule_index} Running",
+            "running",
+            "mdi:calendar-check",
+            None,
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+    POWEROCEAN_SENSORS.append(
+        EcoFlowSensorDef(
+            f"feed_schedule_{_schedule_index}_window",
+            f"Feed Schedule {_schedule_index} Window",
+            None,
+            None,
+            None,
+            "mdi:calendar-clock",
+            None,
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+    POWEROCEAN_BINARY_SENSORS.append(
+        EcoFlowBinarySensorDef(
+            f"feed_schedule_{_schedule_index}_running",
+            f"Feed Schedule {_schedule_index} Running",
+            "running",
+            "mdi:calendar-check",
+            None,
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+
+# Per-inverter readings of a parallel system (#436). A PowerOcean pair sends
+# its energy stream as a list, one row per inverter plus the system total
+# (96/50, #347); the total feeds Solar Power, Battery Power and Battery SOC
+# above, and each inverter's own row feeds these. They are created once a
+# unit row has been reported, so a single unit, which never sends the list,
+# never gets them. The inverters are numbered in the order of their serials,
+# which keeps the number with the unit and the serial out of the name. There
+# is no per-inverter grid reading: on a unit row that figure is the flow
+# between the two inverters, not the property's grid connection.
+#
+# The list only arrives on the app channel, so with developer keys these
+# would be created and never fill.
+for _unit_index in range(1, PARALLEL_UNIT_MAX + 1):
+    POWEROCEAN_SENSORS.extend(
+        [
+            EcoFlowSensorDef(
+                f"inverter_{_unit_index}_solar_w",
+                f"Inverter {_unit_index} Solar Power",
+                "W",
+                "power",
+                "measurement",
+                "mdi:solar-power",
+                enhanced_only=True,
+                suggested_display_precision=0,
+                accessory=True,
+            ),
+            EcoFlowSensorDef(
+                f"inverter_{_unit_index}_batt_w",
+                f"Inverter {_unit_index} Battery Power",
+                "W",
+                "power",
+                "measurement",
+                "mdi:battery",
+                enhanced_only=True,
+                suggested_display_precision=0,
+                accessory=True,
+            ),
+            EcoFlowSensorDef(
+                f"inverter_{_unit_index}_soc_pct",
+                f"Inverter {_unit_index} Battery SOC",
+                "%",
+                # No battery device class: Battery SOC above is the one the
+                # device card shows, and HA picks at random between two.
+                None,
+                "measurement",
+                "mdi:battery",
+                enhanced_only=True,
+                suggested_display_precision=0,
+                accessory=True,
+            ),
+        ]
+    )
+
+# --- Local Modbus (read-only) ---------------------------------------------
+# Keys the Modbus parser shares with the cloud stream: same quantity, same
+# unit, so the entity (unique_id `{serial}_{key}`), its history and its
+# statistics survive a switch of the same entry between modes. The per-pack SoC
+# keys are not shared: Modbus reports the user-facing SoC, the cloud stream the
+# BMS SoC, which differs by up to five points.
+POWEROCEAN_LOCAL_KEYS: frozenset[str] = frozenset(
+    {
+        "home_w",
+        "grid_w",
+        "grid_import_power_w",
+        "grid_export_power_w",
+        "solar_w",
+        "batt_w",
+        "batt_charge_power_w",
+        "batt_discharge_power_w",
+        "soc_pct",
+        "pcs_ac_freq_hz",
+        "batt_charge_energy_kwh",
+        "batt_discharge_energy_kwh",
+        "mppt_pv1_voltage_v",
+        "mppt_pv2_voltage_v",
+        "mppt_pv1_current_a",
+        "mppt_pv2_current_a",
+        "bp_online_sum",
+        "ems_backup_ratio_pct",
+        "ems_total_battery_capacity_wh",
+        "ems_feed_power_limit_w",
+    }
+)
+
+# The device's own lifetime counters. They differ from the cloud entry's
+# integrated totals by thousands of kWh, so they get their own keys: sharing
+# `solar_energy_kwh` and its two grid siblings would put the whole difference
+# into one hour of the Energy Dashboard. The integrated keys are not
+# published in Local mode, and nothing is integrated there.
+#
+# Named `*_SENSORS` so the definition-list gates discover it: every key here
+# needs a translation and a row in the PowerOcean entity documentation, and
+# the gates demand both. The family is one token (`POWEROCEANLOCALONLY`)
+# because block discovery matches exactly one family token before the suffix
+# (see `test_definition_block_names_follow_the_convention`).
+POWEROCEANLOCALONLY_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "solar_lifetime_energy_kwh",
+        "Solar Lifetime Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_import_lifetime_energy_kwh",
+        "Grid Import Lifetime Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_lifetime_energy_kwh",
+        "Grid Export Lifetime Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "fault_count",
+        "Fault Count",
+        None,
+        None,
+        "measurement",
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    # System State 2 (0x0213): the active alert codes as one text, `none` while
+    # no bit is set. Text on purpose: the register is a bit field of 23 alerts,
+    # and a plain state can carry any combination for a notification.
+    EcoFlowSensorDef(
+        "local_system_alerts",
+        "System Alerts",
+        icon="mdi:alert-circle-outline",
+        entity_category="diagnostic",
+    ),
+    # Whole-system battery readings from the Modbus table. The cloud stream
+    # has no such figure: its `bp_current_a` is a single pack, so the current
+    # here keeps its own key instead of sharing one. The labels say "System"
+    # because the cloud's pack readings are called Battery Voltage and Battery
+    # Current: an entry switched between modes keeps those entities, and two
+    # equal names gave the new ones an entity id ending in _2.
+    EcoFlowSensorDef(
+        "batt_voltage_v",
+        "System Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        suggested_display_precision=1,
+        translation_key="local_system_batt_voltage_v",
+    ),
+    EcoFlowSensorDef(
+        "batt_current_a",
+        "System Battery Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        suggested_display_precision=2,
+        translation_key="local_system_batt_current_a",
+    ),
+    EcoFlowSensorDef(
+        "batt_temp_c",
+        "System Battery Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+        translation_key="local_system_batt_temp_c",
+    ),
+    # Single-phase register map only (PowerOcean Single Phase / OCEAN 2
+    # Single-Phase Hybrid Inverter). A three-phase entry publishes none of
+    # these keys and so creates none of these entities.
+    EcoFlowSensorDef(
+        "local_grid_phase_a_voltage_v",
+        "Grid Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "local_grid_phase_a_current_a",
+        "Grid Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    # Net energy of the running day, signed as the device reports it. Not an
+    # energy device class: a net figure that may fall is not a meter the
+    # Energy Dashboard can use.
+    EcoFlowSensorDef(
+        "local_meter_energy_today_kwh",
+        "Grid Net Energy Today",
+        "kWh",
+        None,
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "local_inverter_energy_today_kwh",
+        "Inverter Net Energy Today",
+        "kWh",
+        None,
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "local_battery_energy_today_kwh",
+        "Battery Net Energy Today",
+        "kWh",
+        None,
+        "measurement",
+        "mdi:battery-sync",
+        suggested_display_precision=2,
+    ),
+]
+
+# What a local entry creates: the shared definitions plus the local-only ones.
+POWEROCEAN_LOCAL_SENSOR_DEFS: list[EcoFlowSensorDef] = [
+    sensor_def
+    for sensor_def in POWEROCEAN_SENSORS
+    if sensor_def.key in POWEROCEAN_LOCAL_KEYS
+] + POWEROCEANLOCALONLY_SENSORS
+
+# The controls of a local entry. Each is created only there, by the
+# platform's local branch, never through a device-type dispatcher. Names are the
+# user's words. The block names follow the convention discovery relies on:
+# `<FAMILY>_<PLATFORM>` with one family token (see `POWEROCEANLOCALONLY_SENSORS`).
+#
+# The switch has no data key: it shows the coordinator's `control_enabled` flag,
+# which starts off on every entry start and is never restored. `state_key` only
+# names the reading its definition is filed under.
+POWEROCEANLOCALONLY_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef(
+        "modbus_control",
+        "Modbus Control",
+        "modbus_control_active",
+        "mdi:remote",
+    ),
+]
+
+# Backup reserve reads the register the "EMS Backup Ratio" sensor shows, under
+# its own key so the two entities keep separate unique ids. Both settings are
+# written with a read-back, and neither needs the control switch to be on.
+POWEROCEANLOCALONLY_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "local_backup_reserve",
+        "Backup Reserve",
+        "ems_backup_ratio_pct",
+        "%",
+        "mdi:battery-lock",
+        0,
+        100,
+        1,
+    ),
+    EcoFlowNumberDef(
+        "local_indicator_brightness",
+        "Indicator Brightness",
+        "local_indicator_brightness_pct",
+        "%",
+        "mdi:brightness-percent",
+        0,
+        100,
+        1,
+        entity_category="config",
+    ),
+]
+
+POWEROCEANLOCALONLY_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    # Bit 0 of the system status word. Not a diagnostic: outage automations
+    # trigger on it, and it works without the cloud. No device class, since
+    # off-grid is a state of the site and not a fault. Its own key rather than
+    # the cloud's `grid_status`: that one is an enum sensor fed by a different
+    # field, and one entity must keep one source across a mode switch.
+    EcoFlowBinarySensorDef(
+        "local_off_grid",
+        "Off-Grid",
+        icon="mdi:transmission-tower",
+    ),
+    # Bit 1 of the system status word.
+    EcoFlowBinarySensorDef(
+        "local_system_abnormal",
+        "System Abnormal",
+        device_class="problem",
+        entity_category="diagnostic",
+    ),
+    # Bit 12 of the system status word: whether the battery management system
+    # is connected to the inverter.
+    EcoFlowBinarySensorDef(
+        "local_bms_connected",
+        "Battery Connection",
+        device_class="connectivity",
+        entity_category="diagnostic",
+    ),
+    EcoFlowBinarySensorDef(
+        "modbus_control_active",
+        "Modbus Control Active",
+        icon="mdi:remote",
+        entity_category="diagnostic",
+    ),
+]
+
+POWEROCEAN_NUMBERS: list[EcoFlowNumberDef] = [
+    # Backup-Reserve (App-slider): minimum SoC kept in reserve. Wire field 2
+    # in cmd_id=112 SysBatChgDsgSet, sent as a 3-field app-replay payload.
+    EcoFlowNumberDef(
+        "backup_reserve",
+        "Backup Reserve",
+        "ems_discharge_lower_limit_pct",
+        "%",
+        "mdi:battery-lock",
+        0,
+        100,
+        5,
+        enhanced_only=True,
+    ),
+    # Überschüssige-Solarenergie threshold (App-slider).
+    #
+    # Source key is `ems_app_surplus_pct` (proto wire field 4 = dev_soc /
+    # cloud-quota socDev) - the user-side setting the EcoFlow app reads
+    # and writes. The companion `ems_backup_ratio_pct` (wire field 3 =
+    # sys_bat_backup_ratio) is a derived EMS status that the device
+    # clamps internally; it diverges from dev_soc at edge cases (notably
+    # 100%, where the EMS caps at 90). The SET path still writes BOTH
+    # fields (handled in async_set_powerocean_soc) so the device EMS
+    # follows the user value where it can; the slider sources from the
+    # user-side mirror so HA matches what the app shows the user.
+    EcoFlowNumberDef(
+        "solar_surplus_threshold",
+        "Solar Surplus Threshold",
+        "ems_app_surplus_pct",
+        "%",
+        "mdi:solar-power-variant",
+        0,
+        100,
+        5,
+        enhanced_only=True,
+    ),
+    # PowerGlow heating rod controls (#7, PLAN-190). The rod is an optional
+    # accessory: each control is created on the first 212/8 report of its own
+    # read-back key, so a PowerOcean without a rod gets none of them. The write
+    # waits for that same report, so the number shows what the rod holds and
+    # nothing in between. Same key as the matching diagnostic sensor, as the
+    # PowerPulse 2 setpoint has: a number and a sensor are separate platforms
+    # with separate translations.
+    #
+    # The declared ceiling is the highest any rod accepts (HF33); the entity
+    # narrows it to the rod's own serial prefix once the serial is reported
+    # (`_derived_bounds` in number.py). A whole watt is a valid value: the
+    # app prompt has no step, and the targets on file include 25, 125 and 326.
+    EcoFlowNumberDef(
+        "heating_rod_target_power_w",
+        "Heating Rod Target Power",
+        "heating_rod_target_power_w",
+        "W",
+        "mdi:water-boiler",
+        0,
+        9000,
+        1,
+        enhanced_only=True,
+        accessory=True,
+        entity_category="config",
+    ),
+    EcoFlowNumberDef(
+        "heating_rod_target_temp_c",
+        "Heating Rod Target Temperature",
+        "heating_rod_target_temp_c",
+        "°C",
+        "mdi:thermometer-chevron-up",
+        POWERGLOW_TARGET_TEMP_C_MIN,
+        POWERGLOW_TARGET_TEMP_C_MAX,
+        1,
+        enhanced_only=True,
+        accessory=True,
+        entity_category="config",
+    ),
+]
+
+
+POWEROCEAN_SELECTS: list[EcoFlowSelectDef] = [
+    # Work mode select. Phase 1 scope: SELFUSE (0) and AI_SCHEDULE (12),
+    # which are the modes that work without TouParam/BackupParam sub-data.
+    EcoFlowSelectDef(
+        "work_mode",
+        "Work Mode",
+        "ems_work_mode",
+        ("self_use", "ai_schedule"),
+        icon="mdi:cog-transfer",
+        enhanced_only=True,
+    ),
+    # PowerGlow heating rod: off, Solar surplus or Manual (#7, PLAN-190). The
+    # state is derived from the rod's run switch and mode on its 212/8 report
+    # (`heating_rod_operating_mode`), so the gate is that derived key and it
+    # needs no value map. Created on the first report, like the two numbers.
+    EcoFlowSelectDef(
+        "heating_rod_operating_mode",
+        "Heating Rod Mode",
+        "heating_rod_operating_mode",
+        ("off", "solar", "manual"),
+        icon="mdi:water-boiler",
+        enhanced_only=True,
+        accessory=True,
+        entity_category="config",
+    ),
+]
+
+
+# --- Scheduled charge task controls ---
+#
+# The write side of the schedule readings above. Same gate for the same
+# reason: the definition exists for every slot the device can number, and the
+# entity is created on the first report that carries that slot. A PowerOcean
+# whose owner never made a schedule gets no controls at all.
+#
+# Neither control creates or deletes a task. Creating one means composing a
+# recurrence rather than echoing the device's own, and deleting one cannot be
+# undone from here while creating is out, so a slot is made in the app first
+# and these two change what it does from then on.
+POWEROCEAN_SWITCHES: list[EcoFlowSwitchDef] = []
+
+for _schedule_index in range(1, SCHEDULE_MAX_INDEX + 1):
+    POWEROCEAN_SWITCHES.append(
+        EcoFlowSwitchDef(
+            f"schedule_{_schedule_index}_enabled",
+            f"Schedule {_schedule_index} Enabled",
+            f"schedule_{_schedule_index}_enabled",
+            "mdi:calendar-check-outline",
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+    # The range is the app's own prompt: minimum 100 W per online battery
+    # pack, maximum per model, step 100 W. Whether the device enforces
+    # anything beyond that is unobserved - no write was ever refused, and the
+    # only two figures on file are 1000 and 1500, both on that grid. The
+    # declared bounds below are the fallback; the entity narrows the minimum
+    # to the reported pack count and the maximum to the serial prefix, which
+    # is exactly what the app does.
+    POWEROCEAN_NUMBERS.append(
+        EcoFlowNumberDef(
+            f"schedule_{_schedule_index}_power_w",
+            f"Schedule {_schedule_index} Charge Power",
+            f"schedule_{_schedule_index}_power_w",
+            "W",
+            "mdi:battery-charging-outline",
+            POWEROCEAN_SCHEDULE_POWER_MIN_W,
+            POWEROCEAN_SCHEDULE_POWER_MAX_DEFAULT_W,
+            POWEROCEAN_SCHEDULE_POWER_STEP_W,
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+    POWEROCEAN_SWITCHES.append(
+        EcoFlowSwitchDef(
+            f"feed_schedule_{_schedule_index}_enabled",
+            f"Feed Schedule {_schedule_index} Enabled",
+            f"feed_schedule_{_schedule_index}_enabled",
+            "mdi:calendar-check-outline",
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+    # 100 W is one step above zero (the switch above is how a slot exports
+    # nothing) and 5000 W is the one app maximum on record - see the comment
+    # on the two constants in ecoflow/const.py. The entity narrows the
+    # ceiling to the device's own `ems_feed_power_limit_w` once it arrives.
+    POWEROCEAN_NUMBERS.append(
+        EcoFlowNumberDef(
+            f"feed_schedule_{_schedule_index}_power_w",
+            f"Feed Schedule {_schedule_index} Export Power",
+            f"feed_schedule_{_schedule_index}_power_w",
+            "W",
+            "mdi:transmission-tower-export",
+            POWEROCEAN_FEED_SCHEDULE_POWER_MIN_W,
+            POWEROCEAN_FEED_SCHEDULE_POWER_MAX_DEFAULT_W,
+            POWEROCEAN_SCHEDULE_POWER_STEP_W,
+            enhanced_only=True,
+            accessory=True,
+        )
+    )
+
+
+# =====================================================================
+# Delta 2 Max sensor definitions (from ha_delta_discovery.py)
+# =====================================================================
+
+DELTA2MAX_SENSORS: list[EcoFlowSensorDef] = [
+    # --- Battery / SoC ---
+    EcoFlowSensorDef(
+        "soc",
+        "SoC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "bms_soh_pct",
+        "Battery SoH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "bms_precise_soc",
+        "Precise SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-sync",
+        suggested_display_precision=0,
+    ),
+    # --- Power (W) ---
+    EcoFlowSensorDef(
+        "watts_in_sum",
+        "Input Total",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "watts_out_sum",
+        "Output Total",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_w",
+        "AC Input",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_w",
+        "AC Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug-outline",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "solar_in_w",
+        "Solar Input",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "solar2_in_w",
+        "Solar 2 Input",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "mppt_out_w",
+        "MPPT Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-panel-large",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "car_12v_out_w",
+        "12V Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:car-battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "dcdc_12v_w",
+        "DC-DC 12V",
+        "W",
+        "power",
+        "measurement",
+        "mdi:current-dc",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "car_out_w",
+        "Car Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:car-electric",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "usb1_w",
+        "USB 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "usb2_w",
+        "USB 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "usb_qc1_w",
+        "USB QC 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "usb_qc2_w",
+        "USB QC 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "typec1_w",
+        "Type-C 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb-c-port",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "typec2_w",
+        "Type-C 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb-c-port",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac_chg_rated_power_w",
+        "AC Charge Rated Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:lightning-bolt",
+        suggested_display_precision=0,
+    ),
+    # --- Voltage (V) ---
+    EcoFlowSensorDef(
+        "batt_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_vol_v",
+        "AC Output Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_vol_v",
+        "AC Input Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "dc_in_vol_v",
+        "DC Input Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:current-dc",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "dcdc_12v_vol_v",
+        "12V Rail Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:car-battery",
+        suggested_display_precision=1,
+    ),
+    # --- Current (A) ---
+    EcoFlowSensorDef(
+        "batt_current_a",
+        "Battery Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_amp_a",
+        "AC Output Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "solar_in_amp_a",
+        "Solar Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "solar2_in_amp_a",
+        "Solar 2 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    # --- Temperature ---
+    EcoFlowSensorDef(
+        "batt_temp_c",
+        "Battery Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "inv_out_temp_c",
+        "Inverter Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "dc_in_temp_c",
+        "DC Input Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "mppt_temp_c",
+        "MPPT Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "solar2_mppt_temp_c",
+        "MPPT 2 Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_cell_temp_c",
+        "Max Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-high",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_min_cell_temp_c",
+        "Min Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-low",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_mos_temp_c",
+        "Max MOSFET Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    # --- Duration ---
+    EcoFlowSensorDef(
+        "remain_time_min",
+        "Remaining Time",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:timer-sand",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "chg_remain_time_min",
+        "Charge Time Remaining",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:battery-clock",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "dsg_remain_time_min",
+        "Discharge Time Remaining",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:battery-clock-outline",
+        suggested_display_precision=0,
+    ),
+    # --- Frequency ---
+    EcoFlowSensorDef(
+        "ac_out_freq_hz",
+        "AC Output Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_freq_hz",
+        "AC Input Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    # --- Capacity ---
+    EcoFlowSensorDef(
+        "batt_remain_cap_mah",
+        "Remaining Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-50",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_full_cap_mah",
+        "Full Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Counters / State ---
+    EcoFlowSensorDef(
+        "bms_cycles",
+        "Battery Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:counter",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "fan_level",
+        "Fan Level",
+        None,
+        None,
+        "measurement",
+        "mdi:fan",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "chg_dsg_state",
+        "Charge/Discharge State",
+        None,
+        "enum",
+        None,
+        "mdi:battery-charging",
+        disabled_by_default=True,
+        options=["idle", "discharging", "charging"],
+    ),
+    EcoFlowSensorDef(
+        "ems_chg_state",
+        "EMS Charge State",
+        None,
+        "enum",
+        None,
+        "mdi:battery-charging-outline",
+        disabled_by_default=True,
+        options=["idle", "charging", "discharging"],
+    ),
+    EcoFlowSensorDef(
+        "charger_type",
+        "Charger Type",
+        None,
+        "enum",
+        None,
+        "mdi:ev-plug-type2",
+        disabled_by_default=True,
+        options=["none", "ac", "solar", "dc", "unknown"],
+    ),
+    EcoFlowSensorDef(
+        "mppt_chg_state",
+        "MPPT Charge State",
+        None,
+        "enum",
+        None,
+        "mdi:solar-panel",
+        disabled_by_default=True,
+        options=["idle", "charging"],
+    ),
+    EcoFlowSensorDef(
+        "ems_lcd_soc",
+        "LCD SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:monitor",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_precise_soc",
+        "EMS Precise SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:monitor",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Energy Dashboard (total_increasing, kWh) ---
+    EcoFlowSensorDef(
+        "solar_energy_kwh",
+        "Solar Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "solar2_energy_kwh",
+        "Solar 2 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_energy_kwh",
+        "AC Input Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:power-plug",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_energy_kwh",
+        "AC Output Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:power-plug-outline",
+        suggested_display_precision=2,
+    ),
+    # --- Cell voltages (diagnostic) ---
+    EcoFlowSensorDef(
+        "batt_max_cell_vol_mv",
+        "Max Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_min_cell_vol_mv",
+        "Min Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Error codes (diagnostic) ---
+    EcoFlowSensorDef(
+        "pd_err_code",
+        "PD Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_err_code",
+        "Inverter Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_err_code",
+        "BMS Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "mppt_fault_code",
+        "MPPT Fault Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Slave Battery Pack 1 (expansion) ---
+    # No device_class="battery" on slave SoC: HA picks battery-class
+    # entities for the device-card header, which must stay the main SoC.
+    EcoFlowSensorDef(
+        "slave1_soc",
+        "Slave 1 SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_soh",
+        "Slave 1 SoH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_voltage_v",
+        "Slave 1 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_current_a",
+        "Slave 1 Current",
+        "A",
+        "current",
+        "measurement",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_temp_c",
+        "Slave 1 Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_cycles",
+        "Slave 1 Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:battery-sync",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_in_w",
+        "Slave 1 Input",
+        "W",
+        "power",
+        "measurement",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_out_w",
+        "Slave 1 Output",
+        "W",
+        "power",
+        "measurement",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave1_remain_cap_mah",
+        "Slave 1 Remaining Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave1_full_cap_mah",
+        "Slave 1 Full Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave1_max_cell_vol_mv",
+        "Slave 1 Max Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave1_min_cell_vol_mv",
+        "Slave 1 Min Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave1_max_cell_temp_c",
+        "Slave 1 Max Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-high",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "slave1_min_cell_temp_c",
+        "Slave 1 Min Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-low",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "slave1_max_mos_temp_c",
+        "Slave 1 Max MOSFET Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "slave1_err_code",
+        "Slave 1 Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Slave Battery Pack 2 (expansion) ---
+    EcoFlowSensorDef(
+        "slave2_soc",
+        "Slave 2 SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_soh",
+        "Slave 2 SoH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_voltage_v",
+        "Slave 2 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_current_a",
+        "Slave 2 Current",
+        "A",
+        "current",
+        "measurement",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_temp_c",
+        "Slave 2 Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_cycles",
+        "Slave 2 Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:battery-sync",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_in_w",
+        "Slave 2 Input",
+        "W",
+        "power",
+        "measurement",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_out_w",
+        "Slave 2 Output",
+        "W",
+        "power",
+        "measurement",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "slave2_remain_cap_mah",
+        "Slave 2 Remaining Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave2_full_cap_mah",
+        "Slave 2 Full Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave2_max_cell_vol_mv",
+        "Slave 2 Max Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave2_min_cell_vol_mv",
+        "Slave 2 Min Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "slave2_max_cell_temp_c",
+        "Slave 2 Max Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-high",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "slave2_min_cell_temp_c",
+        "Slave 2 Min Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-low",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "slave2_max_mos_temp_c",
+        "Slave 2 Max MOSFET Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        disabled_by_default=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "slave2_err_code",
+        "Slave 2 Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+]
+
+DELTA2MAX_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    EcoFlowBinarySensorDef("ac_enabled", "AC Enabled", "power", "mdi:power-plug"),
+    EcoFlowBinarySensorDef("dc_out_enabled", "DC Output Enabled", "power", "mdi:flash"),
+    EcoFlowBinarySensorDef(
+        "car_12v_enabled", "12V Enabled", "power", "mdi:car-battery"
+    ),
+    EcoFlowBinarySensorDef(
+        "ups_enabled",
+        "UPS Enabled",
+        "power",
+        "mdi:lightning-bolt",
+        "diagnostic",
+        disabled_by_default=True,
+    ),
+]
+
+DELTA2MAX_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef("ac_switch", "AC Output", "ac_enabled", "mdi:power-plug"),
+    EcoFlowSwitchDef("dc_switch", "DC Output", "dc_out_enabled", "mdi:flash"),
+    EcoFlowSwitchDef(
+        "car_12v_switch", "12V Output", "car_12v_enabled", "mdi:car-battery"
+    ),
+    EcoFlowSwitchDef("beeper_switch", "Beeper", "beep_enabled", "mdi:volume-high"),
+    EcoFlowSwitchDef("xboost_switch", "X-Boost", "ac_xboost", "mdi:lightning-bolt"),
+    EcoFlowSwitchDef(
+        "ac_auto_on_switch", "AC Auto Restart", "ac_auto_on", "mdi:power-plug"
+    ),
+    EcoFlowSwitchDef(
+        "backup_reserve_switch",
+        "Backup Reserve",
+        "backup_reserve_enabled",
+        "mdi:battery-lock",
+    ),
+]
+
+DELTA2MAX_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "ac_charge_speed",
+        "AC Charge Speed",
+        "ac_slow_chg_watts",
+        "W",
+        "mdi:lightning-bolt",
+        200,
+        2400,
+        100,
+    ),
+    EcoFlowNumberDef(
+        "max_charge_soc",
+        "Max Charge SoC",
+        "max_charge_soc",
+        "%",
+        "mdi:battery-charging-100",
+        50,
+        100,
+        1,
+    ),
+    EcoFlowNumberDef(
+        "min_discharge_soc",
+        "Min Discharge SoC",
+        "min_discharge_soc",
+        "%",
+        "mdi:battery-alert-variant-outline",
+        0,
+        30,
+        1,
+    ),
+    EcoFlowNumberDef(
+        "standby_timeout",
+        "Standby Timeout",
+        "standby_timeout_min",
+        "min",
+        "mdi:timer-off-outline",
+        0,
+        720,
+        1,
+    ),
+    EcoFlowNumberDef(
+        "car_standby_timeout",
+        "12V Port Timeout",
+        "car_standby_min",
+        "min",
+        "mdi:timer-outline",
+        0,
+        720,
+        30,
+    ),
+    EcoFlowNumberDef(
+        "screen_brightness",
+        "Screen Brightness",
+        "screen_brightness",
+        "%",
+        "mdi:brightness-6",
+        0,
+        100,
+        10,
+    ),
+    EcoFlowNumberDef(
+        "screen_timeout",
+        "Screen Timeout",
+        "screen_timeout_sec",
+        "s",
+        "mdi:monitor-off",
+        0,
+        1800,
+        10,
+    ),
+    EcoFlowNumberDef(
+        "backup_reserve_soc",
+        "Backup Reserve Level",
+        "backup_reserve_soc",
+        "%",
+        "mdi:battery-lock",
+        5,
+        100,
+        5,
+    ),
+]
+
+
+# =====================================================================
+# Smart Plug sensor definitions
+# =====================================================================
+
+SMARTPLUG_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "power_w",
+        "Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "current_a",
+        "Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "voltage_v",
+        "Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "frequency_hz",
+        "Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "temperature_c",
+        "Temperature",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "max_power_w",
+        "Max Power Rating",
+        "W",
+        "power",
+        None,
+        "mdi:flash-alert",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "max_current_a",
+        "Max Current Rating",
+        "A",
+        "current",
+        None,
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "led_brightness",
+        "LED Brightness",
+        "%",
+        None,
+        "measurement",
+        "mdi:brightness-6",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "error_code",
+        "Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "warning_code",
+        "Warning Code",
+        None,
+        None,
+        None,
+        "mdi:alert-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Energy Dashboard (total_increasing, kWh) ---
+    EcoFlowSensorDef(
+        "energy_kwh",
+        "Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:flash",
+        suggested_display_precision=2,
+    ),
+]
+
+SMARTPLUG_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    EcoFlowBinarySensorDef("switch_state", "Relay", "power", "mdi:power-plug"),
+]
+
+SMARTPLUG_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef("plug_switch", "Plug", "switch_state", "mdi:power-plug"),
+]
+
+STREAM_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    EcoFlowBinarySensorDef(
+        "ac_outlet_1_enabled", "AC Outlet 1", "power", "mdi:power-socket-eu"
+    ),
+    EcoFlowBinarySensorDef(
+        "ac_outlet_2_enabled", "AC Outlet 2", "power", "mdi:power-socket-eu"
+    ),
+]
+
+STREAM_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef(
+        "ac_outlet_1_switch",
+        "AC Outlet 1",
+        "ac_outlet_1_enabled",
+        "mdi:power-socket-eu",
+        enhanced_only=True,
+    ),
+    EcoFlowSwitchDef(
+        "ac_outlet_2_switch",
+        "AC Outlet 2",
+        "ac_outlet_2_enabled",
+        "mdi:power-socket-eu",
+        enhanced_only=True,
+    ),
+]
+
+SMARTPLUG_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "led_brightness",
+        "LED Brightness",
+        "led_brightness",
+        "%",
+        "mdi:brightness-6",
+        0,
+        100,
+        5,
+    ),
+    EcoFlowNumberDef(
+        "max_watts",
+        "Max Power Limit",
+        "max_power_w",
+        "W",
+        "mdi:flash-alert",
+        0,
+        2500,
+        100,
+    ),
+]
+
+STREAM_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "stream_charge_limit",
+        "Max Charge SoC",
+        "max_charge_soc_pct",
+        "%",
+        "mdi:battery-charging-100",
+        3,
+        100,
+        1,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "stream_discharge_limit",
+        "Min Discharge SoC",
+        "min_discharge_soc_pct",
+        "%",
+        "mdi:battery-arrow-down",
+        0,
+        95,
+        1,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "led_brightness",
+        "LED Brightness",
+        "led_brightness",
+        "%",
+        "mdi:brightness-6",
+        0,
+        100,
+        5,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "backup_reserve",
+        "Backup Reserve",
+        "backup_reserve_pct",
+        "%",
+        "mdi:battery-lock",
+        3,
+        95,
+        1,
+        enhanced_only=True,
+    ),
+]
+
+
+# =====================================================================
+# Stream AC Pro sensor definitions
+# =====================================================================
+
+STREAM_SENSORS: list[EcoFlowSensorDef] = [
+    # The system figure: what the app shows, and on two units joined by a
+    # parallel cable the pair's combined state of charge (#323).
+    EcoFlowSensorDef(
+        "soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    # This unit's own BMS state of charge. Off by default because on a single
+    # unit, which is what most owners have, it repeats the system figure.
+    EcoFlowSensorDef(
+        "unit_soc_pct",
+        "Unit Battery SOC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "soc_precise_pct",
+        "Battery SOC (Precise)",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-sync",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "solar_w",
+        "Solar Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # Per-string PV. Standard Mode reads these from powGetPv..powGetPv4 and
+    # Enhanced Mode from status fields 361/70/996/997. Only the larger units
+    # drive strings 3 and 4, so those two are created once a unit reports a
+    # reading above zero, not for every Stream (#139). Presence is not enough:
+    # a Stream AC Pro has no PV input and still sends 996/997 as explicit 0.0.
+    # The price is that a string dark at first setup appears with its first
+    # daylight reading; an entity the owner already enabled is kept.
+    EcoFlowSensorDef(
+        "pv1_w",
+        "PV 1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pv2_w",
+        "PV 2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pv3_w",
+        "PV 3 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_w",
+        "PV 4 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    # Per-string PV input voltage and current. The key naming follows the
+    # vendor's own asymmetry (plugInInfoPvVol / plugInInfoPv2Vol): the first
+    # string has no index, so the existing pv_voltage_v key stays as it is
+    # and renaming it would orphan the entity for current users.
+    EcoFlowSensorDef(
+        "pv_voltage_v",
+        "PV Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv_current_a",
+        "PV Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_voltage_v",
+        "PV 2 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_current_a",
+        "PV 2 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    # Strings 3 and 4 of the larger units. Same wait as the string power above:
+    # the entity is created once the reading is above zero, and an unused input
+    # can read a couple of volts with no current, so voltage and current wait
+    # separately.
+    EcoFlowSensorDef(
+        "pv3_voltage_v",
+        "PV 3 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv3_current_a",
+        "PV 3 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_voltage_v",
+        "PV 4 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_current_a",
+        "PV 4 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "home_from_solar_w",
+        "Home From Solar",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "home_w",
+        "Home Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_power_w",
+        "Battery Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_power_w",
+        "Battery Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac_grid_connection_power_w",
+        "AC Grid Connection Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "solar_energy_kwh",
+        "Solar Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "home_energy_kwh",
+        "Home Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:home-lightning-bolt",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    # Per-string PV energy, Riemann-integrated from pv1_w..pv4_w. All four are
+    # off by default: `solar_energy_kwh` already covers the PV total, and a
+    # dashboard that sums the enabled strings would silently under-report on a
+    # unit whose higher strings are disabled. Users who want per-string
+    # tracking enable exactly the strings their unit has.
+    #
+    # The counter for a string is written only while its power key is present,
+    # so 3 and 4 carry the same gate as the power readings they follow. It
+    # takes hold one update later, since the integrator seeds on the first
+    # reading and reports nothing for it.
+    EcoFlowSensorDef(
+        "pv1_energy_kwh",
+        "PV 1 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_energy_kwh",
+        "PV 2 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv3_energy_kwh",
+        "PV 3 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_energy_kwh",
+        "PV 4 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_energy_kwh",
+        "Battery Charge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-charging",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_energy_kwh",
+        "Battery Discharge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "home_from_batt_w",
+        "Home From Battery",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-battery-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "home_from_grid_w",
+        "Home From Grid",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-import-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_outlet_1_w",
+        "AC Outlet 1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-eu",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_outlet_2_w",
+        "AC Outlet 2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-eu",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "led_brightness",
+        "LED Brightness",
+        "%",
+        None,
+        "measurement",
+        "mdi:brightness-6",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_connection_power_w",
+        "Grid Connection Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "sys_grid_connection_power_w",
+        "System Grid Connection Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_soh_pct",
+        "Battery SoH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        suggested_display_precision=0,
+    ),
+    # From the BMS heartbeat (`32/50` field 14), which only the real-time
+    # connection carries; the Developer API quota has no cycle count.
+    EcoFlowSensorDef(
+        "bms_cycles",
+        "Battery Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:counter",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "batt_temp_c",
+        "Battery Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "batt_design_cap_mah",
+        "Design Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_remain_cap_mah",
+        "Remaining Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-50",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_full_cap_mah",
+        "Full Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_capacity_ah",
+        "Battery Charge Capacity",
+        "Ah",
+        None,
+        "total_increasing",
+        "mdi:battery-plus",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_capacity_ah",
+        "Battery Discharge Capacity",
+        "Ah",
+        None,
+        "total_increasing",
+        "mdi:battery-minus",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_voltage_v",
+        "AC Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_current_a",
+        "AC Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ac_frequency_hz",
+        "AC Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=2,
+    ),
+    # Grid tie state and the configured feed-in cap. Both are read-only here:
+    # the cap is changed in the vendor app, we only report what it is set to.
+    EcoFlowSensorDef(
+        "grid_connection_state",
+        "Grid Connection State",
+        None,
+        "enum",
+        None,
+        "mdi:transmission-tower",
+        "diagnostic",
+        options=["invalid", "grid_in", "not_online", "feed_grid"],
+    ),
+    EcoFlowSensorDef(
+        "feed_grid_power_limit_w",
+        "Feed-in Power Limit",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "wifi_rssi_dbm",
+        "WiFi Signal",
+        "dBm",
+        "signal_strength",
+        "measurement",
+        "mdi:wifi",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_cell_temp_c",
+        "Max Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-high",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_min_cell_temp_c",
+        "Min Cell Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-low",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_mos_temp_c",
+        "Max MOSFET Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_cell_vol_mv",
+        "Max Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_min_cell_vol_mv",
+        "Min Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "backup_reserve_pct",
+        "Backup Reserve",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-lock",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_discharge_state",
+        "Battery Charge/Discharge State",
+        None,
+        "enum",
+        None,
+        "mdi:battery-sync",
+        "diagnostic",
+        disabled_by_default=True,
+        options=["standby", "discharging", "charging"],
+    ),
+]
+
+
+# =====================================================================
+# STREAM AC 5000 (ES22) sensor definitions
+# =====================================================================
+
+# The list name must stay a single run of A-Z0-9 before the suffix.
+# test_entity_translations.py, test_const.py and _collect_total_increasing_keys
+# in mqtt_ingest.py all discover these lists with `[A-Z0-9]+_SENSORS`, which
+# cannot span an underscore. Named STREAM_AC5000_SENSORS it would be skipped
+# by every one of them, including the monotonic guard, and no test would fail.
+STREAMAC5000_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "soc_precise_pct",
+        "Battery SOC (Precise)",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-sync",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    # The BMS pack reading, slightly above the one above it. Both are this
+    # unit's own reading rather than the system figure `soc_pct` carries: on a
+    # two-unit installation they read 65.4 and 87.2 against a system 76, so
+    # the earlier note here that this one sits "about two points above the
+    # system SoC" described a single-unit coincidence. Keyed apart from the
+    # Delta family's `bms_precise_soc`, which is the same reading under a key
+    # that predates the `_pct` convention every other percentage here follows.
+    EcoFlowSensorDef(
+        "bms_soc_precise_pct",
+        "BMS SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-outline",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_soh_pct",
+        "Battery SoH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        suggested_display_precision=0,
+    ),
+    # From the BMS heartbeat (`32/50` field 14), as on the Stream. No
+    # `enhanced_only`: the AC 5000 is Enhanced-only anyway, like Battery SoH
+    # from the same heartbeat.
+    EcoFlowSensorDef(
+        "bms_cycles",
+        "Battery Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:counter",
+        suggested_display_precision=0,
+    ),
+    # --- battery power ---
+    EcoFlowSensorDef(
+        "batt_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_power_w",
+        "Battery Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_power_w",
+        "Battery Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_discharge_state",
+        "Battery Charge/Discharge State",
+        None,
+        "enum",
+        None,
+        "mdi:battery-sync",
+        "diagnostic",
+        disabled_by_default=True,
+        options=["standby", "discharging", "charging"],
+    ),
+    # This unit's own share of the battery power above, which is a system
+    # figure whenever units are linked. Off by default for the same reason
+    # `soc_precise_pct` is: on a single-unit installation, the one the vast
+    # majority of owners have, it repeats the system reading exactly.
+    EcoFlowSensorDef(
+        "unit_batt_w",
+        "Unit Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # Unit Battery Power split by direction, for the Energy Dashboard. Off by
+    # default with it: on a single unit they repeat the system split.
+    EcoFlowSensorDef(
+        "unit_batt_charge_power_w",
+        "Unit Battery Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "unit_batt_discharge_power_w",
+        "Unit Battery Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- power flow ---
+    EcoFlowSensorDef(
+        "home_w",
+        "Home Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=0,
+    ),
+    # Signed: positive draws from the grid, negative feeds into it. Present
+    # only while a smart meter is linked in the EcoFlow app.
+    EcoFlowSensorDef(
+        "grid_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_import_power_w",
+        "Grid Import Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=0,
+    ),
+    # The AC socket output node (#458). The parser publishes an explicit zero
+    # when the socket is idle so the reading cannot latch, which would create
+    # the entity on every unit; waiting for a non-zero reading keeps it to
+    # units that actually have a load on the socket.
+    EcoFlowSensorDef(
+        "ac_output_power_w",
+        "AC Output Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-eu",
+        suggested_display_precision=0,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    # This unit's own power at its AC grid connection, from its `f50.1.7`
+    # entry: positive out of the unit, negative into it, as on the Stream.
+    # Not the AC socket, which is AC Output Power above.
+    EcoFlowSensorDef(
+        "ac_grid_connection_power_w",
+        "AC Grid Connection Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_power_w",
+        "Grid Export Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "home_from_batt_w",
+        "Home From Battery",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-battery-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "home_from_grid_w",
+        "Home From Grid",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-import-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # Solar to home, from the MPPT edge `f12.1`. The parser zero-fills it on
+    # every unit, so the entity waits for a non-zero reading: a unit without
+    # PV in its group never gets it.
+    EcoFlowSensorDef(
+        "home_from_solar_w",
+        "Home From Solar",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    # Solar is accessory-gated rather than listed per prefix: whether a unit
+    # has PV on the EcoFlow itself is a wiring choice, not a model difference.
+    #
+    # Labelled as the third-party figure, not as the unit's own solar. The app
+    # splits its solar panel into the unit's own strings and an "Other" row,
+    # and adds the two for the total it shows. In the 08:21 screenshot on
+    # issue #258 that row reads 80 W while the four strings read 0, 34, 50 and
+    # 102, and the two frames either side of that moment carry `f11.9` at 81
+    # and 78 against a string sum of 195.91 and 174.48. The app's own notice
+    # on that row says third-party solar is not accurately detected and that
+    # the figure is what remains after offsetting home consumption, so this is
+    # the device's inference rather than a measurement.
+    #
+    # The name still holds on a unit with no PV wired to the EcoFlow, where
+    # this figure is the whole solar reading: those panels are third-party by
+    # the same definition. The key stays `solar_w` - renaming it would orphan
+    # the entity for everyone who already has it.
+    EcoFlowSensorDef(
+        "solar_w",
+        "Third-Party Solar Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+        translation_key="third_party_solar_w",
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    # --- PV strings, direct MPPT reading ---
+    # Key and display names follow the BK series (Stream Ultra / Ultra X):
+    # `pvN_w` / "PV N Power". These sit alongside Solar Power above rather
+    # than replacing it - that one is the device's own inference from the
+    # house flows, these are the MPPT reading.
+    #
+    # Accessory-gated on a non-zero reading, not on the key appearing. The
+    # `f50.1` group arrives on every unit of this family, and the parser fills
+    # all five to 0 W whenever it does, which is what stops them latching
+    # overnight - so the key alone says nothing about whether there is PV. A
+    # string that has produced once keeps its entity and reads 0 W at night;
+    # a string that never produces never becomes an entity, which is the same
+    # side the BK series takes by hiding its strings 3 and 4 by default. All
+    # four are enabled here rather than hidden, because on this family the
+    # gate has already established the string is real.
+    EcoFlowSensorDef(
+        "pv_total_w",
+        "PV Total Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "pv1_w",
+        "PV 1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_w",
+        "PV 2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "pv3_w",
+        "PV 3 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_w",
+        "PV 4 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        accessory=True,
+        accessory_needs_nonzero=True,
+    ),
+    # --- smart meter, EcoFlow P1 variant only ---
+    # A Tibber Pulse reports a single total, so these stay absent there.
+    EcoFlowSensorDef(
+        "grid_phase_a_active_power_w",
+        "Grid Phase A Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_active_power_w",
+        "Grid Phase B Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_active_power_w",
+        "Grid Phase C Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_a_voltage_v",
+        "Grid Phase A Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_voltage_v",
+        "Grid Phase B Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_voltage_v",
+        "Grid Phase C Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_a_current_a",
+        "Grid Phase A Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_current_a",
+        "Grid Phase B Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_current_a",
+        "Grid Phase C Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_frequency_hz",
+        "AC Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        accessory=True,
+    ),
+    # --- configuration readback ---
+    EcoFlowSensorDef(
+        "work_mode",
+        "Work Mode",
+        None,
+        "enum",
+        None,
+        "mdi:cog-outline",
+        "diagnostic",
+        options=["self_powered", "intelligent_plus", "custom"],
+    ),
+    EcoFlowSensorDef(
+        "max_charge_soc_pct",
+        "Max Charge SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-charging-high",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "min_discharge_soc_pct",
+        "Min Discharge SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-arrow-down",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "backup_reserve_pct",
+        "Backup Reserve",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-lock",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    # The two power limits, named as the app names them. The output limit is
+    # an account-level ceiling and raising it needs a request to EcoFlow; the
+    # input limit is an ordinary setting in the app. A task power above either
+    # is accepted and then clamped.
+    EcoFlowSensorDef(
+        "max_grid_output_power_w",
+        "Max Grid-tied Output Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "max_grid_input_power_w",
+        "Max Grid Input Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-import",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "scheduled_discharge_power_w",
+        "Scheduled Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:calendar-clock",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "scheduled_charge_power_w",
+        "Scheduled Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:calendar-clock",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    # The charge task's own SoC target, shown in the app as "Charge limit".
+    # Exposed because a power write has to preserve it, so it is worth being
+    # able to see what will be preserved.
+    EcoFlowSensorDef(
+        "scheduled_charge_soc_target",
+        "Scheduled Charge Target SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-clock",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    # --- battery diagnostics ---
+    EcoFlowSensorDef(
+        "batt_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "bms_current_a",
+        "Battery Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_temp_c",
+        "Battery Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_cell_temp_c",
+        "Max Cell Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-high",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_min_cell_temp_c",
+        "Min Cell Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-low",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_mos_temp_c",
+        "Max MOSFET Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_max_cell_vol_mv",
+        "Max Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_min_cell_vol_mv",
+        "Min Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_design_cap_mah",
+        "Design Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_full_cap_mah",
+        "Full Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_remain_cap_mah",
+        "Remaining Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-50",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Energy Dashboard (total_increasing, kWh) ---
+    EcoFlowSensorDef(
+        "batt_charge_energy_kwh",
+        "Battery Charge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-charging",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_energy_kwh",
+        "Battery Discharge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery",
+        suggested_display_precision=2,
+    ),
+    # This unit's share of the two counters above, which count the group when
+    # units are linked. Off by default like the power readings they integrate.
+    EcoFlowSensorDef(
+        "unit_batt_charge_energy_kwh",
+        "Unit Battery Charge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-charging-outline",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "unit_batt_discharge_energy_kwh",
+        "Unit Battery Discharge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-outline",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_import_energy_kwh",
+        "Grid Import Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_energy_kwh",
+        "Grid Export Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "home_energy_kwh",
+        "Home Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:home-lightning-bolt",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    # No solar energy counter. This device derives its solar figure from the
+    # house flows and reports one on a unit with no PV wired to it at all, so
+    # integrating it would credit the Energy Dashboard with production that
+    # never happened. A total_increasing counter only goes up and cannot be
+    # corrected afterwards, while the instantaneous `solar_w` reading carries
+    # the same information and can simply be ignored.
+]
+
+STREAMAC5000_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    EcoFlowBinarySensorDef(
+        "backup_reserve_enabled",
+        "Backup Reserve",
+        None,
+        "mdi:battery-lock",
+        "diagnostic",
+    ),
+    EcoFlowBinarySensorDef(
+        "backup_socket_enabled",
+        "Backup Socket",
+        None,
+        "mdi:power-socket-eu",
+        "diagnostic",
+    ),
+]
+
+# Both captured from the app: config field 30 carries the backup reserve as
+# {1: on/off, 2: reserve %}, so the switch and the number below write it
+# together the way the SoC limits do. Field 19 is the backup socket.
+STREAMAC5000_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef(
+        "backup_reserve_switch",
+        "Backup Reserve",
+        "backup_reserve_enabled",
+        "mdi:battery-lock",
+        enhanced_only=True,
+    ),
+    EcoFlowSwitchDef(
+        "backup_socket_switch",
+        "Backup Socket",
+        "backup_socket_enabled",
+        "mdi:power-socket-eu",
+        enhanced_only=True,
+    ),
+]
+
+# All app-channel only: the device is not reachable through the Developer API,
+# so with developer keys these would be created and never work.
+#
+# The two power controls write a scheduled task, which is this device's power
+# setpoint. Bounds are the model's rated 2500 W, a constant rather than a
+# reading: the app's own limits sit at or below it and are not enforced here,
+# because a setpoint above one is acknowledged and then silently clamped by the
+# device rather than rejected. Both limits are exposed as the Max Grid-tied
+# Output Power and Max Grid Input Power sensors for an optimiser to read and
+# respect. The output one is also a control, and the only write in this list
+# reproduced from a frame recorded on the model it is offered to: an ES21
+# owner changed it in the app while a capture ran, and the device reported the
+# new value back (#231). Its ceiling is not the rated 2500 W but a value the
+# device carries on `f10.6`, which only EcoFlow can raise, so the control
+# narrows to that ceiling at runtime rather than declaring one. The input
+# limit stays read-only: no frame writing it has been recorded.
+#
+# Each is keyed and named after the state key it writes, so the control and the
+# sensor reporting it back read the same. The keys stay separate from the shared
+# `max_charge_soc` / `min_discharge_soc` ones, because a key change would move
+# the entity id for every Delta 3 and PowerOcean owner. The displayed names were
+# unified across all of them instead: one value carries one name, and a label
+# costs nobody their history. It also rules out the app's "Max discharging
+# power" and "Max grid charging power". The discharging one is a maximum only
+# while a smart meter is linked; the charging one has been measured being
+# ignored outright, so neither app name describes what the entity does.
+STREAMAC5000_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "scheduled_discharge_power_w",
+        "Scheduled Discharge Power",
+        "scheduled_discharge_power_w",
+        "W",
+        "mdi:battery-arrow-down-outline",
+        0,
+        2500,
+        50,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "scheduled_charge_power_w",
+        "Scheduled Charge Power",
+        "scheduled_charge_power_w",
+        "W",
+        "mdi:battery-arrow-up-outline",
+        0,
+        2500,
+        50,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "max_charge_soc_pct",
+        "Max Charge SoC",
+        "max_charge_soc_pct",
+        "%",
+        "mdi:battery-charging-high",
+        50,
+        100,
+        1,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "min_discharge_soc_pct",
+        "Min Discharge SoC",
+        "min_discharge_soc_pct",
+        "%",
+        "mdi:battery-arrow-down",
+        0,
+        50,
+        1,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "backup_reserve",
+        "Backup Reserve",
+        "backup_reserve_pct",
+        "%",
+        "mdi:battery-lock",
+        0,
+        100,
+        5,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "max_grid_output_power_w",
+        "Max Grid-tied Output Power",
+        "max_grid_output_power_w",
+        "W",
+        "mdi:transmission-tower-export",
+        0,
+        2500,
+        50,
+        enhanced_only=True,
+    ),
+    # 2600 W is not the model rating. It is the highest figure an app has
+    # offered and a device has acknowledged: an owner raised this setting from
+    # 2200 to 2600 on a unit rated 2500, and the app took it without the
+    # authorisation step it asks for on the output side (#284). The
+    # acknowledgement is not proof the device kept it, because this family
+    # clamps a setpoint it dislikes silently, and no read-back of 2600 is on
+    # file. That a written value is kept at all was settled separately, at
+    # 1800 W: the reporter set it from here and made the app request the
+    # settings again, and the device's answer carries 1800 on this subfield
+    # with the output setpoint beside it untouched. The top of the range is
+    # the one figure still resting on an acknowledgement alone. Nothing on
+    # the wire reports an input ceiling the way `f10.6` reports the output
+    # one, so there is nothing better to follow than the highest
+    # acknowledged figure.
+    #
+    # The step is the app's own: all four recorded writes are multiples of
+    # 100 and the app adjusts this setting in 100 W steps. The output number
+    # beside it offers 50 because its own captures do.
+    EcoFlowNumberDef(
+        "max_grid_input_power_w",
+        "Max Grid Input Power",
+        "max_grid_input_power_w",
+        "W",
+        "mdi:transmission-tower-import",
+        0,
+        2600,
+        100,
+        enhanced_only=True,
+    ),
+]
+
+STREAMAC5000_SELECTS: list[EcoFlowSelectDef] = [
+    EcoFlowSelectDef(
+        "work_mode",
+        "Work Mode",
+        "work_mode",
+        ("self_powered", "intelligent_plus", "custom"),
+        "mdi:cog-outline",
+        enhanced_only=True,
+    ),
+]
+
+
+# The Stream Micro (BK01) is a grid-tie PV inverter: two PV strings, one
+# single-phase grid connection, no battery, no AC outlets. It speaks the same
+# wire format as the rest of the BK series and therefore shares the parser and
+# the entity lists, so the keys it never produces are filtered out here rather
+# than by forking a second device type.
+#
+# The list is deliberately generous. Home Assistant keeps an entity in the
+# registry after a later fix removes it, so a wrongly created entity is
+# permanent for that owner, while a wrongly omitted one is added back in the
+# next release without breaking anything.
+STREAM_MICRO_EXCLUDED_KEYS: frozenset[str] = frozenset(
+    {
+        # Battery block: the periodic full telemetry upload carries none of the
+        # battery fields the protocol defines in that same message.
+        "soc_pct",
+        "unit_soc_pct",
+        "soc_precise_pct",
+        "bms_soh_pct",
+        "batt_w",
+        "batt_charge_power_w",
+        "batt_discharge_power_w",
+        "batt_charge_energy_kwh",
+        "batt_discharge_energy_kwh",
+        "batt_voltage_v",
+        "batt_temp_c",
+        "batt_design_cap_mah",
+        "batt_remain_cap_mah",
+        "batt_full_cap_mah",
+        "batt_charge_capacity_ah",
+        "batt_discharge_capacity_ah",
+        "batt_max_cell_vol_mv",
+        "batt_min_cell_vol_mv",
+        "batt_max_cell_temp_c",
+        "batt_min_cell_temp_c",
+        "batt_max_mos_temp_c",
+        "batt_charge_discharge_state",
+        "bms_cycles",
+        # The SoC limits (fields 270/271) are parsed but have no Stream entity of
+        # their own, so there is nothing to exclude for them here.
+        # Backup reserve is a battery control: the read-only sensor and the
+        # number entity that writes it.
+        "backup_reserve_pct",
+        "backup_reserve",
+        # AC outlets: this unit has no sockets to switch or meter.
+        "ac_outlet_1_enabled",
+        "ac_outlet_2_enabled",
+        "ac_outlet_1_w",
+        "ac_outlet_2_w",
+        # System load/grid paths. A microinverter reports what it feeds in, not
+        # a house energy balance, and none of these appear in its uploads.
+        "grid_w",
+        "home_w",
+        "home_energy_kwh",
+        "home_from_batt_w",
+        "home_from_grid_w",
+        "home_from_solar_w",
+        "sys_grid_connection_power_w",
+        # The meter-dependent solar total belongs to that same system path and is
+        # absent from both full uploads. This unit reports its PV through the two
+        # per-string readings instead, which it does keep. Its energy counter is
+        # integrated from the power reading, so leaving the counter in would put a
+        # lifetime total on the device that can never move off zero.
+        "solar_w",
+        "solar_energy_kwh",
+    }
+)
+
+# Port priority exists on part of the Delta 3 family only. The app shows the
+# menu entry when the serial starts with D3M or D51 and hides it otherwise, so
+# a base DELTA 3 (P231) and a P321 never get it - the entities would be created
+# and stay empty forever.
+#
+# The table below is a denylist, which means a Delta 3 prefix added later gets
+# port priority by default - the wrong default for exactly this feature. A test
+# pins every non-D3M Delta 3 prefix to this set, so adding a prefix to the
+# device-type map without deciding here fails CI rather than shipping entities
+# that can never fill.
+DELTA3_PORT_PRIORITY_KEYS: frozenset[str] = frozenset(
+    {
+        "port_priority_ac1_switch",
+        "port_priority_ac2_switch",
+        "port_priority_dc_switch",
+        "port_priority_ac1_soc",
+        "port_priority_ac2_soc",
+        "port_priority_dc_soc",
+        "port_priority_ac1_limited",
+        "port_priority_ac2_limited",
+        "port_priority_dc_limited",
+        "port_priority_ac1_cutoff_soc",
+        "port_priority_ac2_cutoff_soc",
+        "port_priority_dc_cutoff_soc",
+        "port_priority_active",
+    }
+)
+
+# Serial prefix -> entity keys that variant never produces. A prefix absent
+# from this table gets the full entity list of its device type. The `R655`
+# entry is added further down, next to the Delta 3 definition lists it is
+# computed from, and `R631` shares it.
+_SN_PREFIX_EXCLUDED_KEYS: dict[str, frozenset[str]] = {
+    "BK01": STREAM_MICRO_EXCLUDED_KEYS,
+    "P321": DELTA3_PORT_PRIORITY_KEYS,
+    "P231": DELTA3_PORT_PRIORITY_KEYS,
+    "D3N1": DELTA3_PORT_PRIORITY_KEYS,
+    # A DELTA 3 Plus serial is neither D3M nor D51, so the app hides the menu
+    # and the entities could never fill. Its capture carries no port priority
+    # field either (#304).
+    "P351": DELTA3_PORT_PRIORITY_KEYS,
+}
+
+
+def excluded_keys_for_serial(device_sn: str) -> frozenset[str]:
+    """Return the entity keys the device behind ``device_sn`` never produces."""
+    if not device_sn:
+        return frozenset()
+    return _SN_PREFIX_EXCLUDED_KEYS.get(device_sn[:4].upper(), frozenset())
+
+
+# Serial prefixes whose STREAM AC 5000 controls have been confirmed on
+# hardware. Every write this integration sends to that family is a
+# byte-for-byte reproduction of a frame captured from the app, and a power
+# setpoint writes a scheduled task into a real battery rather than flipping a
+# display setting. Reading the same telemetry is no evidence that the same
+# config write is accepted, so a variant reads until one of its own frames
+# says otherwise.
+#
+# Both prefixes have now said so. ES22 was confirmed first. ES21 followed from
+# a capture on a reporter's own unit (#231): he changed a setting in the app
+# while the raw capture was running, and the download carries the app's write
+# and the device's answer to it. The envelope in that write is this
+# integration's own, field for field including the negative product id, on the
+# same command pair every control here uses. The device then reported the
+# written value back, which is what separates a frame leaving a phone from a
+# frame a device accepted. Both halves are held by
+# TestES21WriteFrames in tests/test_stream_ac5000_commands.py, against the
+# recorded frames rather than against a description of them.
+#
+# What the capture settles is the envelope and the command, not each config
+# field. The setting he changed was the grid-tied output, config field 10,
+# and that one is now written from here too, which makes it the only write on
+# this device confirmed on the model it is offered to. The other eight
+# controls write five further fields inside that same envelope, and for those
+# the capture proves the mechanism rather than the individual setting.
+#
+# The read-back side carries the same limit, and it is worth stating because
+# "no control without read-back" is a commitment here. Replaying every ES21
+# fixture through the parser yields five of the nine control states: both SoC
+# limits, the work mode, the scheduled charge power and the grid-tied output.
+# Every ES22 fixture yields those five and one more, the scheduled discharge
+# power, which appears in the two recordings where somebody had a task
+# configured while the capture ran. Neither ES21 recording had one, so that
+# difference is about which recordings exist rather than about what the
+# models report. The backup reserve, its level and the backup socket are
+# missing on both model numbers, because `254/39` reports only the block that
+# changed and nobody touched those settings while a capture was running.
+#
+# The grid-tied output is the exception that proves the rule: it is the one
+# control here whose write was recorded on an ES21 rather than inherited from
+# an ES22, and it is also the one whose read-back both models report.
+#
+# This is an allowlist on purpose, the inverse of DELTA3_PORT_PRIORITY_KEYS
+# above: a prefix added later gets no controls until someone decides here,
+# which is the safe default for a write and the wrong one for a read.
+#
+# The exclusion table below cannot carry this. It matches on entity keys, and
+# every control state key is also the key of a read entity (six sensors, two
+# binary sensors), so excluding them would take the read-only entities with
+# them - including the two SoC limits an ES21 demonstrably reports.
+STREAM_AC5000_CONTROL_PREFIXES: frozenset[str] = frozenset({"ES21", "ES22"})
+
+# Serial prefixes whose Stream (BK-series) writes have been confirmed on
+# hardware. Every config write this integration sends to that family was
+# reproduced from a frame captured on a Stream AC Pro and then exercised on
+# one, so a variant that merely reports the same telemetry stays read-only
+# until one of its own frames says otherwise. Same allowlist reasoning as
+# STREAM_AC5000_CONTROL_PREFIXES above: a prefix added later gets no controls
+# until someone decides here.
+#
+# The outlet switches, SoC limits and LED brightness share this one gate rather
+# than holding a set each. All were confirmed on the same hardware, so separate
+# sets would be several names for one fact and would have to stay in step.
+#
+# The backup reserve floor derivation rides this gate too, and it is the one
+# rider that is not a write: the reserve's lowest setting follows the discharge
+# limit by three points, measured on a BK31 (#264). Adding a prefix here on
+# confirmed writes alone therefore also claims that relation for it, so check
+# the floor on that hardware before widening the set.
+STREAM_CONTROL_PREFIXES: frozenset[str] = frozenset({"BK31"})
+
+
+# Only these PowerPulse variants retain the existing control paths. New
+# prefixes start read-only until their writes are explicitly supported.
+POWERPULSE_CONTROL_PREFIXES: frozenset[str] = frozenset({"C376", "C374"})
+
+
+def supports_powerpulse_controls(device_sn: str) -> bool:
+    """Return whether this PowerPulse variant may expose controls."""
+    return device_sn[:4].upper() in POWERPULSE_CONTROL_PREFIXES
+
+
+def supports_stream_ac5000_controls(device_sn: str) -> bool:
+    """Return whether this STREAM AC 5000 variant may be written to."""
+    if not device_sn:
+        return False
+    return device_sn[:4].upper() in STREAM_AC5000_CONTROL_PREFIXES
+
+
+def supports_stream_controls(device_sn: str) -> bool:
+    """Return whether this Stream variant may be written to."""
+    if not device_sn:
+        return False
+    return device_sn[:4].upper() in STREAM_CONTROL_PREFIXES
+
+
+@dataclass(frozen=True)
+class Ocean2Controls:
+    """What may be written to one Ocean 2 model, and how (None = no control).
+
+    ``reserve_floor`` is the lowest Backup Reserve the model is written with:
+    the RE11 has only acknowledged 1 and up, the RE41 has held 0 on its own
+    unit, and the RE43 floor of 1 is borrowed from the RE11 (the lowest value
+    seen on that unit is 10). ``storm_param_full`` says whether the Storm
+    Guard write sends all three StormParam fields (the RE41 app's own bytes)
+    or only the switch field (the RE11 app's bytes); the fields are
+    presence-tracked, so the two are different messages.
+    """
+
+    reserve_floor: int | None
+    storm_param_full: bool | None
+
+
+# Ocean 2 variants that may be written to, and the write facts of each. Only
+# the RE11, the RE41 and the RE43 have writes on record, so only they get
+# controls. The RE11 has both (the Backup Reserve and the Storm Guard switch,
+# each with its acknowledgement and read-back). The RE41 has Backup Reserve
+# writes from Home Assistant with acknowledgement and read-back; for its Storm
+# Guard only the app's own switching is on record (the OFF acknowledgement and
+# the ON read-back), no write from Home Assistant yet, and the long form is the
+# one the RE41 app was recorded sending. The RE43 has a Backup Reserve write
+# only on record from the app itself (one recording: the app's write, the
+# device's acknowledgement and the read-back on field 10); no write from Home
+# Assistant has been tried on it yet, and no Storm Guard recording exists, so
+# its Storm Guard column stays empty. RE17 is routed with the RE11 for reading,
+# and RE42 differs on the read side already; a read-only routing does not
+# carry over to a write.
+# This table says what is confirmed on the model, the accessory gate on the
+# number and the switch says this unit reports the value: two facts, not two
+# names for one. The two columns part where a model has one control confirmed
+# and not the other.
+OCEAN2_CONTROLS: dict[str, Ocean2Controls] = {
+    "RE11": Ocean2Controls(reserve_floor=1, storm_param_full=False),
+    "RE41": Ocean2Controls(reserve_floor=0, storm_param_full=True),
+    "RE43": Ocean2Controls(reserve_floor=1, storm_param_full=None),
+}
+
+
+def ocean2_controls(device_sn: str) -> Ocean2Controls | None:
+    """Return the write facts of this Ocean 2 variant, None when it has none."""
+    if not device_sn:
+        return None
+    return OCEAN2_CONTROLS.get(device_sn[:4].upper())
+
+
+def supports_ocean2_reserve(device_sn: str) -> bool:
+    """Return whether this Ocean 2 variant has a Backup Reserve control."""
+    row = ocean2_controls(device_sn)
+    return row is not None and row.reserve_floor is not None
+
+
+def supports_ocean2_storm_guard(device_sn: str) -> bool:
+    """Return whether this Ocean 2 variant has a Storm Guard switch."""
+    row = ocean2_controls(device_sn)
+    return row is not None and row.storm_param_full is not None
+
+
+class _HasKey(Protocol):
+    """Structural bound for `filter_defs_for_serial`.
+
+    The five entity-definition dataclasses (sensor, binary sensor, switch,
+    number, select) share no common base - only the `key` field they all
+    declare. Declared as a read-only property, not a plain attribute: a
+    plain `key: str` here would require every implementer's `key` to be
+    externally *assignable* through this Protocol for mypy to call it a
+    match, which none of the `frozen=True` dataclasses are.
+    """
+
+    @property
+    def key(self) -> str: ...
+
+
+# DefT is any entity definition carrying a ``key`` attribute (sensor,
+# binary sensor, number, switch, select).
+def filter_defs_for_serial[DefT: _HasKey](
+    definitions: list[DefT], device_sn: str
+) -> list[DefT]:
+    """Drop entity definitions a device variant cannot ever populate.
+
+    Applied by the sensor, binary sensor, number, switch and select platforms
+    next to the ``enhanced_only`` filter. Number, switch and select
+    definitions read their value from ``state_key``, so both that and ``key``
+    are matched against the exclusion set.
+    """
+    excluded = excluded_keys_for_serial(device_sn)
+    if not excluded:
+        return list(definitions)
+    return [
+        definition
+        for definition in definitions
+        if definition.key not in excluded
+        and getattr(definition, "state_key", None) not in excluded
+    ]
+
+
+def readback_binary_defs_for_serial(
+    switches: list[EcoFlowSwitchDef], device_sn: str
+) -> list[EcoFlowBinarySensorDef]:
+    """Return a read-only binary sensor for each switch a variant may not write.
+
+    A variant that is read-only loses its switches through
+    ``filter_defs_for_serial``, and with them the only entity that shows the
+    state they read back. Where the state key is still allowed, the state is
+    exposed as a binary sensor instead, so read-only is decided once, by the
+    exclusion table, and never as a second list.
+    """
+    excluded = excluded_keys_for_serial(device_sn)
+    return [
+        EcoFlowBinarySensorDef(
+            switch.state_key,
+            switch.name,
+            icon=switch.icon,
+            enhanced_only=switch.enhanced_only,
+            accessory=switch.accessory,
+        )
+        for switch in switches
+        if switch.key in excluded and switch.state_key not in excluded
+    ]
+
+
+# =====================================================================
+# Delta 3 Max Plus sensor definitions
+# =====================================================================
+#
+# Telemetry arrives via HTTP quota (Standard mode) or protobuf push
+# (Enhanced mode); both paths produce identical sensor keys. Switches and
+# numbers are defined further below and require Standard mode, because the
+# SET commands go through the official HTTP endpoint. The quota exposes no
+# native energy counters, so the kWh Energy Dashboard sensors are derived
+# from the live power keys via Riemann-sum integration (see
+# DELTA3_POWER_TO_ENERGY and the delta3_http.py docstring).
+
+DELTA3_SENSORS: list[EcoFlowSensorDef] = [
+    # --- Battery / SoC ---
+    EcoFlowSensorDef(
+        "cms_batt_soc",
+        "SoC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    # --- Power (W) ---
+    EcoFlowSensorDef(
+        "pow_in_sum_w",
+        "Input Total",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pow_out_sum_w",
+        "Output Total",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_w",
+        "AC Input",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pv1_in_w",
+        "Solar Input 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pv2_in_w",
+        "Solar Input 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "dc_12v_out_w",
+        "12V Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:car-battery",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "anderson_out_w",
+        "Anderson Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug-outline",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac1_out_w",
+        "AC Output 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug-outline",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac2_out_w",
+        "AC Output 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug-outline",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "typec1_w",
+        "Type-C 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb-c-port",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "typec2_w",
+        "Type-C 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb-c-port",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "typec3_w",
+        "Type-C 3",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb-c-port",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "usb_qc1_w",
+        "USB QC 1",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "usb_qc2_w",
+        "USB QC 2",
+        "W",
+        "power",
+        "measurement",
+        "mdi:usb",
+        suggested_display_precision=0,
+    ),
+    # --- Energy Dashboard (total_increasing, kWh; derived via Riemann integration) ---
+    EcoFlowSensorDef(
+        "solar_energy_kwh",
+        "Solar Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "solar2_energy_kwh",
+        "Solar 2 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_energy_kwh",
+        "AC Input Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:power-plug",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "out_energy_kwh",
+        "Output Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:power-plug-outline",
+        suggested_display_precision=2,
+    ),
+    # --- Duration (minutes; can exceed 12000, no cap) ---
+    EcoFlowSensorDef(
+        "chg_remain_time_min",
+        "Charge Time Remaining",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:battery-clock",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "dsg_remain_time_min",
+        "Discharge Time Remaining",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:battery-clock-outline",
+        suggested_display_precision=0,
+    ),
+    # --- State (enum) ---
+    EcoFlowSensorDef(
+        "chg_dsg_state",
+        "Charge/Discharge State",
+        None,
+        "enum",
+        None,
+        "mdi:battery-charging",
+        options=["idle", "discharging", "charging"],
+    ),
+    # --- SoC limits / backup reserve (diagnostic) ---
+    EcoFlowSensorDef(
+        "max_charge_soc_pct",
+        "Max Charge SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-charging-100",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "min_discharge_soc_pct",
+        "Min Discharge SoC",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-alert-variant-outline",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    # --- AC charge power limit (Enhanced Mode only, #181) ---
+    # The value behind the charge speed slider in the app. It travels on the
+    # protobuf push path only, so it stays unavailable with developer keys.
+    EcoFlowSensorDef(
+        "ac_charge_power_limit_w",
+        "AC Charge Power Limit",
+        "W",
+        "power",
+        "measurement",
+        "mdi:lightning-bolt",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    # --- Battery health (BMS heartbeat, Enhanced Mode only) ---
+    # The BMS frame is the only source for these; the HTTP quota carries no
+    # battery health at all, so with developer keys they never get a value.
+    # Hence enhanced_only on every one: without it the entity is created and
+    # stays empty forever, and an empty sensor claims a reading is on its way
+    # when it is not. Registry entries outlive the fix, so the flag has to be
+    # right the first time.
+    # Same keys the Delta 2 Max and the Stream already use, on purpose: one
+    # translation, one meaning, one entity name across the device families.
+    # Those two families keep their own definitions without the flag, because
+    # their HTTP parsers do carry battery health.
+    EcoFlowSensorDef(
+        "bms_soh_pct",
+        "Battery SoH",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "bms_cycles",
+        "Battery Cycles",
+        None,
+        None,
+        "total_increasing",
+        "mdi:counter",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    # Lifetime counters read from the BMS, not integrated from power.
+    EcoFlowSensorDef(
+        "bms_accu_chg_energy_kwh",
+        "Battery Lifetime Charge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-charging",
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "bms_accu_dsg_energy_kwh",
+        "Battery Lifetime Discharge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery",
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "bms_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "bms_current_a",
+        "Battery Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "bms_temp_c",
+        "Battery Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "bms_max_cell_temp_c",
+        "Battery Max Cell Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-up",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_min_cell_temp_c",
+        "Battery Min Cell Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-down",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_max_mos_temp_c",
+        "Battery Max MOSFET Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_min_mos_temp_c",
+        "Battery Min MOSFET Temp",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_max_cell_vol_mv",
+        "Battery Max Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_min_cell_vol_mv",
+        "Battery Min Cell Voltage",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_cell_vol_diff_mv",
+        "Battery Cell Voltage Spread",
+        "mV",
+        "voltage",
+        "measurement",
+        "mdi:arrow-expand-vertical",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_remain_cap_mah",
+        "Battery Remaining Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-clock",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_full_cap_mah",
+        "Battery Full Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_design_cap_mah",
+        "Battery Design Capacity",
+        "mAh",
+        None,
+        "measurement",
+        "mdi:battery-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_cell_count",
+        "Battery Cell Count",
+        None,
+        None,
+        None,
+        "mdi:counter",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_real_soh_pct",
+        "Battery Real Health",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-heart-variant",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_calendar_soh_pct",
+        "Battery Calendar Health",
+        "%",
+        None,
+        "measurement",
+        "mdi:calendar-heart",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_cycle_soh_pct",
+        "Battery Cycle Health",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-sync-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "bms_error_code",
+        "Battery Error Code",
+        None,
+        None,
+        None,
+        "mdi:alert-circle-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+]
+
+# The Delta 3 controls read back from the same fields a binary sensor would
+# expose, so a read-only twin for every switch would just double the entity
+# count. The one entry here is not a twin of anything: it reports whether port
+# priority is currently in effect, which the device decides on its own and no
+# control can set.
+DELTA3_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    # Only true while the unit runs off battery or solar with no AC input and
+    # no smart generator attached, so on a grid-connected device this stays
+    # off. Diagnostic rather than a headline reading for exactly that reason.
+    EcoFlowBinarySensorDef(
+        "port_priority_active",
+        "Port Priority Active",
+        None,
+        "mdi:priority-high",
+        "diagnostic",
+        enhanced_only=True,
+    ),
+]
+
+# Controls. Every switch reads back from the same field the read-only entity
+# above uses, so the device state stays the single source of truth. The params
+# keys and value ranges are vendor-documented, see
+# docs/reference/ecoflow-api-delta3-max-plus.md
+DELTA3_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef("ac_out_switch", "AC Output", "ac_out_flow", "mdi:power-plug"),
+    EcoFlowSwitchDef("ac2_out_switch", "AC Output 2", "ac2_out_flow", "mdi:power-plug"),
+    EcoFlowSwitchDef(
+        "dc_12v_out_switch", "12V Output", "dc_12v_out_flow", "mdi:car-battery"
+    ),
+    EcoFlowSwitchDef(
+        "energy_backup_switch",
+        "Backup Reserve",
+        "backup_reserve_enabled",
+        "mdi:battery-lock",
+    ),
+    EcoFlowSwitchDef(
+        "xboost_switch", "X-Boost", "xboost_enabled", "mdi:lightning-bolt"
+    ),
+    EcoFlowSwitchDef("beeper_switch", "Beeper", "beeper_enabled", "mdi:volume-high"),
+    EcoFlowSwitchDef(
+        "bypass_out_disable_switch",
+        "Bypass Output Disabled",
+        "bypass_out_disabled",
+        "mdi:transmission-tower-off",
+    ),
+    # Port priority. On means the port is non-essential and gets switched off
+    # once the battery falls to its cutoff below; off means essential, which is
+    # what the wire calls false. The switch follows the wire rather than the
+    # app's wording, because an inverted control here cuts power to the wrong
+    # outlets during an outage.
+    #
+    # Push path only, like the AC charge power: the polled quota carries none
+    # of this, so with developer keys the switch could be flipped but never
+    # show where the device actually stands.
+    EcoFlowSwitchDef(
+        "port_priority_ac1_switch",
+        "AC 1 Non-Essential",
+        "port_priority_ac1_limited",
+        "mdi:power-plug-off-outline",
+        enhanced_only=True,
+    ),
+    EcoFlowSwitchDef(
+        "port_priority_ac2_switch",
+        "AC 2 Non-Essential",
+        "port_priority_ac2_limited",
+        "mdi:power-plug-off-outline",
+        enhanced_only=True,
+    ),
+    EcoFlowSwitchDef(
+        "port_priority_dc_switch",
+        "DC Non-Essential",
+        "port_priority_dc_limited",
+        "mdi:power-plug-off-outline",
+        enhanced_only=True,
+    ),
+]
+
+# Ranges are the vendor's own bounds, not our choice, except the backup reserve
+# floor, which is measured (see `backup_reserve_soc_bounds`). The charge limit
+# cannot go below 50. The backup reserve declares 5-100 and the entity narrows it at
+# runtime to run from five points above the discharge limit up to the charge
+# limit (see `backup_reserve_soc_bounds`). The three battery limits are sliders.
+DELTA3_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "backup_reserve_soc",
+        "Backup Reserve Level",
+        "backup_reserve_soc_pct",
+        "%",
+        "mdi:battery-lock",
+        5,
+        100,
+        1,
+        slider=True,
+    ),
+    EcoFlowNumberDef(
+        "max_charge_soc",
+        "Max Charge SoC",
+        "max_charge_soc_pct",
+        "%",
+        "mdi:battery-charging-100",
+        50,
+        100,
+        1,
+        slider=True,
+    ),
+    EcoFlowNumberDef(
+        "min_discharge_soc",
+        "Min Discharge SoC",
+        "min_discharge_soc_pct",
+        "%",
+        "mdi:battery-alert-variant-outline",
+        0,
+        30,
+        1,
+        slider=True,
+    ),
+    # AC charge power. Push path only: the polled quota never carries this
+    # field, so it exists on account sign-in and nowhere else. Ships with the
+    # charge mode below because the app puts this slider under its custom
+    # power mode; a write was accepted and reported back in battery-optimised
+    # mode too, so "only works in custom mode" is the app's framing rather
+    # than a measured property of the device.
+    EcoFlowNumberDef(
+        "ac_charge_power_limit",
+        "AC Charge Power",
+        "ac_charge_power_limit_w",
+        "W",
+        "mdi:lightning-bolt",
+        200,
+        2400,
+        100,
+        enhanced_only=True,
+    ),
+    # Port priority cutoffs. The bounds below are the widest the app's own
+    # formula can produce; the entity narrows them at runtime from the two
+    # battery limits (see `port_priority_soc_bounds`). Push path only, same
+    # reason as the switches above.
+    EcoFlowNumberDef(
+        "port_priority_ac1_soc",
+        "AC 1 Cutoff Level",
+        "port_priority_ac1_cutoff_soc",
+        "%",
+        "mdi:battery-off-outline",
+        5,
+        95,
+        1,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "port_priority_ac2_soc",
+        "AC 2 Cutoff Level",
+        "port_priority_ac2_cutoff_soc",
+        "%",
+        "mdi:battery-off-outline",
+        5,
+        95,
+        1,
+        enhanced_only=True,
+    ),
+    EcoFlowNumberDef(
+        "port_priority_dc_soc",
+        "DC Cutoff Level",
+        "port_priority_dc_cutoff_soc",
+        "%",
+        "mdi:battery-off-outline",
+        5,
+        95,
+        1,
+        enhanced_only=True,
+    ),
+]
+
+# LCD screen timeout. The six steps are the app's own list, in the app's order,
+# and the wire values behind them were read off a D3M1 rather than guessed.
+#
+# Zero is "never", not "off". Three other rows on the same app page read "Never"
+# and carry 0 on the wire, so a user reaching for a dark panel must not be able
+# to pick 0 by mistake - hence it is labelled and sits last, where the app puts
+# it. There is no value that switches the screen off outright; the shortest
+# timeout is as close as the device gets.
+DELTA3_SCREEN_TIMEOUT_VALUES: Mapping[int, str] = MappingProxyType(
+    {
+        10: "10_seconds",
+        30: "30_seconds",
+        60: "1_minute",
+        300: "5_minutes",
+        1800: "30_minutes",
+        0: "never",
+    }
+)
+DELTA3_SCREEN_TIMEOUT_KEY = "screen_timeout"
+DELTA3_SCREEN_TIMEOUT_STATE_KEY = "screen_off_time_sec"
+
+# The four idle shutdowns from the same app page, in minutes. Every one of them
+# offers the identical eight steps, read off all four pages of the app.
+#
+# The unit is settled rather than inferred: the 12 V DC page had "2 h" ticked
+# while its field read 120, and two hours is 120 minutes. Note that it differs
+# from the screen timeout above, which is seconds, in the same frame.
+#
+# These are idle shutdowns, not timers. The app's own description on each page:
+# the output switches off when no load is connected and no activity is seen for
+# the configured span. A load that keeps drawing keeps its output alive.
+DELTA3_IDLE_SHUTDOWN_VALUES: Mapping[int, str] = MappingProxyType(
+    {
+        30: "30_minutes",
+        60: "1_hour",
+        120: "2_hours",
+        240: "4_hours",
+        360: "6_hours",
+        720: "12_hours",
+        1440: "24_hours",
+        0: "never",
+    }
+)
+
+# key -> (entity name, state key, icon). The names say what powers down and that
+# it is idle-triggered; the app calls them "timeout", which describes the
+# mechanism and not the effect.
+DELTA3_IDLE_SHUTDOWNS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "device_idle_shutdown",
+        "Device Idle Shutdown",
+        "dev_standby_time_min",
+        "mdi:power-off",
+    ),
+    (
+        "ac1_idle_shutdown",
+        "AC 1 Idle Shutdown",
+        "ac_standby_time_min",
+        "mdi:power-socket-de",
+    ),
+    (
+        "ac2_idle_shutdown",
+        "AC 2 Idle Shutdown",
+        "ac2_standby_time_min",
+        "mdi:power-socket-de",
+    ),
+    (
+        "dc_idle_shutdown",
+        "12 V Idle Shutdown",
+        "dc_standby_time_min",
+        "mdi:car-battery",
+    ),
+)
+
+DELTA3_SELECTS: list[EcoFlowSelectDef] = [
+    # Push path only: the polled quota carries no screen or standby field at all,
+    # and the official Delta 3 HTTP documentation has none either. Without this
+    # flag the entities would exist on developer keys and never read or write.
+    EcoFlowSelectDef(
+        DELTA3_SCREEN_TIMEOUT_KEY,
+        "Screen Timeout",
+        DELTA3_SCREEN_TIMEOUT_STATE_KEY,
+        tuple(DELTA3_SCREEN_TIMEOUT_VALUES.values()),
+        icon="mdi:monitor-off",
+        enhanced_only=True,
+        value_map=DELTA3_SCREEN_TIMEOUT_VALUES,
+    ),
+    *(
+        EcoFlowSelectDef(
+            key,
+            name,
+            state_key,
+            tuple(DELTA3_IDLE_SHUTDOWN_VALUES.values()),
+            icon=icon,
+            enhanced_only=True,
+            value_map=DELTA3_IDLE_SHUTDOWN_VALUES,
+        )
+        for key, name, state_key, icon in DELTA3_IDLE_SHUTDOWNS
+    ),
+]
+
+# The charge mode deliberately has no entity. It is part of the same wire
+# setting as the power above and travels with every write, but its read-back
+# (status frame field 124) only arrives when the mode changes, not on a cycle:
+# measured over five minutes on a D3M1 without a single report. A select that
+# cannot show what the device is set to fails the read-back gate, so the mode
+# is written and never displayed.
+AC_CHARGE_POWER_STATE_KEY = "ac_charge_power_limit_w"
+
+# RIVER 3 (`R655`) reads and never writes (#296). The three recorded units
+# prove telemetry only: no frame in the recording is a write or the answer to
+# one, so no Delta 3 SET parameter is verified on this model, and a control
+# without a verified write and read-back would be a button that lies.
+#
+# This set names the sensors the recording backs, and it is the only thing
+# that does. Everything else the Delta 3 definitions offer, every switch,
+# number, select and binary sensor and every other sensor, is derived below as
+# the exclusion for the prefix instead of being listed a second time, so a
+# control added to the Delta 3 lists later stays off a RIVER 3 until someone
+# decides here. Two of them, the remaining times, never carry a value in the
+# recording because every unit reported itself idle; they are allowed on the
+# strength of the raw remaining-time fields that are in the frames. The
+# sensors left out are the ones the recording does not back: the solar input,
+# the 12 V output and the USB ports read 0 W (one USB reading is -2 W), and on
+# one unit the app showed 2 W of DC output while the matching Delta 3 field read
+# 0 W, so this model reports those ports somewhere the Delta 3 message does not
+# cover, and no unit had a USB load. Per-outlet AC power and the two
+# lifetime energy counters do not appear at all and would sit unknown. The
+# charge limits, the AC charge power limit and the idle timers do appear, but
+# they are the read-back of the controls left out here.
+#
+# `ac_in_energy_kwh` and `out_energy_kwh` are not in the frames either: the
+# coordinator integrates them from `ac_in_w` and `pow_out_sum_w`, which are.
+RIVER3_SENSOR_KEYS: frozenset[str] = frozenset(
+    {
+        "cms_batt_soc",
+        "pow_in_sum_w",
+        "pow_out_sum_w",
+        "ac_in_w",
+        "ac_in_energy_kwh",
+        "out_energy_kwh",
+        "typec1_w",
+        "usb_qc1_w",
+        "chg_remain_time_min",
+        "dsg_remain_time_min",
+        "chg_dsg_state",
+        "bms_soh_pct",
+        "bms_cycles",
+        "bms_voltage_v",
+        "bms_current_a",
+        "bms_temp_c",
+        "bms_max_cell_temp_c",
+        "bms_min_cell_temp_c",
+        "bms_max_mos_temp_c",
+        "bms_min_mos_temp_c",
+        "bms_max_cell_vol_mv",
+        "bms_min_cell_vol_mv",
+        "bms_cell_vol_diff_mv",
+        "bms_remain_cap_mah",
+        "bms_full_cap_mah",
+        "bms_design_cap_mah",
+        "bms_cell_count",
+        "bms_real_soh_pct",
+        "bms_calendar_soh_pct",
+        "bms_cycle_soh_pct",
+        "bms_error_code",
+    }
+)
+
+
+def _delta3_names_outside(allowed: frozenset[str]) -> frozenset[str]:
+    """Return every Delta 3 entity key and state key not named in ``allowed``."""
+    definition_lists: tuple[Sequence[_HasKey], ...] = (
+        DELTA3_SENSORS,
+        DELTA3_BINARY_SENSORS,
+        DELTA3_SWITCHES,
+        DELTA3_NUMBERS,
+        DELTA3_SELECTS,
+    )
+    names: set[str] = set()
+    for definitions in definition_lists:
+        for definition in definitions:
+            names.add(definition.key)
+            state_key = getattr(definition, "state_key", None)
+            if state_key is not None:
+                names.add(state_key)
+    return frozenset(names - allowed)
+
+
+# The one table entry that cannot sit in the literal above, because it is
+# computed from the Delta 3 definition lists that come after it in the file.
+# States a RIVER 3 reports for a Delta 3 switch it gets no write for. The
+# switch stays excluded; readback_binary_defs_for_serial() shows the state.
+# AC output: 0 off and 2 on, recorded switching off and on in the app (#296).
+RIVER3_READBACK_KEYS: frozenset[str] = frozenset({"ac_out_flow"})
+
+_SN_PREFIX_EXCLUDED_KEYS["R655"] = _delta3_names_outside(
+    RIVER3_SENSOR_KEYS | RIVER3_READBACK_KEYS
+)
+# RIVER 3 Plus: the same entry, not a second set. Its recording (#296) backs
+# the same sensors with two exceptions taken from the RIVER 3: the unit stayed
+# idle, so Charge Time Remaining rests on the raw remaining-time field alone,
+# and the AC output only ever read on, so the off value comes from the RIVER 3
+# run. It also sends the two lifetime battery energy counters the RIVER 3 does
+# not; they stay off so the family keeps one set. Like the RIVER 3 it holds no
+# write, so whatever is decided for the family above applies to both.
+_SN_PREFIX_EXCLUDED_KEYS["R631"] = _SN_PREFIX_EXCLUDED_KEYS["R655"]
+
+
+# =====================================================================
+# PowerStream microinverter sensor definitions
+# =====================================================================
+
+# Standard Mode only. Every reading below comes from the `20_1.` HTTP quota
+# and is scaled per the arithmetic in powerstream_http.py; the readings that
+# the capture could not settle - currents, the history counters, the remaining
+# times, the status enums - are absent on purpose rather than by oversight.
+POWERSTREAM_SENSORS: list[EcoFlowSensorDef] = [
+    # --- Production ---
+    EcoFlowSensorDef(
+        "solar_w",
+        "Solar Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pv1_w",
+        "PV 1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "pv2_w",
+        "PV 2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "inv_output_w",
+        "Inverter Output Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    # Signed, negative while the unit exports. There is no import/export split
+    # here: the capture only ever shows this unit exporting, so which quantity
+    # a positive value would describe is unknown, and two energy counters built
+    # on that guess would be worse than none.
+    EcoFlowSensorDef(
+        "grid_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "plug_total_w",
+        "Smart Plug Load Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Battery ---
+    EcoFlowSensorDef(
+        "soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+    # Positive = charging, taken from the field name rather than from an
+    # observation: the battery was idle for the whole capture. Deliberately
+    # absent from POWERSTREAM_POWER_TO_ENERGY until an owner confirms it.
+    EcoFlowSensorDef(
+        "batt_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "batt_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "batt_temp_c",
+        "Battery Temp",
+        "\u00b0C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    # --- Settings the device reports back ---
+    EcoFlowSensorDef(
+        "permanent_watts_w",
+        "Custom Load Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "lower_limit_pct",
+        "Discharge Limit",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-arrow-down",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "upper_limit_pct",
+        "Charge Limit",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-charging-100",
+        "diagnostic",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "supply_priority",
+        "Power Supply Priority",
+        None,
+        "enum",
+        None,
+        "mdi:priority-high",
+        "diagnostic",
+        options=["power_supply", "battery_storage"],
+    ),
+    EcoFlowSensorDef(
+        "led_brightness",
+        "LED Brightness",
+        "%",
+        None,
+        "measurement",
+        "mdi:brightness-6",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "rated_power_w",
+        "Rated Power",
+        "W",
+        "power",
+        None,
+        "mdi:flash-alert",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Electrical diagnostics ---
+    EcoFlowSensorDef(
+        "ac_voltage_v",
+        "AC Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_frequency_hz",
+        "AC Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv1_voltage_v",
+        "PV 1 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_voltage_v",
+        "PV 2 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "wifi_rssi_dbm",
+        "WiFi Signal",
+        "dBm",
+        "signal_strength",
+        "measurement",
+        "mdi:wifi",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # --- Energy Dashboard (Riemann-integrated, kWh) ---
+    EcoFlowSensorDef(
+        "solar_energy_kwh",
+        "Solar Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "inv_output_energy_kwh",
+        "Inverter Output Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:flash",
+        suggested_display_precision=2,
+    ),
+    # Per-string energy, off by default for the same reason as on the Stream:
+    # `solar_energy_kwh` already carries the PV total, and a dashboard summing
+    # the enabled strings would under-report on a unit with one panel.
+    EcoFlowSensorDef(
+        "pv1_energy_kwh",
+        "PV 1 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_energy_kwh",
+        "PV 2 Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power-variant",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+]
+
+# =====================================================================
+# Smart Meter sensor definitions
+# =====================================================================
+
+# The meter reports through the app channel only, so every reading here
+# arrives as a push. Phase labels follow the app, which counts A/B/C, while
+# the keys keep the L1/L2/L3 form the wire uses.
+SMARTMETER_SENSORS: list[EcoFlowSensorDef] = [
+    # --- Grid power ---
+    EcoFlowSensorDef(
+        "grid_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_w",
+        "Phase A Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_w",
+        "Phase B Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_l3_w",
+        "Phase C Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    # --- Per-phase electrical readings, sent with the full uploads ---
+    EcoFlowSensorDef(
+        "grid_l1_voltage_v",
+        "Phase A Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_voltage_v",
+        "Phase B Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "grid_l3_voltage_v",
+        "Phase C Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_current_a",
+        "Phase A Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_current_a",
+        "Phase B Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_l3_current_a",
+        "Phase C Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+    ),
+    # --- Energy counters the meter keeps itself ---
+    # All six are lifetime counters (ADR-018, PLAN-123): a capture spanning
+    # local midnight shows none of them resetting, so direction decides the
+    # state class, not a daily/lifetime split the wire does not have. Import
+    # and export only ever stand still or rise, so they are
+    # `total_increasing` and the Energy Dashboard's two grid entries. Net and
+    # the three phase nets fall whenever the house exports - `.7 = .4 - .6`
+    # and the phases sum to `.7`, not to import - so they are `total`, which
+    # records the fall as the negative delta it is and permits the negative
+    # value a net exporter's total will eventually cross. `measurement` is
+    # not a candidate: `device_class: energy` admits only `total` and
+    # `total_increasing`.
+    EcoFlowSensorDef(
+        "grid_import_energy_wh",
+        "Grid Import Energy",
+        "Wh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_energy_wh",
+        "Grid Export Energy",
+        "Wh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_net_energy_wh",
+        "Grid Net Energy",
+        "Wh",
+        "energy",
+        "total",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_net_energy_wh",
+        "Phase A Net Energy",
+        "Wh",
+        "energy",
+        "total",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_net_energy_wh",
+        "Phase B Net Energy",
+        "Wh",
+        "energy",
+        "total",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "grid_l3_net_energy_wh",
+        "Phase C Net Energy",
+        "Wh",
+        "energy",
+        "total",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+    ),
+    # --- Diagnostics ---
+    EcoFlowSensorDef(
+        "grid_power_factor",
+        "Power Factor",
+        None,
+        "power_factor",
+        "measurement",
+        "mdi:angle-acute",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "grid_connection_state",
+        "Grid Connection State",
+        None,
+        "enum",
+        None,
+        "mdi:transmission-tower",
+        "diagnostic",
+        options=["invalid", "grid_in", "not_online", "feed_grid"],
+    ),
+]
+
+SMARTMETER_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    EcoFlowBinarySensorDef(
+        "grid_l1_connected",
+        "Phase A Connected",
+        "connectivity",
+        "mdi:transmission-tower",
+        "diagnostic",
+    ),
+    EcoFlowBinarySensorDef(
+        "grid_l2_connected",
+        "Phase B Connected",
+        "connectivity",
+        "mdi:transmission-tower",
+        "diagnostic",
+    ),
+    EcoFlowBinarySensorDef(
+        "grid_l3_connected",
+        "Phase C Connected",
+        "connectivity",
+        "mdi:transmission-tower",
+        "diagnostic",
+    ),
+]
+
+# =====================================================================
+# Solar Tracker sensor definitions
+# =====================================================================
+
+# Single Axis Solar Tracker (HZ31 / S02F, #339). Six entities, the list ADR-014
+# closes: `target_angle_deg` and `tracking_mode` are frozen keys, kept for the
+# controls PLAN-119 leaves for round 2. See
+# custom_components/ecoflow_energy/ecoflow/parsers/solar_tracker_proto.py for
+# the field notes behind the offset, the sentinel and the enum.
+SOLARTRACKER_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "tilt_angle_deg",
+        "Tilt Angle",
+        "°",
+        None,
+        "measurement",
+        "mdi:angle-acute",
+        suggested_display_precision=0,
+    ),
+    # Frozen key: becomes the round-2 number entity's unique_id.
+    EcoFlowSensorDef(
+        "target_angle_deg",
+        "Target Angle",
+        "°",
+        None,
+        "measurement",
+        "mdi:angle-acute",
+        suggested_display_precision=0,
+    ),
+    # `0xFFFFFFFF` on the wire is published as an explicit None (ADR-011
+    # decision 2), which reads as unknown here rather than as a stale value.
+    EcoFlowSensorDef(
+        "optimal_angle_deg",
+        "Optimal Angle",
+        "°",
+        None,
+        "measurement",
+        "mdi:angle-acute",
+        suggested_display_precision=0,
+    ),
+    # Unscaled and unitless: no factor is verified against any app reading.
+    EcoFlowSensorDef(
+        "light_level",
+        "Light Level",
+        None,
+        None,
+        "measurement",
+        "mdi:brightness-6",
+        suggested_display_precision=0,
+    ),
+    # Frozen key: becomes the round-2 select entity's unique_id.
+    EcoFlowSensorDef(
+        "tracking_mode",
+        "Mode",
+        None,
+        "enum",
+        None,
+        "mdi:sun-compass",
+        options=["manual", "auto"],
+    ),
+    EcoFlowSensorDef(
+        "battery_pct",
+        "Battery",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+    ),
+]
+
+# =====================================================================
+# WAVE 3 sensor definitions
+# =====================================================================
+
+# WAVE 3 portable AC (AC71, #161, PLAN-047 Phase A). Account-channel only -
+# no serial prefix can be bound to a Developer Key (error 1006), so every
+# entity below is enhanced_only. See
+# custom_components/ecoflow_energy/ecoflow/parsers/wave3_proto.py for the
+# field notes behind the enums and the optional add-on battery.
+WAVE3_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "temp_ambient_c",
+        "Ambient Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "humi_ambient_pct",
+        "Ambient Humidity",
+        "%",
+        "humidity",
+        "measurement",
+        "mdi:water-percent",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ac_input_power_w",
+        "AC Input Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "temp_outdoor_ambient_c",
+        "Outdoor Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_input_energy_kwh",
+        "AC Input Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:lightning-bolt",
+        suggested_display_precision=2,
+    ),
+    # --- Diagnostics ---
+    EcoFlowSensorDef(
+        "temp_indoor_supply_air_c",
+        "Supply Air Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-up",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "temp_indoor_return_air_c",
+        "Return Air Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-chevron-down",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_input_voltage_v",
+        "AC Input Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ac_input_current_a",
+        "AC Input Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+    ),
+    # `temp_condenser_c`, `temp_evaporator_c` and `temp_compressor_discharge_c` are
+    # disabled by default: internal refrigeration-cycle readings, useful for
+    # diagnostics but not something most users watch daily. `target_temp_c`,
+    # `airflow_speed_pct`, `operating_mode`, `operating_submode`,
+    # `target_humidity_pct` and `screen_brightness_pct` moved to the number and
+    # select platforms below, where a control lives alongside its own read-back.
+    EcoFlowSensorDef(
+        "temp_condenser_c",
+        "Condenser Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-high",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "temp_evaporator_c",
+        "Evaporator Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-low",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "temp_compressor_discharge_c",
+        "Compressor Discharge Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer-alert",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+    ),
+    # --- Optional add-on battery: disabled by default, reads 0 on units without one ---
+    EcoFlowSensorDef(
+        "battery_soc_pct",
+        "Battery",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_current_a",
+        "Battery Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_power_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # Not the add-on battery group above: no non-zero value has been observed
+    # yet on the one unit on record, so it stays off until one is (#161).
+    EcoFlowSensorDef(
+        "pv_input_power_w",
+        "PV Input Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+    # Not the add-on battery group above: unit is unknown, the capture only
+    # ever showed 0.0 for this key, so it stays off until a unit is known.
+    EcoFlowSensorDef(
+        "condensate_water_level",
+        "Condensate Water Level",
+        None,
+        None,
+        "measurement",
+        "mdi:water",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+    ),
+]
+
+WAVE3_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    # "running" moved to the switch platform below (`power`), whose own
+    # state key is the same "running" field. See EcoFlowSwitchDef("power", ...).
+    EcoFlowBinarySensorDef(
+        "ac_input_connected",
+        "AC Input Connected",
+        "plug",
+        "mdi:power-plug",
+        "diagnostic",
+    ),
+    EcoFlowBinarySensorDef(
+        "fault", "Fault", "problem", "mdi:alert-circle", "diagnostic"
+    ),
+    EcoFlowBinarySensorDef("draining", "Draining", None, "mdi:water", "diagnostic"),
+    EcoFlowBinarySensorDef(
+        "pet_care_alarm",
+        "Pet Care Alarm",
+        "problem",
+        "mdi:paw",
+        "diagnostic",
+        disabled_by_default=True,
+    ),
+    # Reads true on every unit without an add-on battery fitted.
+    EcoFlowBinarySensorDef(
+        "bms_communication_error",
+        "Battery Communication Error",
+        "problem",
+        "mdi:battery-alert",
+        "diagnostic",
+        disabled_by_default=True,
+    ),
+]
+
+# Every write here goes over the same app WebSocket ConfigWrite envelope as
+# Delta 3, with the WAVE 3's own routing id - see `wave3_commands.py`. No
+# `enhanced_only` flag on any of these: the device type is in
+# ENHANCED_ONLY_DEVICE_TYPES already, so a Developer Key entry can never
+# select it in the first place.
+WAVE3_SWITCHES: list[EcoFlowSwitchDef] = [
+    # Standby, not the hard power-off: the app's own client never writes
+    # `cfg_power_off` (field 3) either. See WAVE3_POWER_ON_FIELD / WAVE3_STANDBY_FIELD.
+    EcoFlowSwitchDef("power", "Power", "running", "mdi:power"),
+    EcoFlowSwitchDef("beep_enabled", "Buzzer", "beep_enabled", "mdi:volume-high"),
+    EcoFlowSwitchDef(
+        "automatic_drainage",
+        "Automatic Drainage",
+        "automatic_drainage",
+        "mdi:water-pump",
+    ),
+    EcoFlowSwitchDef("pet_care_enabled", "Pet Care", "pet_care_enabled", "mdi:paw"),
+]
+
+WAVE3_NUMBERS: list[EcoFlowNumberDef] = [
+    # target_temp_c, airflow_speed_pct, target_humidity_pct and operating_submode
+    # (on the select platform below) are the values of whichever mode is
+    # currently running - see WAVE3_ACTIVE_MODE_INPUTS in wave3_proto.py. A
+    # write is refused outside the mode it belongs to; see wave3_commands.py.
+    EcoFlowNumberDef(
+        "target_temp_c",
+        "Target Temperature",
+        "target_temp_c",
+        "°C",
+        "mdi:thermostat",
+        15.5,
+        30,
+        0.5,
+    ),
+    EcoFlowNumberDef(
+        "airflow_speed_pct",
+        "Fan Speed",
+        "airflow_speed_pct",
+        "%",
+        "mdi:fan",
+        20,
+        100,
+        20,
+    ),
+    EcoFlowNumberDef(
+        "target_humidity_pct",
+        "Target Humidity",
+        "target_humidity_pct",
+        "%",
+        "mdi:water-percent",
+        40,
+        80,
+        1,
+    ),
+    EcoFlowNumberDef(
+        "screen_brightness_pct",
+        "Screen Brightness",
+        "screen_brightness_pct",
+        "%",
+        "mdi:brightness-6",
+        10,
+        100,
+        1,
+    ),
+    EcoFlowNumberDef(
+        "pet_care_warning_temp_c",
+        "Pet Care Warning Temperature",
+        "pet_care_warning_temp_c",
+        "°C",
+        "mdi:thermometer-alert",
+        25,
+        45,
+        1,
+    ),
+]
+
+# Wire value -> option label, screen-off timeout. Same pattern as
+# DELTA3_SCREEN_TIMEOUT_VALUES: the device reports a number of seconds, not a
+# label, so the wire value is what the entity stores and round-trips.
+WAVE3_SCREEN_OFF_TIME_VALUES: Mapping[int, str] = MappingProxyType(
+    {
+        10: "10s",
+        30: "30s",
+        60: "1min",
+        300: "5min",
+        600: "10min",
+        0: "never",
+    }
+)
+
+WAVE3_SELECTS: list[EcoFlowSelectDef] = [
+    EcoFlowSelectDef(
+        "operating_mode",
+        "Operating Mode",
+        "operating_mode",
+        ("cooling", "heating", "fan", "dehumidify", "constant_temp"),
+        icon="mdi:air-conditioner",
+    ),
+    EcoFlowSelectDef(
+        "operating_submode",
+        "Operating Submode",
+        "operating_submode",
+        ("none", "normal", "max", "sleep", "eco"),
+        icon="mdi:cog-outline",
+    ),
+    EcoFlowSelectDef(
+        "display_temperature_source",
+        "Display Temperature",
+        "display_temperature_source",
+        ("ambient", "outlet"),
+        icon="mdi:thermometer",
+    ),
+    EcoFlowSelectDef(
+        "mood_light_mode",
+        "Mood Light",
+        "mood_light_mode",
+        ("off", "on", "screen_time"),
+        icon="mdi:led-strip-variant",
+    ),
+    EcoFlowSelectDef(
+        "screen_off_time_s",
+        "Screen Timeout",
+        "screen_off_time_s",
+        tuple(WAVE3_SCREEN_OFF_TIME_VALUES.values()),
+        icon="mdi:monitor-off",
+        value_map=WAVE3_SCREEN_OFF_TIME_VALUES,
+    ),
+]
+
+# PowerPulse 2 wallbox (`C376`), standalone device type since PLAN-132.
+# `ev_charge_power_w`, `ev_session_energy_wh`, `ev_session_duration_s` and
+# `ev_charge_status` moved here unchanged from POWEROCEAN_SENSORS, where
+# they were an `accessory` reading relayed through the PowerOcean on
+# cmd_func 209. On its own device the wallbox is not an optional bolt-on -
+# every PowerPulse 2 has these readings - so `accessory` is dropped for the
+# four of them: the entities are created for every device of this type
+# instead of waiting for a first report. `ev_cable_lock_enabled` below is
+# the one exception, kept as an accessory-style wait (see its own list).
+#
+# All entries are `enhanced_only`: developer keys never carry this device's
+# telemetry, only the app/Enhanced Mode channel does.
+# Ocean 2 (`RE11`, `RE17`, `RE41`, `RE42`, `RE43`). Enhanced mode only - the
+# Developer API answers error 1006 for this device, so every value here comes
+# from the protobuf stream.
+#
+# The readings the app shows on its home screen are confirmed against it and
+# enabled by default. AC power/frequency, the three inverter phases and the
+# per-string PV voltage/current below them are diagnostics the app does not
+# surface there, so they ship disabled; the three grid phase voltages ship
+# enabled, alongside the totals. Per-module battery data (cell voltages,
+# temperatures, cycle counts) is its own entity set, built per module in
+# `_build_ocean2_module_sensors()` below.
+#
+# Solar strings 3 and 4 are off by default. A unit populates as many strings
+# as its MPPT inputs are wired, and an entity that never fills reads as a
+# broken sensor rather than an unused input.
+OCEAN2_SENSORS: list[EcoFlowSensorDef] = [
+    # The EMS status record (254/39 field 3): what the app shows as the work
+    # mode, what the system is doing, and which program overrides the mode.
+    # It rides mostly on the full snapshot, so these are accessories and
+    # appear on the first report. The options come from the parser's tables,
+    # which are the only place the wire values are named. Work mode and system
+    # state share their keys, state names and translations with the
+    # PowerOcean's sensors of the same name.
+    EcoFlowSensorDef(
+        "ems_work_mode",
+        "Work Mode",
+        None,
+        "enum",
+        None,
+        "mdi:cog",
+        "diagnostic",
+        enhanced_only=True,
+        options=list(OCEAN2_WORK_MODES.values()),
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_work_state",
+        "System State",
+        None,
+        "enum",
+        None,
+        "mdi:state-machine",
+        "diagnostic",
+        enhanced_only=True,
+        options=list(EMS_WORK_STATES.values()),
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "ems_control_mode",
+        "Control Mode",
+        None,
+        "enum",
+        None,
+        "mdi:tune-variant",
+        "diagnostic",
+        enhanced_only=True,
+        options=list(OCEAN2_CONTROL_MODES.values()),
+        accessory=True,
+    ),
+    EcoFlowSensorDef(
+        "soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # Signed: positive = charging, negative = discharging.
+    EcoFlowSensorDef(
+        "batt_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # Energy left in the pack, not its capacity.
+    EcoFlowSensorDef(
+        "batt_remaining_wh",
+        "Battery Remaining Energy",
+        "Wh",
+        "energy_storage",
+        "measurement",
+        "mdi:battery-70",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "solar_w",
+        "Solar Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # Signed: positive = import from grid, negative = export.
+    EcoFlowSensorDef(
+        "grid_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # As the device reports it, not derived from the other three.
+    EcoFlowSensorDef(
+        "home_w",
+        "Home Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv1_w",
+        "PV 1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_w",
+        "PV 2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv3_w",
+        "PV 3 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_w",
+        "PV 4 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power-variant",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    # Directional splits of grid_w and batt_w. The device reports one signed
+    # value per path; the energy dashboard needs two one-directional counters,
+    # because integrating a signed value cancels itself out.
+    EcoFlowSensorDef(
+        "grid_import_power_w",
+        "Grid Import Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_power_w",
+        "Grid Export Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_power_w",
+        "Battery Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_power_w",
+        "Battery Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # Riemann sums over the power sensors above - the entities the energy
+    # dashboard is configured with.
+    EcoFlowSensorDef(
+        "solar_energy_kwh",
+        "Solar Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:solar-power",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "home_energy_kwh",
+        "Home Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_import_energy_kwh",
+        "Grid Import Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-import",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_export_energy_kwh",
+        "Grid Export Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:transmission-tower-export",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_energy_kwh",
+        "Battery Charge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery-charging",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_energy_kwh",
+        "Battery Discharge Energy",
+        "kWh",
+        "energy",
+        "total_increasing",
+        "mdi:battery",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    # --- PCS / AC output ---
+    EcoFlowSensorDef(
+        "pcs_ac_power_w",
+        "AC Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash-triangle",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # Same key as the PowerOcean's own "Grid Frequency" - one shared
+    # reading published once per frame rather than once per phase, see the
+    # parser's `_grid_phases()`.
+    EcoFlowSensorDef(
+        "pcs_ac_freq_hz",
+        "Grid Frequency",
+        "Hz",
+        "frequency",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=1,
+        enhanced_only=True,
+    ),
+    # --- Inverter per-phase diagnostics ---
+    # Disabled by default: the app does not surface these on its home
+    # screen, and grid-port current/power in the same block do not track
+    # the grid meter (see the parser's `_grid_phases()` docstring), so
+    # nothing per-phase ships enabled except the grid voltage below.
+    EcoFlowSensorDef(
+        "inv_phase_a_voltage_v",
+        "Inverter Phase A Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_b_voltage_v",
+        "Inverter Phase B Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_c_voltage_v",
+        "Inverter Phase C Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_a_current_a",
+        "Inverter Phase A Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_b_current_a",
+        "Inverter Phase B Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_c_current_a",
+        "Inverter Phase C Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_a_active_power_w",
+        "Inverter Phase A Active Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_b_active_power_w",
+        "Inverter Phase B Active Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_c_active_power_w",
+        "Inverter Phase C Active Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash-triangle",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_a_reactive_power_var",
+        "Inverter Phase A Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_b_reactive_power_var",
+        "Inverter Phase B Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_c_reactive_power_var",
+        "Inverter Phase C Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_a_apparent_power_va",
+        "Inverter Phase A Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_b_apparent_power_va",
+        "Inverter Phase B Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_phase_c_apparent_power_va",
+        "Inverter Phase C Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:sine-wave",
+        "diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    # --- Grid per-phase voltage ---
+    # Same keys as the PowerOcean's own grid-phase voltages. Current and
+    # power for this block are deliberately not read - see the parser's
+    # `_grid_phases()` docstring.
+    EcoFlowSensorDef(
+        "grid_phase_a_voltage_v",
+        "Grid Phase A Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=1,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_b_voltage_v",
+        "Grid Phase B Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=1,
+        accessory=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_phase_c_voltage_v",
+        "Grid Phase C Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:transmission-tower",
+        "diagnostic",
+        suggested_display_precision=1,
+        accessory=True,
+        enhanced_only=True,
+    ),
+    # --- Per-string PV voltage/current ---
+    # Same disabled-by-default reasoning as PV 3/4 Power above: a string
+    # that is not wired reads as a broken sensor rather than an unused
+    # input.
+    EcoFlowSensorDef(
+        "pv1_voltage_v",
+        "PV 1 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv1_current_a",
+        "PV 1 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_voltage_v",
+        "PV 2 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv2_current_a",
+        "PV 2 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv3_voltage_v",
+        "PV 3 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv3_current_a",
+        "PV 3 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_voltage_v",
+        "PV 4 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash",
+        "diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv4_current_a",
+        "PV 4 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-dc",
+        "diagnostic",
+        suggested_display_precision=2,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+]
+
+
+def _build_ocean2_module_sensors(module_num: int) -> list[EcoFlowSensorDef]:
+    """Build the entity definitions for one Ocean 2 battery module.
+
+    Every one of these is an accessory: created once the module has actually
+    reported, never before. The module count is an installation choice rather
+    than a model difference - two on the unit this was mapped on; captures
+    from other systems show bundles of up to fourteen per-module headers in
+    one frame, which is a heartbeat backlog rather than fourteen distinct
+    modules (see the parser's own note on this). Declaring a fixed number as
+    disabled-by-default would still leave most owners with dozens of entities
+    their hardware can never fill, and the rest hunting through a disabled
+    list for the modules they do have.
+    """
+    m = f"module{module_num}"
+    n = module_num
+
+    core = [
+        # No battery device class: Home Assistant shows one battery figure per
+        # device, and that is the system state of charge. A per-module class
+        # would put sixteen competing battery icons on one device.
+        EcoFlowSensorDef(
+            f"{m}_soc_pct",
+            f"Module {n} SoC",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery",
+            suggested_display_precision=1,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        # Signed like the system reading: positive charges, negative discharges.
+        EcoFlowSensorDef(
+            f"{m}_power_w",
+            f"Module {n} Power",
+            "W",
+            "power",
+            "measurement",
+            "mdi:battery-charging",
+            suggested_display_precision=0,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        # Energy left in this module, not its capacity.
+        EcoFlowSensorDef(
+            f"{m}_remaining_wh",
+            f"Module {n} Remaining Energy",
+            "Wh",
+            "energy_storage",
+            "measurement",
+            "mdi:battery-70",
+            suggested_display_precision=0,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{m}_soh_pct",
+            f"Module {n} State of Health",
+            "%",
+            None,
+            "measurement",
+            "mdi:heart-pulse",
+            "diagnostic",
+            suggested_display_precision=1,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{m}_cycles",
+            f"Module {n} Charge Cycles",
+            None,
+            None,
+            "total_increasing",
+            "mdi:counter",
+            "diagnostic",
+            suggested_display_precision=0,
+            accessory=True,
+            enhanced_only=True,
+        ),
+    ]
+
+    diagnostic = [
+        # Cell temperatures. The three hold the order min <= average <= max in
+        # every frame and move together and slowly.
+        EcoFlowSensorDef(
+            f"{m}_cell_temp_c",
+            f"Module {n} Cell Temperature",
+            "°C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{m}_cell_temp_min_c",
+            f"Module {n} Min Cell Temperature",
+            "°C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-low",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{m}_cell_temp_max_c",
+            f"Module {n} Max Cell Temperature",
+            "°C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-high",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        # The hottest of the four power-electronics readings, see the parser.
+        EcoFlowSensorDef(
+            f"{m}_mos_temp_c",
+            f"Module {n} Power Electronics Temperature",
+            "°C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer-alert",
+            "diagnostic",
+            suggested_display_precision=1,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        # Pack voltage: low for a home battery because the modules are 5S.
+        EcoFlowSensorDef(
+            f"{m}_voltage_v",
+            f"Module {n} Voltage",
+            "V",
+            "voltage",
+            "measurement",
+            "mdi:flash",
+            "diagnostic",
+            suggested_display_precision=2,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{m}_current_a",
+            f"Module {n} Current",
+            "A",
+            "current",
+            "measurement",
+            "mdi:current-dc",
+            "diagnostic",
+            suggested_display_precision=2,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        # Highest cell voltage, not the pack - it follows the load.
+        EcoFlowSensorDef(
+            f"{m}_cell_voltage_mv",
+            f"Module {n} Max Cell Voltage",
+            "mV",
+            "voltage",
+            "measurement",
+            "mdi:flash-triangle-outline",
+            "diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+            accessory=True,
+            enhanced_only=True,
+        ),
+    ]
+
+    return core + diagnostic
+
+
+for _module_num in range(1, OCEAN2_MAX_MODULES + 1):
+    OCEAN2_SENSORS.extend(_build_ocean2_module_sensors(_module_num))
+
+
+# Ocean 2 controls (PLAN-151). One number: the Backup Reserve, the same setting
+# the app offers as a percentage slider. The declared floor of 1 is the RE11's:
+# the lowest value that unit acknowledged. The RE41 has held 0, so its floor
+# comes from its `OCEAN2_CONTROLS` row at runtime (`reserve_floor`), as does
+# the ceiling from the device's own SoC ratio (`edev_soc_ratio_pct`), see
+# `EcoFlowNumber._is_ocean2_backup_reserve`. Created per variant by
+# `supports_ocean2_reserve` and, because it is an accessory, only once the unit
+# has reported the value.
+OCEAN2_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "backup_reserve",
+        "Backup Reserve",
+        "backup_reserve_pct",
+        "%",
+        "mdi:battery-lock",
+        1,
+        100,
+        1,
+        enhanced_only=True,
+        accessory=True,
+        slider=True,
+    ),
+]
+
+# The Ocean 2 Storm Guard switch (PLAN-192): the setting the app offers as a
+# switch, written as an action command and confirmed by the next full snapshot
+# (`EcoFlowDeviceCoordinator.async_set_ocean2_storm_guard`). The read-back key
+# is only on that snapshot, so as an accessory the switch is created once the
+# unit has reported it, and the variant gate is `supports_ocean2_storm_guard`.
+OCEAN2_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef(
+        "storm_guard",
+        "Storm Guard",
+        "storm_guard_enabled",
+        "mdi:weather-lightning-rainy",
+        enhanced_only=True,
+        accessory=True,
+        entity_category="config",
+    ),
+]
+
+
+# OCEAN Smart Electrical Panel 40 (`HR61`). Enhanced mode only: the one
+# capture on record came over the app channel. Read-only, and no energy
+# counters: none appear in the panel's push, and integrating power locally
+# would invent a second source for a figure the panel may report elsewhere.
+# Per-circuit entities are created from the circuits the panel reports.
+SMARTPANEL40_SENSORS: list[EcoFlowSensorDef] = [
+    # Signed: positive = import from grid, negative = export.
+    EcoFlowSensorDef(
+        "grid_power_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+        translation_key="grid_w",
+        enhanced_only=True,
+    ),
+    # Computed by the panel from grid, solar and battery power, not a
+    # second measurement.
+    EcoFlowSensorDef(
+        "load_power_w",
+        "Home Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=0,
+        translation_key="home_w",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pv_power_w",
+        "Solar Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+        translation_key="solar_w",
+        enhanced_only=True,
+    ),
+    # Signed: positive = charging, negative = discharging.
+    EcoFlowSensorDef(
+        "battery_power_w",
+        "Battery Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-charging",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        translation_key="soc_pct",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_voltage_v",
+        "Grid L1 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=0,
+        translation_key="grid_leg_l1_voltage_v",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_voltage_v",
+        "Grid L2 Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=0,
+        translation_key="grid_leg_l2_voltage_v",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_current_a",
+        "Grid L1 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+        translation_key="grid_leg_l1_current_a",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_current_a",
+        "Grid L2 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+        translation_key="grid_leg_l2_current_a",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_power_w",
+        "Grid L1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_power_w",
+        "Grid L2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_apparent_power_va",
+        "Grid L1 Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:flash",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_apparent_power_va",
+        "Grid L2 Apparent Power",
+        "VA",
+        "apparent_power",
+        "measurement",
+        "mdi:flash",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_reactive_power_var",
+        "Grid L1 Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:flash-outline",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_reactive_power_var",
+        "Grid L2 Reactive Power",
+        "var",
+        "reactive_power",
+        "measurement",
+        "mdi:flash-outline",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "backup_reserve_pct",
+        "Backup Reserve",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-lock",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    # Grid-code block, sent once per full state: the nominal values the
+    # panel is configured for, not live measurements.
+    EcoFlowSensorDef(
+        "grid_nominal_voltage_v",
+        "Grid Nominal Voltage",
+        "V",
+        "voltage",
+        None,
+        "mdi:sine-wave",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_nominal_frequency_hz",
+        "Grid Nominal Frequency",
+        "Hz",
+        "frequency",
+        None,
+        "mdi:sine-wave",
+        entity_category="diagnostic",
+        suggested_display_precision=1,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_code",
+        "Grid Code",
+        None,
+        None,
+        None,
+        "mdi:file-certificate-outline",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        disabled_by_default=True,
+        enhanced_only=True,
+    ),
+]
+
+
+def _build_panel_circuit_sensors(
+    circuit: int, *, with_voltage: bool = True, current_precision: int = 0
+) -> list[EcoFlowSensorDef]:
+    """Build the sensor definitions for one Smart Panel 40 circuit.
+
+    Accessories: created once the panel reports the circuit, so a panel with
+    fewer circuits wired never shows empty ones. Power is signed from the
+    circuit's side: positive while it draws, negative while it feeds the
+    panel (a battery or generator breaker). Voltage sits near the leg voltage
+    and current is reported in whole amps only, so both start disabled.
+
+    The Smart Home Panel 2 shares this builder: it sends the same keys,
+    the same label and the same translations per circuit, so a second
+    builder would only restate them. It reports no per-circuit voltage
+    (`with_voltage=False`) and its currents carry two decimals
+    (`current_precision=2`). The defaults are the Smart Panel 40's own.
+    """
+    c = f"circuit_{circuit}"
+    label = str(circuit)
+    label_key = f"{c}_name"
+    sensors = [
+        EcoFlowSensorDef(
+            f"{c}_power_w",
+            f"Circuit {circuit} Power",
+            "W",
+            "power",
+            "measurement",
+            "mdi:flash",
+            suggested_display_precision=0,
+            translation_key="circuit_power_w",
+            label=label,
+            label_key=label_key,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{c}_voltage_v",
+            f"Circuit {circuit} Voltage",
+            "V",
+            "voltage",
+            "measurement",
+            "mdi:sine-wave",
+            entity_category="diagnostic",
+            suggested_display_precision=0,
+            disabled_by_default=True,
+            translation_key="circuit_voltage_v",
+            label=label,
+            label_key=label_key,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"{c}_current_a",
+            f"Circuit {circuit} Current",
+            "A",
+            "current",
+            "measurement",
+            "mdi:current-ac",
+            entity_category="diagnostic",
+            suggested_display_precision=current_precision,
+            disabled_by_default=True,
+            translation_key="circuit_current_a",
+            label=label,
+            label_key=label_key,
+            accessory=True,
+            enhanced_only=True,
+        ),
+    ]
+    if not with_voltage:
+        sensors = [s for s in sensors if s.key != f"{c}_voltage_v"]
+    return sensors
+
+
+for _circuit in range(1, SMARTPANEL40_CIRCUIT_COUNT + 1):
+    SMARTPANEL40_SENSORS.extend(_build_panel_circuit_sensors(_circuit))
+
+# Whether each circuit's breaker is closed, as the panel reports it. State
+# only: switching a circuit needs a write path with read-back, which does not
+# exist yet.
+SMARTPANEL40_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    EcoFlowBinarySensorDef(
+        f"circuit_{_circuit}_on",
+        f"Circuit {_circuit} On",
+        "power",
+        "mdi:electric-switch",
+        enhanced_only=True,
+        accessory=True,
+        translation_key="circuit_on",
+        label=str(_circuit),
+        label_key=f"circuit_{_circuit}_name",
+    )
+    for _circuit in range(1, SMARTPANEL40_CIRCUIT_COUNT + 1)
+]
+
+
+# DELTA Pro Ultra (`Y711`). Enhanced mode only and read-only: the frames on
+# record came over the app channel. No energy counters yet: the unit sends
+# none, and its power fields are unverified (the capture is of an idle unit).
+# A wrong scale or sign feeding a total_increasing counter cannot be undone,
+# so a `DELTAPROULTRA_POWER_TO_ENERGY` waits for one capture under load.
+# Every reading arrives incrementally, so the coordinator's merge is what
+# keeps the ones a push leaves out.
+#
+# Readings whose meaning another device already names reuse that
+# translation (`translation_key`, or the key itself where it is the same).
+DELTAPROULTRA_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "soc",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        translation_key="soc_pct",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "remain_time_min",
+        "Remaining Time",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:timer-outline",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "watts_in_sum",
+        "Input Total",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "watts_out_sum",
+        "Output Total",
+        "W",
+        "power",
+        "measurement",
+        "mdi:flash",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_in_w",
+        "AC Input",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-plug",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "power_io_in_w",
+        "Power In/Out Port Input",
+        "W",
+        "power",
+        "measurement",
+        "mdi:import",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "power_io_out_w",
+        "Power In/Out Port Output",
+        "W",
+        "power",
+        "measurement",
+        "mdi:export",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "solar_lv_in_w",
+        "Solar LV Input Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "solar_hv_in_w",
+        "Solar HV Input Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:solar-power",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_l1_1_w",
+        "AC Output L1-1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-us",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_l1_2_w",
+        "AC Output L1-2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-us",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_l2_1_w",
+        "AC Output L2-1 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-us",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_l2_2_w",
+        "AC Output L2-2 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-us",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_tt30_w",
+        "AC Output TT-30 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:rv-truck",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ac_out_l14_w",
+        "AC Output L14-30 Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:power-socket-us",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_voltage_v",
+        "Battery Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:flash-triangle",
+        suggested_display_precision=2,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_charge_power_w",
+        "Battery Charge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-plus",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "batt_discharge_power_w",
+        "Battery Discharge Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:battery-minus",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "inv_ac_temp_c",
+        "Inverter Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "pd_temp_c",
+        "System Temperature",
+        "°C",
+        "temperature",
+        "measurement",
+        "mdi:thermometer",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    # The backup reserve the owner set in the app, read-only here.
+    EcoFlowSensorDef(
+        "backup_reserve_pct",
+        "Backup Reserve",
+        "%",
+        None,
+        "measurement",
+        "mdi:battery-lock",
+        "diagnostic",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+]
+
+
+def _build_delta_pro_ultra_pack_sensors(pack_num: int) -> list[EcoFlowSensorDef]:
+    """Build the entity definitions for one DELTA Pro Ultra extra battery pack.
+
+    Accessories: the unit takes up to five extra packs and an installation
+    has however many its owner bought, so an entity exists only once its
+    pack has reported (the same reason as the Ocean 2 modules). No battery
+    device class: Home Assistant shows one battery figure per device, and
+    that is the system state of charge in `soc`.
+    """
+    n = pack_num
+    return [
+        EcoFlowSensorDef(
+            f"bp{n}_soc_pct",
+            f"Battery Pack {n} SOC",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery",
+            suggested_display_precision=0,
+            accessory=True,
+            enhanced_only=True,
+        ),
+        EcoFlowSensorDef(
+            f"bp{n}_temp_c",
+            f"Battery Pack {n} Temperature",
+            "°C",
+            "temperature",
+            "measurement",
+            "mdi:thermometer",
+            suggested_display_precision=0,
+            accessory=True,
+            enhanced_only=True,
+        ),
+    ]
+
+
+for _pack in range(1, DELTAPROULTRA_MAX_PACKS + 1):
+    DELTAPROULTRA_SENSORS.extend(_build_delta_pro_ultra_pack_sensors(_pack))
+
+
+# Smart Home Panel 2 (`HD31`). Enhanced mode only and read-only. The panel
+# pushes incrementally, so the coordinator's merge keeps the readings a push
+# leaves out. Its twelve circuits come from the Smart Panel 40's builder (same
+# keys, label and translations), and its storage channels are accessories
+# that exist once a channel is ready or connected.
+#
+# Readings whose meaning another device already names reuse that
+# translation (`translation_key`, or the key itself where it is the same).
+SMARTHOMEPANEL2_SENSORS: list[EcoFlowSensorDef] = [
+    # Only imports are on record (grid power equals home power in the
+    # frames); which sign an export carries has not been observed.
+    EcoFlowSensorDef(
+        "grid_power_w",
+        "Grid Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:transmission-tower",
+        suggested_display_precision=0,
+        translation_key="grid_w",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "load_power_w",
+        "Home Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:home-lightning-bolt",
+        suggested_display_precision=0,
+        translation_key="home_w",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l1_current_a",
+        "Grid L1 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+        translation_key="grid_leg_l1_current_a",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_l2_current_a",
+        "Grid L2 Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        suggested_display_precision=2,
+        translation_key="grid_leg_l2_current_a",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "grid_voltage_v",
+        "Grid Voltage",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_soc_pct",
+        "Battery SOC",
+        "%",
+        "battery",
+        "measurement",
+        "mdi:battery",
+        suggested_display_precision=0,
+        translation_key="soc_pct",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_remaining_energy_wh",
+        "Battery Remaining Energy",
+        "Wh",
+        "energy_storage",
+        "measurement",
+        "mdi:battery-charging-high",
+        suggested_display_precision=0,
+        translation_key="batt_remaining_wh",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "battery_full_capacity_wh",
+        "Battery Full Capacity",
+        "Wh",
+        "energy_storage",
+        None,
+        "mdi:battery-outline",
+        entity_category="diagnostic",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "backup_runtime_min",
+        "Backup Runtime",
+        "min",
+        "duration",
+        "measurement",
+        "mdi:timer-outline",
+        suggested_display_precision=0,
+        enhanced_only=True,
+    ),
+]
+
+
+def _build_smart_home_panel_2_storage_sensors(channel: int) -> list[EcoFlowSensorDef]:
+    """Build the entity definition for one Smart Home Panel 2 storage channel.
+
+    Accessory: the panel has three storage channels and an installation has
+    however many are wired, so an entity exists only once its channel is ready
+    or connected. The parser sends `None` for a channel whose ready and
+    connected flags are both 0 (that is how an unplugged battery clears), so
+    the entity also waits for a nonzero reading: without it every
+    single-battery installation would get two "unknown" entities for the empty
+    channels. The price is that a battery first seen at exactly 0 % gets its
+    entity at its first nonzero reading. No battery device class: Home
+    Assistant shows one battery figure per device, and that is the system
+    state of charge in `battery_soc_pct`.
+    """
+    return [
+        EcoFlowSensorDef(
+            f"storage_ch{channel}_soc_pct",
+            f"Storage Channel {channel} SOC",
+            "%",
+            None,
+            "measurement",
+            "mdi:battery",
+            suggested_display_precision=0,
+            accessory=True,
+            accessory_needs_nonzero=True,
+            enhanced_only=True,
+        ),
+    ]
+
+
+for _circuit in range(1, SMARTHOMEPANEL2_CIRCUIT_COUNT + 1):
+    SMARTHOMEPANEL2_SENSORS.extend(
+        _build_panel_circuit_sensors(_circuit, with_voltage=False, current_precision=2)
+    )
+for _channel in range(1, SMARTHOMEPANEL2_STORAGE_CHANNEL_COUNT + 1):
+    SMARTHOMEPANEL2_SENSORS.extend(_build_smart_home_panel_2_storage_sensors(_channel))
+
+
+POWERPULSE2_SENSORS: list[EcoFlowSensorDef] = [
+    EcoFlowSensorDef(
+        "ev_charge_power_w",
+        "Wallbox Charging Power",
+        "W",
+        "power",
+        "measurement",
+        "mdi:ev-station",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ev_voltage_l1_v",
+        "Wallbox Voltage L1",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ev_voltage_l2_v",
+        "Wallbox Voltage L2",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ev_voltage_l3_v",
+        "Wallbox Voltage L3",
+        "V",
+        "voltage",
+        "measurement",
+        "mdi:sine-wave",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ev_current_l1_a",
+        "Wallbox Current L1",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ev_current_l2_a",
+        "Wallbox Current L2",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    EcoFlowSensorDef(
+        "ev_current_l3_a",
+        "Wallbox Current L3",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=2,
+    ),
+    # Two configured currents, not live measurements - hence diagnostic even
+    # though they carry the same device/state class as the phase currents.
+    # The maximum current is the limit set on the wallbox (heartbeat field
+    # 18); the charging current is the session setpoint (field 17). They
+    # agree while charging at the limit and differ otherwise, see #7.
+    EcoFlowSensorDef(
+        "ev_max_current_a",
+        "Wallbox Maximum Current",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ev_charge_current_a",
+        "Wallbox Charging Current Setpoint",
+        "A",
+        "current",
+        "measurement",
+        "mdi:current-ac",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=1,
+    ),
+    EcoFlowSensorDef(
+        "ev_phase_mode",
+        "Wallbox Phase Mode",
+        None,
+        "enum",
+        None,
+        "mdi:transmission-tower",
+        "diagnostic",
+        enhanced_only=True,
+        options=["single_phase", "three_phase"],
+    ),
+    EcoFlowSensorDef(
+        "ev_session_status",
+        "Wallbox Session Status",
+        None,
+        "enum",
+        None,
+        "mdi:progress-clock",
+        "diagnostic",
+        enhanced_only=True,
+        options=["idle", "charging", "finished"],
+    ),
+    EcoFlowSensorDef(
+        "ev_session_duration_s",
+        "Wallbox Session Duration",
+        "s",
+        "duration",
+        "measurement",
+        "mdi:timer-outline",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    EcoFlowSensorDef(
+        "ev_charge_status",
+        "Wallbox Charging Status",
+        None,
+        "enum",
+        None,
+        "mdi:ev-station",
+        None,
+        enhanced_only=True,
+        options=[
+            "none",
+            "available",
+            "preparing",
+            "charging",
+            "suspended_charger",
+            "suspended_vehicle",
+            "finishing",
+            "faulted",
+        ],
+    ),
+    # The wallbox's own charging-mode setting (PLAN-147), read from its
+    # heartbeat field 63 sub-field 4, the linkage record every heartbeat on
+    # file carries, with or without a PowerOcean on the account (every `2/33`
+    # in the seven powerpulse fixtures, 46 of 46 on 2026-09-14, all four
+    # modes among them; `test_charge_mode_on_every_heartbeat_in_the_corpus`
+    # holds that floor). On an entry with a PowerOcean the settings report's
+    # work mode fills the same key while one arrived in the last 10 s
+    # (PLAN-173, `_resolve_wallbox_charge_mode`). `accessory=True`
+    # like `ev_charge_status` above: created on the first report. Mirrors
+    # `ev_max_current_a`'s sensor + number pair: the sensor exists on every
+    # route, the select below is sibling-only (async_set_powerpulse_charge_mode()).
+    EcoFlowSensorDef(
+        "ev_charge_mode",
+        "Wallbox Charging Mode",
+        None,
+        "enum",
+        None,
+        "mdi:ev-station",
+        None,
+        enhanced_only=True,
+        accessory=True,
+        options=list(POWERPULSE2_CHARGE_MODE_OPTIONS),
+    ),
+    # Unix seconds on the wire; the sensor platform converts it to a UTC
+    # datetime for the `timestamp` device class (see EcoFlowSensor.native_value).
+    EcoFlowSensorDef(
+        "ev_session_start_ts",
+        "Wallbox Session Start",
+        None,
+        "timestamp",
+        None,
+        "mdi:clock-start",
+        "diagnostic",
+        enhanced_only=True,
+    ),
+    EcoFlowSensorDef(
+        "ev_session_energy_wh",
+        "Wallbox Session Energy",
+        "Wh",
+        "energy",
+        "total",
+        "mdi:ev-plug-type2",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    # The lifetime counter's value when the current session began - jumps to
+    # a new value every session, so it is a snapshot rather than a counter.
+    # No state class at all: as `total` it would be offered to the Energy
+    # Dashboard and summed by long-term statistics, and a meter reading
+    # frozen at session start is neither energy delivered nor a rate.
+    EcoFlowSensorDef(
+        "ev_session_start_energy_wh",
+        "Wallbox Session Start Meter",
+        "Wh",
+        "energy",
+        None,
+        "mdi:counter",
+        "diagnostic",
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+    # The genuine lifetime counter (field 44): monotonic across the whole
+    # capture (84944 -> 104680 Wh), unlike the session-scoped snapshot above.
+    EcoFlowSensorDef(
+        "ev_total_energy_wh",
+        "Wallbox Total Energy",
+        "Wh",
+        "energy",
+        "total_increasing",
+        "mdi:lightning-bolt",
+        None,
+        enhanced_only=True,
+        suggested_display_precision=0,
+    ),
+]
+
+POWERPULSE2_BINARY_SENSORS: list[EcoFlowBinarySensorDef] = [
+    # Only carried in the ParamReport (2/34) message, which this device only
+    # sends inside a get_reply bundle - never on the plain property-push
+    # topic. A session that only sees pushes never reports this key, so it
+    # is an accessory wait rather than an unconditional entity.
+    EcoFlowBinarySensorDef(
+        "ev_cable_lock_enabled",
+        "Wallbox Cable Lock",
+        None,
+        "mdi:lock",
+        "diagnostic",
+        enhanced_only=True,
+        accessory=True,
+    ),
+]
+
+
+# The wallbox's own start/stop controls (ADR-009). With one PowerOcean in
+# the entry they are created on the descriptor report (ev_charger_sn), the
+# same accessory gate as the cable lock binary sensor above, and send through
+# that PowerOcean; without one they are created on the first heartbeat and
+# send on the wallbox's own topic (PLAN-140). Two or more PowerOceans get no
+# buttons. The platform setup decides the route, not this list.
+POWERPULSE2_BUTTONS: list[EcoFlowButtonDef] = [
+    EcoFlowButtonDef(
+        "ev_start_charging",
+        "Wallbox Start Charging",
+        "start",
+        "ev_charger_sn",
+        "mdi:play",
+    ),
+    EcoFlowButtonDef(
+        "ev_stop_charging",
+        "Wallbox Stop Charging",
+        "stop",
+        "ev_charger_sn",
+        "mdi:stop",
+    ),
+]
+
+# The wallbox's own current controls. The same key as the matching sensor on
+# purpose - one reading, the value the wallbox itself reports, so the number
+# shows what the sensor shows and a write returns only once the wallbox
+# reports the new value back. Each control exists on exactly one write route,
+# named by `powerpulse_route` and enforced twice: here (`async_setup_entry()`
+# in number.py filters per definition) and in the matching coordinator write,
+# which refuses on the same condition.
+#
+# `ev_max_current_a` (PLAN-146) is sibling-only: the write has no evidenced
+# route on the wallbox's own channel (decision 2), so an entry with zero or
+# two-or-more PowerOceans gets no number at all - see
+# async_set_powerpulse_max_current(). It is an accessory entity, created on
+# the first `ev_max_current_a` report, the same pattern as the cable lock
+# binary sensor and the start/stop buttons above.
+#
+# `ev_charge_current_a` (issue #7, 2026-09-14 recording) is the mirror image:
+# own-channel-only, since the app's write for this field has only ever been
+# seen on a wallbox's own topic, never relayed through a PowerOcean - see
+# async_set_powerpulse_charge_current(). Accessory entity like
+# `ev_max_current_a` above: created on the first `ev_charge_current_a`
+# report rather than unconditionally, in case a device never sends field 17.
+POWERPULSE2_NUMBERS: list[EcoFlowNumberDef] = [
+    EcoFlowNumberDef(
+        "ev_max_current_a",
+        "Wallbox Maximum Current",
+        "ev_max_current_a",
+        "A",
+        "mdi:current-ac",
+        POWERPULSE2_MAX_CURRENT_RANGE_A[0],
+        POWERPULSE2_MAX_CURRENT_RANGE_A[1],
+        1,
+        enhanced_only=True,
+        accessory=True,
+        powerpulse_route="sibling",
+    ),
+    EcoFlowNumberDef(
+        "ev_charge_current_a",
+        "Wallbox Charging Current Setpoint",
+        "ev_charge_current_a",
+        "A",
+        "mdi:current-ac",
+        POWERPULSE2_MAX_CURRENT_RANGE_A[0],
+        POWERPULSE2_MAX_CURRENT_RANGE_A[1],
+        1,
+        enhanced_only=True,
+        accessory=True,
+        powerpulse_route="own",
+    ),
+    # Two stored setpoints from the wallbox's settings report (PLAN-172). Both
+    # are sibling-only like the maximum current: the write goes through the
+    # PowerOcean and the coordinator refuses on the same condition. Both are
+    # accessory entities, created once the settings report has been decoded.
+    # Four current controls now sit on one wallbox, so the roles are kept
+    # apart on purpose:
+    #   Maximum Current          the upper limit of the wallbox itself
+    #   Charging Current         the target of the running session (dynamic)
+    #   Custom Charging Current  the stored setpoint of the Custom mode,
+    #                            writable in every mode
+    #   Solar Minimum Current    the stored minimum current of the Solar mode
+    EcoFlowNumberDef(
+        "ev_solar_min_current_a",
+        "Wallbox Solar Minimum Current",
+        "ev_solar_min_current_a",
+        "A",
+        "mdi:current-ac",
+        POWERPULSE2_MAX_CURRENT_RANGE_A[0],
+        POWERPULSE2_MAX_CURRENT_RANGE_A[1],
+        1,
+        enhanced_only=True,
+        accessory=True,
+        powerpulse_route="sibling",
+    ),
+    EcoFlowNumberDef(
+        "ev_custom_current_a",
+        "Wallbox Custom Charging Current",
+        "ev_custom_current_a",
+        "A",
+        "mdi:current-ac",
+        POWERPULSE2_MAX_CURRENT_RANGE_A[0],
+        POWERPULSE2_MAX_CURRENT_RANGE_A[1],
+        1,
+        enhanced_only=True,
+        accessory=True,
+        powerpulse_route="sibling",
+    ),
+    # PLAN-188 (#495): the brightness of the wallbox's screen and LED
+    # indicator, from the display block of the settings report. Four steps
+    # (25, 50, 75, 100 %), so a slider: it only offers values the wallbox
+    # accepts. Sibling route like the other settings, accessory entities
+    # created once the report has carried the block. The wallbox keeps the
+    # brightness while the screen or LED is off, and the write does not depend
+    # on the on/off switch.
+    EcoFlowNumberDef(
+        "ev_screen_brightness_pct",
+        "Wallbox Screen Brightness",
+        "ev_screen_brightness_pct",
+        "%",
+        "mdi:brightness-6",
+        POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS[0],
+        POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS[-1],
+        POWERPULSE2_DISPLAY_BRIGHTNESS_STEP_PCT,
+        enhanced_only=True,
+        accessory=True,
+        powerpulse_route="sibling",
+        slider=True,
+    ),
+    EcoFlowNumberDef(
+        "ev_led_brightness_pct",
+        "Wallbox LED Indicator Brightness",
+        "ev_led_brightness_pct",
+        "%",
+        "mdi:brightness-5",
+        POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS[0],
+        POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS[-1],
+        POWERPULSE2_DISPLAY_BRIGHTNESS_STEP_PCT,
+        enhanced_only=True,
+        accessory=True,
+        powerpulse_route="sibling",
+        slider=True,
+    ),
+]
+
+# The wallbox's own charging-mode control (PLAN-147). Sibling route only,
+# the same reasoning as POWERPULSE2_NUMBERS above: the write has no
+# evidenced route on the wallbox's own channel, so an entry with zero or
+# two-or-more PowerOceans gets no select at all - the coordinator write
+# itself refuses on the same condition, see async_set_powerpulse_charge_mode().
+# "smart" stays in the option list so the select can display the state, but
+# selecting it raises before anything is published (PLAN-147 decision 3).
+POWERPULSE2_SELECTS: list[EcoFlowSelectDef] = [
+    EcoFlowSelectDef(
+        "ev_charge_mode",
+        "Wallbox Charging Mode",
+        "ev_charge_mode",
+        POWERPULSE2_CHARGE_MODE_OPTIONS,
+        icon="mdi:ev-station",
+        enhanced_only=True,
+    ),
+    # The configured phase setting (PLAN-172). A separate entity from the
+    # `Wallbox Phase Mode` sensor: that one shows the phase the wallbox is
+    # charging on right now, this one shows what the wallbox is set to use.
+    # The wallbox reports the setting as a number (0 Auto, 1 one phase,
+    # 2 three phases), so the definition carries a value map; an absent key
+    # reads as unknown rather than as Auto. An accessory entity, created once
+    # the first settings report has carried the key.
+    EcoFlowSelectDef(
+        "ev_phase_setting",
+        "Wallbox Phase Setting",
+        "ev_phase_setting",
+        POWERPULSE2_PHASE_SETTING_OPTIONS,
+        icon="mdi:sine-wave",
+        enhanced_only=True,
+        value_map={
+            wire: option for option, wire in POWERPULSE2_PHASE_SETTING_WIRE.items()
+        },
+        accessory=True,
+    ),
+]
+
+# The wallbox's settings switches: Continuous Charging (PLAN-172), Block
+# Battery Discharge and Plug-and-Play (PLAN-187), then Screen and LED Indicator
+# (PLAN-188). The state of the first three is one bit
+# (`bit_mask`) of the settings report's switch bits, so the read-back key is
+# the whole byte and the switch decodes its bit itself. Sibling-route,
+# accessory controls like the settings numbers and the phase select: created
+# once the first settings report has carried the bits, and only where exactly
+# one PowerOcean can carry the write.
+POWERPULSE2_SWITCHES: list[EcoFlowSwitchDef] = [
+    EcoFlowSwitchDef(
+        "ev_continuous_charging",
+        "Wallbox Continuous Charging",
+        "ev_settings_switch_bits",
+        icon="mdi:ev-plug-type2",
+        enhanced_only=True,
+        accessory=True,
+        bit_mask=POWERPULSE2_SWITCH_BIT_CONTINUOUS,
+    ),
+    # PLAN-187: two more bits of the same byte, same route and same write path.
+    EcoFlowSwitchDef(
+        "ev_battery_discharge_block",
+        "Wallbox Block Battery Discharge",
+        "ev_settings_switch_bits",
+        icon="mdi:battery-off",
+        enhanced_only=True,
+        accessory=True,
+        bit_mask=POWERPULSE2_SWITCH_BIT_BATTERY_DISCHARGE_BLOCK,
+    ),
+    EcoFlowSwitchDef(
+        "ev_plug_and_play",
+        "Wallbox Plug-and-Play",
+        "ev_settings_switch_bits",
+        icon="mdi:power-plug",
+        enhanced_only=True,
+        accessory=True,
+        bit_mask=POWERPULSE2_SWITCH_BIT_PLUG_AND_PLAY,
+    ),
+    # PLAN-188 (#495): the screen and the LED indicator, from the display block
+    # of the settings report. Not bits of the switch byte: the state key holds a
+    # plain on/off value, so there is no bit mask and the write is the display
+    # setter. Same route and accessory rule as the three above.
+    EcoFlowSwitchDef(
+        "ev_screen_enabled",
+        "Wallbox Screen",
+        "ev_screen_enabled",
+        icon="mdi:monitor",
+        enhanced_only=True,
+        accessory=True,
+    ),
+    EcoFlowSwitchDef(
+        "ev_led_enabled",
+        "Wallbox LED Indicator",
+        "ev_led_enabled",
+        icon="mdi:led-on",
+        enhanced_only=True,
+        accessory=True,
+    ),
+]
+
+
+# =====================================================================
+# Power → Energy mappings (Riemann sum integration per device type)
+# =====================================================================
+
+POWEROCEAN_POWER_TO_ENERGY: dict[str, str] = {
+    "solar_w": "solar_energy_kwh",
+    "home_w": "home_energy_kwh",
+    "grid_import_power_w": "grid_import_energy_kwh",
+    "grid_export_power_w": "grid_export_energy_kwh",
+}
+
+POWEROCEAN_ENERGY_FROM_API: list[tuple[str, str]] = [
+    ("batt_charge_power_w", "batt_charge_energy_kwh"),
+    ("batt_discharge_power_w", "batt_discharge_energy_kwh"),
+]
+
+DELTA_POWER_TO_ENERGY: dict[str, str] = {
+    "solar_in_w": "solar_energy_kwh",
+    "solar2_in_w": "solar2_energy_kwh",
+    "ac_in_w": "ac_in_energy_kwh",
+    "ac_out_w": "ac_out_energy_kwh",
+}
+
+DELTA_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+# The Delta 3 HTTP quota exposes no native energy counters, so these kWh
+# sensors are integrated from the live power keys. pow_out_sum_w is the
+# aggregate output (AC + DC + USB), giving one clean "output energy" total.
+DELTA3_POWER_TO_ENERGY: dict[str, str] = {
+    "pv1_in_w": "solar_energy_kwh",
+    "pv2_in_w": "solar2_energy_kwh",
+    "ac_in_w": "ac_in_energy_kwh",
+    "pow_out_sum_w": "out_energy_kwh",
+}
+
+DELTA3_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+SMARTPLUG_POWER_TO_ENERGY: dict[str, str] = {
+    "power_w": "energy_kwh",
+}
+
+SMARTPLUG_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+# grid_w is deliberately excluded: the Stream reports a signed grid power
+# without an import/export split. Feeding abs(grid_w) into a single energy
+# counter would conflate consumption and feed-in, making it useless for the
+# Energy Dashboard.
+STREAM_POWER_TO_ENERGY: dict[str, str] = {
+    "solar_w": "solar_energy_kwh",
+    "pv1_w": "pv1_energy_kwh",
+    "pv2_w": "pv2_energy_kwh",
+    "pv3_w": "pv3_energy_kwh",
+    "pv4_w": "pv4_energy_kwh",
+    "home_w": "home_energy_kwh",
+    "batt_charge_power_w": "batt_charge_energy_kwh",
+    "batt_discharge_power_w": "batt_discharge_energy_kwh",
+}
+
+STREAM_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+STREAMAC5000_POWER_TO_ENERGY: dict[str, str] = {
+    # `solar_w` is deliberately absent: the device infers that figure from the
+    # house flows and reports it with no PV wired to it, so integrating it
+    # would write production that never happened into a counter that only ever
+    # counts up. See the note on the sensor list.
+    "home_w": "home_energy_kwh",
+    "batt_charge_power_w": "batt_charge_energy_kwh",
+    "batt_discharge_power_w": "batt_discharge_energy_kwh",
+    "unit_batt_charge_power_w": "unit_batt_charge_energy_kwh",
+    "unit_batt_discharge_power_w": "unit_batt_discharge_energy_kwh",
+    # This device reports the grid split as separate flow edges, so import and
+    # export each get an honest counter instead of one signed total.
+    "grid_import_power_w": "grid_import_energy_kwh",
+    "grid_export_power_w": "grid_export_energy_kwh",
+}
+
+STREAMAC5000_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+# The PowerStream quota carries `history*` counters that all read 0 in the only
+# capture available, so nothing is known about them and the kWh sensors are
+# integrated from the live power keys instead. `grid_w` and `batt_w` are both
+# absent on purpose: the grid figure is signed with no observed import case,
+# and the battery sign is taken from a field name rather than from a reading.
+# Either one feeding a monotonic counter would be unrecoverable once wrong.
+POWERSTREAM_POWER_TO_ENERGY: dict[str, str] = {
+    "solar_w": "solar_energy_kwh",
+    "pv1_w": "pv1_energy_kwh",
+    "pv2_w": "pv2_energy_kwh",
+    "inv_output_w": "inv_output_energy_kwh",
+}
+
+POWERSTREAM_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+# The Riemann sum samples every frame carrying the power reading: about 2s
+# while the unit runs, 120s in standby (WAVE3's push cadence).
+WAVE3_POWER_TO_ENERGY: dict[str, str] = {
+    "ac_input_power_w": "ac_input_energy_kwh",
+}
+
+WAVE3_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+
+# Every counter is integrated locally: the Ocean 2 exposes no lifetime totals
+# on the account channel. Per-string solar counters are deliberately absent -
+# `solar_energy_kwh` already covers the total, and summing per-string counters
+# on a dashboard would under-report on a unit whose higher strings are
+# disabled by default.
+OCEAN2_POWER_TO_ENERGY: dict[str, str] = {
+    "solar_w": "solar_energy_kwh",
+    "home_w": "home_energy_kwh",
+    "grid_import_power_w": "grid_import_energy_kwh",
+    "grid_export_power_w": "grid_export_energy_kwh",
+    "batt_charge_power_w": "batt_charge_energy_kwh",
+    "batt_discharge_power_w": "batt_discharge_energy_kwh",
+}
+
+OCEAN2_ENERGY_FROM_API: list[tuple[str, str]] = []
+
+
+# ===========================================================================
+# SET Command Templates (per device type)
+# ===========================================================================
+
+# Smart Plug SET-command templates (uses cmdCode format)
+SMARTPLUG_SWITCH_COMMANDS: dict[str, dict[str, dict[str, Any]]] = {
+    "plug_switch": {
+        "on": {
+            "cmdCode": "WN511_SOCKET_SET_PLUG_SWITCH_MESSAGE",
+            "params": {"plugSwitch": 1},
+        },
+        "off": {
+            "cmdCode": "WN511_SOCKET_SET_PLUG_SWITCH_MESSAGE",
+            "params": {"plugSwitch": 0},
+        },
+    },
+}
+
+# IoT API SET-command templates for switches (Delta 2 Max R351 profile)
+SWITCH_COMMANDS_R351: dict[str, dict[str, dict[str, Any]]] = {
+    "ac_switch": {
+        "on": {
+            "moduleType": 3,
+            "operateType": "acOutCfg",
+            "params": {
+                "enabled": 1,
+                "out_voltage": 4294967295,
+                "out_freq": 1,
+                "xboost": 1,
+            },
+        },
+        "off": {
+            "moduleType": 3,
+            "operateType": "acOutCfg",
+            "params": {
+                "enabled": 0,
+                "out_voltage": 4294967295,
+                "out_freq": 1,
+                "xboost": 0,
+            },
+        },
+    },
+    "dc_switch": {
+        "on": {"moduleType": 1, "operateType": "dcOutCfg", "params": {"enabled": 1}},
+        "off": {"moduleType": 1, "operateType": "dcOutCfg", "params": {"enabled": 0}},
+    },
+    "car_12v_switch": {
+        "on": {"moduleType": 5, "operateType": "mpptCar", "params": {"enabled": 1}},
+        "off": {"moduleType": 5, "operateType": "mpptCar", "params": {"enabled": 0}},
+    },
+}
+
+# IoT API SET-command templates for switches (Delta 2 Max R331/legacy profile)
+SWITCH_COMMANDS_R331: dict[str, dict[str, dict[str, Any]]] = {
+    "ac_switch": {
+        "on": {
+            "moduleType": 5,
+            "operateType": "acOutCfg",
+            "params": {
+                "enabled": 1,
+                "out_voltage": 4294967295,
+                "out_freq": 255,
+                "xboost": 255,
+            },
+        },
+        "off": {
+            "moduleType": 5,
+            "operateType": "acOutCfg",
+            "params": {
+                "enabled": 0,
+                "out_voltage": 4294967295,
+                "out_freq": 255,
+                "xboost": 255,
+            },
+        },
+    },
+    "dc_switch": {
+        "on": {"moduleType": 1, "operateType": "dcOutCfg", "params": {"enabled": 1}},
+        "off": {"moduleType": 1, "operateType": "dcOutCfg", "params": {"enabled": 0}},
+    },
+    "car_12v_switch": {
+        "on": {"moduleType": 5, "operateType": "mpptCar", "params": {"enabled": 1}},
+        "off": {"moduleType": 5, "operateType": "mpptCar", "params": {"enabled": 0}},
+    },
+    "xboost_switch": {
+        "on": {
+            "moduleType": 5,
+            "operateType": "acOutCfg",
+            "params": {
+                "xboost": 1,
+                "enabled": 255,
+                "out_voltage": 4294967295,
+                "out_freq": 255,
+            },
+        },
+        "off": {
+            "moduleType": 5,
+            "operateType": "acOutCfg",
+            "params": {
+                "xboost": 0,
+                "enabled": 255,
+                "out_voltage": 4294967295,
+                "out_freq": 255,
+            },
+        },
+    },
+}
+
+# Declarative switch command templates (Delta 2 Max R351)
+SWITCH_DECLARATIVE_R351: dict[str, dict[str, Any]] = {
+    "beeper_switch": {
+        "moduleType": 1,
+        "operateType": "quietCfg",
+        "param_key": "enabled",
+        "invert": True,
+    },
+    "xboost_switch": {
+        "moduleType": 3,
+        "operateType": "acOutCfg",
+        "param_key": "xboost",
+    },
+    "ac_auto_on_switch": {
+        "moduleType": 1,
+        "operateType": "newAcAutoOnCfg",
+        "param_key": "enabled",
+        "extra_params": {"minAcSoc": 5},
+    },
+    "backup_reserve_switch": {
+        "moduleType": 1,
+        "operateType": "watthConfig",
+        "param_key": "isConfig",
+        "extra_params": {"bpPowerSoc": 50, "minChgSoc": 0, "minDsgSoc": 0},
+    },
+}
+
+# Declarative switch command templates (Delta 2 Max R331/legacy)
+SWITCH_DECLARATIVE_R331: dict[str, dict[str, Any]] = {
+    "beeper_switch": {
+        "moduleType": 1,
+        "operateType": "quietMode",
+        "param_key": "enabled",
+        "invert": True,
+    },
+    "ac_auto_on_switch": {
+        "moduleType": 1,
+        "operateType": "acAutoOutConfig",
+        "param_key": "acAutoOutConfig",
+        "extra_params": {"minAcOutSoc": 5},
+    },
+    "backup_reserve_switch": {
+        "moduleType": 1,
+        "operateType": "watthConfig",
+        "param_key": "isConfig",
+        "extra_params": {"bpPowerSoc": 50, "minChgSoc": 0, "minDsgSoc": 0},
+    },
+}
+
+# IoT API SET-command templates for number entities (Delta 2 Max)
+NUMBER_COMMANDS: dict[str, dict[str, Any]] = {
+    "ac_charge_speed": {
+        "moduleType": 3,
+        "operateType": "acChgCfg",
+        # The effective AC charge speed follows slowChgWatts; fastChgWatts is
+        # mirrored to the same value so both charger paths use the user's
+        # setting (issue #95: hardcoding slowChgWatts=400 pinned the device
+        # at 400 W regardless of the requested value).
+        "param_key": "slowChgWatts",
+        "value_params": ["fastChgWatts"],
+        "extra_params": {"chgPauseFlag": 0},
+    },
+    "max_charge_soc": {
+        "moduleType": 2,
+        "operateType": "upsConfig",
+        "param_key": "maxChgSoc",
+    },
+    "min_discharge_soc": {
+        "moduleType": 2,
+        "operateType": "dsgCfg",
+        "param_key": "minDsgSoc",
+    },
+    "standby_timeout": {
+        "moduleType": 1,
+        "operateType": "standbyTime",
+        "param_key": "standbyMin",
+    },
+    "car_standby_timeout": {
+        "moduleType": 5,
+        "operateType": "standbyTime",
+        "param_key": "standbyMins",
+    },
+    "screen_brightness": {
+        "moduleType": 1,
+        "operateType": "lcdCfg",
+        "param_key": "brighLevel",
+        "extra_params": {"delayOff": 0},
+    },
+    "screen_timeout": {
+        "moduleType": 1,
+        "operateType": "lcdCfg",
+        "param_key": "delayOff",
+        "extra_params": {"brighLevel": 255},
+    },
+    "backup_reserve_soc": {
+        "moduleType": 1,
+        "operateType": "watthConfig",
+        "param_key": "bpPowerSoc",
+        "extra_params": {"isConfig": 1, "minChgSoc": 0, "minDsgSoc": 0},
+    },
+}
+
+# Smart Plug SET-command templates for number entities
+SMARTPLUG_NUMBER_COMMANDS: dict[str, dict[str, Any]] = {
+    "led_brightness": {
+        "cmdCode": "WN511_SOCKET_SET_BRIGHTNESS_PACK",
+        "param_key": "brightness",
+        "scale": 1023.0 / 100.0,
+    },
+    "max_watts": {
+        "cmdCode": "WN511_SOCKET_SET_MAX_WATTS",
+        "param_key": "maxWatts",
+        "scale": 1,
+    },
+}
+
+# The loop above is a module-level generator, so its variable would stay
+# bound in this namespace. Nothing reads it after the definitions are built.
+del _schedule_index

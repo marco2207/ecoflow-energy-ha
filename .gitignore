@@ -1,0 +1,89 @@
+# Project-local docs
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# HA dev
+config/
+homeassistant/
+
+# Scripts (local tools, not for remote)
+scripts/
+
+# Secrets (never)
+*.env
+.secrets
+# Probe output carries real serial numbers, user IDs and raw frames.
+# Match files with any extension and whole output directories, not just .json.
+probe_output_*
+probe_output_*/
+
+# Local mitmproxy/protocol captures
+dumps/
+*.mitm
+mitm-flows*.dump
+ecoflow-mqtt-decoded*.json
+.venv-proto/
+
+# Editor and tooling backups. A copy of a production module next to the module
+# is invisible to `git status` when only a personal ~/.config/git/ignore covers
+# it, and a fresh checkout without that config would stage it into this public
+# repository on the next `git add -A`. Found 2026-09-04 in a review.
+*.bak
+*.orig
+*.rej

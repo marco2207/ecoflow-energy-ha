@@ -1,0 +1,158 @@
+"""EcoFlow protobuf header decoder.
+
+Decodes the outer EcoFlow frame header (wrapper structure).
+Inner payload fields are decoded via the generated pb2 classes.
+"""
+
+from __future__ import annotations
+
+import struct
+from typing import Any
+
+_HEADER_FIELDS = {
+    1: ("pdata", "bytes"),
+    2: ("src", "i32"),
+    3: ("dest", "i32"),
+    4: ("d_src", "i32"),
+    5: ("d_dest", "i32"),
+    6: ("enc_type", "i32"),
+    7: ("check_type", "i32"),
+    8: ("cmd_func", "i32"),
+    9: ("cmd_id", "i32"),
+    10: ("data_len", "i32"),
+    11: ("need_ack", "i32"),
+    12: ("is_ack", "i32"),
+    14: ("seq", "i32"),
+    15: ("product_id", "i32"),
+    16: ("version", "i32"),
+    17: ("payload_ver", "i32"),
+    18: ("time_snap", "i32"),
+    19: ("is_rw_cmd", "i32"),
+    20: ("is_queue", "i32"),
+    21: ("ack_type", "i32"),
+    22: ("code", "str"),
+    23: ("from", "str"),
+    24: ("module_sn", "str"),
+    25: ("device_sn", "str"),
+}
+
+
+def _read_varint(mv: memoryview | bytes, i: int) -> tuple[int | None, int]:
+    """Read a variable-length integer from protobuf wire format at position i.
+
+    Returns ``(None, len(mv))`` on truncated or oversized (>64-bit) input so
+    callers can stop cleanly instead of raising on malformed frames.
+    """
+    shift = 0
+    res = 0
+    n = len(mv)
+    while True:
+        if i >= n or shift > 63:
+            return None, n
+        b = mv[i]
+        i += 1
+        res |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return res, i
+
+
+def _try_utf8(b: bytes) -> str:
+    """Attempt to decode bytes as UTF-8, falling back to hex representation."""
+    try:
+        return b.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return b.hex()
+
+
+def _decode_single_header(hdr: bytes) -> dict:
+    """Decode a single protobuf header message into field name/value pairs."""
+    mv = memoryview(hdr)
+    i = 0
+    # Explicitly annotated: an unannotated {} would lock mypy's inferred
+    # value type to whatever the first assignment below happens to be (int,
+    # from the wt==0 branch), then flag the wt==2 str-valued assignments as
+    # incompatible - the field values here are genuinely int | str | float
+    # depending on wire type and field name.
+    out: dict[str, Any] = {}
+    while i < len(mv):
+        key, i = _read_varint(mv, i)
+        if key is None:
+            break
+        fn, wt = key >> 3, key & 0x07
+        name, typ = _HEADER_FIELDS.get(fn, (f"f{fn}", None))
+        if wt == 0:
+            val, i = _read_varint(mv, i)
+            if val is None:
+                break
+            out[name] = int(val)
+        elif wt == 2:
+            length, i = _read_varint(mv, i)
+            if length is None:
+                break
+            sub = mv[i : i + length].tobytes()
+            i += length
+            if typ == "str":
+                out[name] = _try_utf8(sub)
+            elif typ == "bytes":
+                out[name] = sub.hex()
+            else:
+                out[name] = sub.hex()
+        elif wt == 5:
+            if i + 4 > len(mv):
+                break
+            f = struct.unpack("<f", mv[i : i + 4])[0]
+            i += 4
+            out[name] = f
+        elif wt == 1:
+            if i + 8 > len(mv):
+                break
+            out[name] = int.from_bytes(mv[i : i + 8], "little")
+            i += 8
+        else:
+            break
+    return out
+
+
+def decode_header_message(b: bytes) -> tuple[list[dict], bytes | None]:
+    """Decode an EcoFlow frame: returns (headers, payload)."""
+    headers = []
+    payload = None
+    mv = memoryview(b)
+    i = 0
+    while i < len(mv):
+        key, i = _read_varint(mv, i)
+        if key is None:
+            break
+        fn, wt = key >> 3, key & 0x07
+        if fn == 1 and wt == 2:
+            length, i = _read_varint(mv, i)
+            if length is None:
+                break
+            hdr = mv[i : i + length].tobytes()
+            i += length
+            headers.append(_decode_single_header(hdr))
+        elif fn == 2 and wt == 2:
+            length, i = _read_varint(mv, i)
+            if length is None:
+                break
+            payload = mv[i : i + length].tobytes()
+            i += length
+        else:
+            if wt == 0:
+                val, i = _read_varint(mv, i)
+                if val is None:
+                    break
+            elif wt == 1:
+                i += 8
+            elif wt == 2:
+                length, i = _read_varint(mv, i)
+                if length is None:
+                    break
+                i += length
+            elif wt == 5:
+                i += 4
+            else:
+                break
+    return headers, payload

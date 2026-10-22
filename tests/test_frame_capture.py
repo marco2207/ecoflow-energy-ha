@@ -1,0 +1,3113 @@
+"""Tests for the shared raw-frame capture helpers."""
+
+import re
+import signal
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
+import pytest
+from ecoflow_energy.const import (
+    RAW_FRAME_BUNDLE_HARD_CAP,
+    RAW_FRAME_BUNDLE_MAX_BYTES,
+    RAW_FRAME_MAX_BYTES,
+)
+from ecoflow_energy.ecoflow.frame_capture import (
+    _ANCHOR_DEPTH,
+    _COORDINATE_PAIR,
+    _SERIAL_RUN,
+    WRITE_CLASS_RESERVE,
+    TypedFrameBuffer,
+    _anchored_string_fields,
+    _delimited_fields,
+    _delimited_spans_by_message,
+    _encrypted_regions,
+    _mask_anchored_strings,
+    _plain_passes,
+    _slot,
+    _xor,
+    build_frame_entry,
+    decode_cmd_headers,
+    frame_budget,
+    frame_key,
+    is_proto_frame,
+    sanitize_frame,
+)
+from ecoflow_energy.ecoflow.proto_encoding import (
+    encode_field_bytes,
+    encode_field_varint,
+)
+
+# Frame timestamps are wall clock. Tests offset from a fixed epoch instead of
+# starting at zero, so they exercise the same value range the capture sees.
+_T0 = 1_785_000_000.0
+
+# The six commands a STREAM AC 5000 bundles into one get_reply, in the order
+# the reporter captures show them.
+_ES22_BUNDLE = ((32, 50), (254, 39), (254, 40), (53, 77), (50, 2), (32, 2))
+
+
+def _header(cmd_func: int, cmd_id: int, pdata: bytes) -> bytes:
+    """Build one repeated-header entry of a protobuf frame."""
+    header = bytearray()
+    header.extend(encode_field_bytes(1, pdata))
+    header.extend(encode_field_varint(8, cmd_func))
+    header.extend(encode_field_varint(9, cmd_id))
+    return encode_field_bytes(1, bytes(header))
+
+
+def _frame_of(total: int, *commands: tuple[int, int]) -> bytes:
+    """Build a decodable frame of exactly `total` bytes.
+
+    Padding goes into the last message's payload rather than after the last
+    header, because a trailing run of filler is not a valid tag and the whole
+    frame would stop decoding - which would test the wrong thing.
+    """
+    prefix = b"".join(_header(func, ident, bytes(160)) for func, ident in commands[:-1])
+    func, ident = commands[-1]
+    for pad in range(total):
+        frame = prefix + _header(func, ident, bytes(pad))
+        if len(frame) == total:
+            return frame
+    raise AssertionError(f"no frame of exactly {total} B for {commands}")
+
+
+def _entry(offset: float, **extra: Any) -> dict[str, Any]:
+    """Build a stored frame `offset` seconds into the recording.
+
+    Timestamps are supplied by the test, never read from a clock, so the
+    span assertions below mean the same thing on every machine.
+    """
+    return {"ts": _T0 + offset, "topic": "property", "format": "proto", **extra}
+
+
+@contextmanager
+def _must_finish_within(seconds: int) -> Iterator[None]:
+    """Fail instead of hanging forever.
+
+    The defect these guard against is a loop that never terminates, so an
+    assertion cannot express it: without a deadline the test run itself
+    would hang and CI would time out with no clue which test did it.
+    """
+
+    def _expired(signum: int, frame: Any) -> None:
+        raise AssertionError(f"did not finish within {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _enc_header(
+    cmd_func: int,
+    cmd_id: int,
+    *,
+    pdata_plain: bytes | None,
+    enc_type: int | None = 1,
+    seq: int | None = 7,
+    prefix: bytes = b"",
+) -> bytes:
+    """Build one repeated-header entry with `pdata` XOR-masked as a device does.
+
+    Mirrors `_header` above, adding `enc_type` (field 6) and `seq` (field 14).
+    `pdata_plain` is XOR-ed with `seq & 0xFF` before being written into the
+    frame, but only when `enc_type == 1` - a device never masks a header it
+    did not flag, and a header carrying no `seq` has no key to mask with
+    either, so the stored bytes are the plaintext unchanged in both cases.
+
+    `prefix` is raw bytes written before `enc_type`, for a test that needs
+    control over what sits ahead of the header's own fields - a real device
+    never sends this, `_header_fields` walks straight past whatever bytes
+    it turns out to be.
+    """
+    header = bytearray()
+    header.extend(prefix)
+    if enc_type is not None:
+        header.extend(encode_field_varint(6, enc_type))
+    header.extend(encode_field_varint(8, cmd_func))
+    header.extend(encode_field_varint(9, cmd_id))
+    if seq is not None:
+        header.extend(encode_field_varint(14, seq))
+    if pdata_plain is not None:
+        # pdata goes last: the frame's other fields all encode as tag bytes
+        # or small varints, none of which are alphanumeric ASCII on their
+        # own - but a *serial-shaped* ciphertext run has no upper bound
+        # either, so an alphanumeric tag byte placed right after it would
+        # silently extend the match past the field it belongs to. Emitting
+        # pdata last means nothing but the end of the header (or the end of
+        # the frame) ever follows it.
+        key = (seq & 0xFF) if (enc_type == 1 and seq is not None) else 0
+        header.extend(encode_field_bytes(1, bytes(b ^ key for b in pdata_plain)))
+    return encode_field_bytes(1, bytes(header))
+
+
+def _decode_first_header(frame: bytes) -> dict[str, Any]:
+    """Decode and return the first header submessage of a frame."""
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    headers, _ = decode_header_message(frame)
+    return headers[0]
+
+
+def _unmask_pdata(header: dict[str, Any]) -> bytes:
+    """Undo the device's XOR mask on a decoded header's `pdata` field."""
+    key = header.get("seq", 0) & 0xFF
+    return bytes(b ^ key for b in bytes.fromhex(header["pdata"]))
+
+
+_CASE_E_SERIAL = b"C376TESTPLAIN001"
+
+
+def _case_e_frame(key: int) -> bytes:
+    """Build a frame whose header declares a key but sends its data plain.
+
+    `enc_type` is 1 and `seq` carries `key`, yet `pdata` is not masked: a
+    serial followed by sixteen bytes that spell `A` once the key is applied.
+    The plain passes mask the serial on the wire. Under the key the sixteen
+    bytes read as a serial-shaped run, so the plaintext pass finds something
+    of its own to change, and the region is rebuilt rather than left alone.
+    """
+    header = bytearray()
+    header.extend(encode_field_varint(6, 1))  # enc_type = XOR, declared
+    header.extend(encode_field_varint(14, key))  # seq
+    header.extend(
+        encode_field_bytes(1, _CASE_E_SERIAL + bytes([ord("A") ^ key]) * 16)
+    )  # pdata NOT masked
+    return encode_field_bytes(1, bytes(header))
+
+
+def _serial_pieces(serial: bytes) -> list[bytes]:
+    """Every 12-character piece of a serial, the shortest a reader could use."""
+    return [serial[start : start + 12] for start in range(len(serial) - 11)]
+
+
+class TestSanitizeFrame:
+    def test_serial_is_replaced_by_equal_length_filler(self) -> None:
+        """Byte offsets must survive masking, a field analysis depends on them."""
+        sn = "RE11TEST00000001"
+        payload = b"\x0a\x10" + sn.encode() + b"\x12\x04data"
+
+        result = sanitize_frame(payload, [sn])
+
+        assert sn.encode() not in result
+        assert len(result) == len(payload)
+        assert b"X" * len(sn) in result
+
+    def test_case_variants_are_caught(self) -> None:
+        sn = "Re11Test00000001"
+        payload = b"\x0a" + sn.lower().encode() + sn.upper().encode()
+
+        result = sanitize_frame(payload, [sn])
+
+        assert sn.lower().encode() not in result
+        assert sn.upper().encode() not in result
+
+    def test_user_id_is_masked_too(self) -> None:
+        payload = b"\x0a user12345 payload"
+
+        result = sanitize_frame(payload, ["", "user12345"])
+
+        assert b"user12345" not in result
+
+    def test_empty_secret_is_ignored(self) -> None:
+        payload = b"\x0a\x01\x02"
+
+        assert sanitize_frame(payload, ["", ""]) == payload
+
+    def test_unnamed_serials_are_masked_by_shape(self) -> None:
+        """A frame carries serials the caller never knew about.
+
+        Battery packs and attached accessories bring their own serials, and
+        the coordinator can only name the device serial and the account id.
+        Publishing a dump would otherwise expose them.
+        """
+        device_sn = "HJ31TEST00000001"
+        pack_sn = "BP5000TEST000001"
+        payload = b"\x0a\x10" + device_sn.encode() + b"\x12\x10" + pack_sn.encode()
+
+        result = sanitize_frame(payload, [device_sn])
+
+        assert device_sn.encode() not in result
+        assert pack_sn.encode() not in result
+        assert len(result) == len(payload)
+
+    def test_masking_preserves_byte_offsets(self) -> None:
+        """Both passes replace by length, so the frame layout is unchanged."""
+        payload = b"\x0a\x10" + b"HJ31TEST00000001" + b"\x18\x2a"
+
+        result = sanitize_frame(payload, ["HJ31TEST00000001"])
+
+        assert result.startswith(b"\x0a\x10")
+        assert result.endswith(b"\x18\x2a")
+        assert len(result) == len(payload)
+
+    def test_short_alphanumeric_runs_survive(self) -> None:
+        """Over-masking would destroy the payload this capture exists for."""
+        payload = b"\x0a\x04ABC1\x12\x02OK"
+
+        assert sanitize_frame(payload, []) == payload
+
+
+class TestDelimitedIdentifierMasking:
+    """The third pass: identifiers too short for the shape pass to risk.
+
+    A run of 12 upper-case alphanumerics turns up in ordinary binary, so a
+    free-running pattern that short would corrupt frames instead of cleaning
+    them. Protobuf supplies the boundary: a length-delimited field says how
+    many bytes it holds, so the whole value can be tested rather than a run
+    inside it.
+
+    The vectors below are the real thing. A STREAM AC 5000 carries a
+    12-character identifier this way in every frame it sends, and it reached
+    a public issue attachment because the serial pass never matched it.
+    """
+
+    # The exact bytes the device sends, identifier replaced: tag for field 2
+    # with wire type 2, length 12, then the value.
+    REAL_SHAPE = b"\x08\x03\x12\x0cAABBCCDDEEFF\x1d\xfa\x7e\xe2\x41"
+
+    def test_the_identifier_the_serial_pass_missed_is_masked(self) -> None:
+        result = sanitize_frame(self.REAL_SHAPE, [])
+
+        assert b"AABBCCDDEEFF" not in result
+        assert result == b"\x08\x03\x12\x0cXXXXXXXXXXXX\x1d\xfa\x7e\xe2\x41"
+
+    def test_the_serial_pass_alone_would_have_missed_it(self) -> None:
+        """The control for the line above: without this pass, nothing fires.
+
+        Twelve characters sit below the 15 the shape pattern requires, so a
+        test asserting the identifier is gone proves nothing unless the old
+        behaviour is pinned as well.
+        """
+        from ecoflow_energy.ecoflow.frame_capture import _SERIAL_RUN
+
+        assert _SERIAL_RUN.search(b"AABBCCDDEEFF") is None
+
+    def test_the_bytes_around_it_are_untouched(self) -> None:
+        result = sanitize_frame(self.REAL_SHAPE, [])
+
+        assert result.startswith(b"\x08\x03\x12\x0c")
+        assert result.endswith(b"\x1d\xfa\x7e\xe2\x41")
+        assert len(result) == len(self.REAL_SHAPE)
+
+    def test_a_field_below_the_floor_survives(self) -> None:
+        """Under 12 characters a field stops being an identifier.
+
+        Model names and status words live there, and they are what a capture
+        is read for.
+        """
+        payload = b"\x12\x0bSHORTID1234"
+
+        assert sanitize_frame(payload, []) == payload
+
+    def test_a_value_that_is_not_all_identifier_characters_survives(self) -> None:
+        """One lower-case letter is enough to say this is not an identifier."""
+        payload = b"\x12\x0cMODEL name12"
+
+        assert sanitize_frame(payload, []) == payload
+
+    def test_a_length_running_past_the_frame_is_ignored(self) -> None:
+        """A truncated frame must not be read past its end.
+
+        Frames are cut to a byte budget before they are stored, so a field
+        announcing more than remains is the normal case at the cut, not a
+        malformed device.
+        """
+        payload = b"\x12\x20AABBCCDDEEFF"
+
+        assert sanitize_frame(payload, []) == payload
+
+    def test_a_varint_field_is_not_read_as_a_length(self) -> None:
+        """Only wire type 2 announces a length. The others must be skipped."""
+        payload = b"\x08\x0cAABBCCDDEEFF"
+
+        assert sanitize_frame(payload, []) == payload
+
+    def test_two_identifiers_in_one_frame_both_go(self) -> None:
+        payload = b"\x12\x0cAABBCCDDEEFF\x1a\x0c112233445566"
+
+        result = sanitize_frame(payload, [])
+
+        assert b"AABBCCDDEEFF" not in result
+        assert b"112233445566" not in result
+        assert len(result) == len(payload)
+
+    def test_a_serial_sized_value_is_still_masked_once(self) -> None:
+        """The passes overlap on a 16-character serial. That is fine as long
+        as the result is a run of filler and not a run of filler masked
+        again into something shorter.
+        """
+        payload = b"\x12\x10HJ31TEST00000001"
+
+        result = sanitize_frame(payload, [])
+
+        assert result == b"\x12\x10" + b"X" * 16
+
+
+class TestAnchoredStringMasking:
+    """The seventh pass: a neighbour's name and short id, masked by position.
+
+    Neither the delimited pass nor any shape pattern above it can see these
+    values on their own - the id is eight hex characters, under `_IDENT_MIN`,
+    and the name mixes a lower-case run with an underscore, outside every
+    alphabet above. The serial beside them is the boundary: within one
+    protobuf message, a whole field that is serial-shaped anchors every
+    other whole field of eight or more identifier-shaped characters
+    (PLAN-133, ADR-025).
+    """
+
+    SN = "HJ31TESTBAM40TX5"
+    FIELD2 = b"A1B2C3D4"
+    FIELD5 = b"Ecoflow_1234"
+
+    @staticmethod
+    def _wrap(depth: int, payload: bytes) -> bytes:
+        """Nest `payload` `depth` delimited levels deep in field 1.
+
+        Matches how far `_delimited_spans_by_message` must descend before it
+        reads `payload` as a message of its own.
+        """
+        for _ in range(depth):
+            payload = encode_field_bytes(1, payload)
+        return payload
+
+    @classmethod
+    def _record(
+        cls,
+        *,
+        field2: bytes | None = FIELD2,
+        field3: bytes | None = None,
+        field5: bytes | None = FIELD5,
+    ) -> bytes:
+        """One record: a sequence number, then the fields under test."""
+        out = encode_field_varint(1, 1)
+        if field2 is not None:
+            out += encode_field_bytes(2, field2)
+        if field3 is not None:
+            out += encode_field_bytes(3, field3)
+        if field5 is not None:
+            out += encode_field_bytes(5, field5)
+        return out
+
+    @classmethod
+    def _depth3_frame(cls, **field_kwargs: bytes | None) -> bytes:
+        """A record wrapped 3 delimited levels down: frame, header, pdata."""
+        record = cls._record(field3=cls.SN.encode(), **field_kwargs)
+        return cls._wrap(3, record)
+
+    def test_the_record_the_other_passes_missed_is_masked(self) -> None:
+        frame = self._depth3_frame()
+        field2_offset = frame.index(self.FIELD2)
+        field5_offset = frame.index(self.FIELD5)
+
+        result = sanitize_frame(frame, [])
+
+        assert self.FIELD2 not in result
+        assert self.FIELD5 not in result
+        assert result[field2_offset : field2_offset + len(self.FIELD2)] == (
+            b"X" * len(self.FIELD2)
+        )
+        assert result[field5_offset : field5_offset + len(self.FIELD5)] == (
+            b"X" * len(self.FIELD5)
+        )
+
+    def test_the_earlier_passes_alone_leave_both_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The control: without this pass, neither value is touched."""
+        import ecoflow_energy.ecoflow.frame_capture as frame_capture_module
+
+        monkeypatch.setattr(frame_capture_module, "_mask_anchored_strings", lambda p: p)
+        frame = self._depth3_frame()
+
+        result = sanitize_frame(frame, [])
+
+        assert b"X" * len(self.SN) in result
+        assert self.FIELD2 in result
+        assert self.FIELD5 in result
+
+    def test_the_eight_character_hex_id_is_masked(self) -> None:
+        frame = self._depth3_frame(field5=None)
+        offset = frame.index(self.FIELD2)
+
+        result = sanitize_frame(frame, [])
+
+        assert self.FIELD2 not in result
+        assert result[offset : offset + 8] == b"X" * 8
+
+    def test_the_name_with_an_underscore_is_masked(self) -> None:
+        frame = self._depth3_frame(field2=None)
+        offset = frame.index(self.FIELD5)
+
+        result = sanitize_frame(frame, [])
+
+        assert self.FIELD5 not in result
+        assert result[offset : offset + 12] == b"X" * 12
+
+    def test_a_string_without_a_serial_beside_it_survives(self) -> None:
+        """`653` is not serial-shaped, so the message has no anchor at all."""
+        record = encode_field_varint(1, 1)
+        record += encode_field_bytes(2, self.FIELD2)
+        record += encode_field_bytes(3, b"653")
+        record += encode_field_bytes(7, b"plug_and_play")
+        frame = self._wrap(3, record)
+
+        assert sanitize_frame(frame, []) == frame
+
+    def test_a_sibling_outside_the_shape_survives(self) -> None:
+        """Under the floor, and outside the alphabet, in the same message.
+
+        The serial goes last: right after its raw run, `_SERIAL_RUN` (an
+        earlier, free-running pass) would otherwise swallow the very next
+        tag byte too, whenever that byte happens to also read as
+        `[A-Z0-9]` - corrupting the field this test means to check.
+        """
+        record = encode_field_varint(1, 1)
+        record += encode_field_bytes(6, b"android")
+        record += encode_field_bytes(8, b"V0.0.0")
+        record += encode_field_bytes(3, self.SN.encode())
+        frame = self._wrap(3, record)
+
+        result = sanitize_frame(frame, [])
+
+        assert b"android" in result
+        assert b"V0.0.0" in result
+
+    def test_a_serial_already_masked_is_still_the_anchor(self) -> None:
+        """A serial `_SERIAL_RUN` already turned into filler still matches."""
+        record = self._record(field3=b"X" * len(self.SN))
+        frame = self._wrap(3, record)
+
+        result = _mask_anchored_strings(frame)
+
+        assert self.FIELD2 not in result
+        assert self.FIELD5 not in result
+
+    def test_a_name_after_the_serial_with_an_alphanumeric_tag_is_masked(self) -> None:
+        """Field 8 follows the serial with the tag byte `B`, which is in
+        `[A-Z0-9]`: the free-running serial pass would swallow that tag and
+        blind the walk to the rest of the message. The anchored pass runs
+        before it for exactly this case. Red when the pass moves back behind
+        `_SERIAL_RUN`.
+        """
+        record = (
+            encode_field_varint(1, 1)
+            + encode_field_bytes(3, self.SN.encode())
+            + encode_field_bytes(8, self.FIELD5)
+        )
+        frame = self._wrap(3, record)
+
+        result = sanitize_frame(frame, [])
+
+        assert self.FIELD5 not in result
+        at = frame.index(self.FIELD5)
+        assert result[at : at + len(self.FIELD5)] == b"X" * len(self.FIELD5)
+        assert self.SN.encode() not in result
+
+    def test_a_dotted_or_slashed_sibling_of_eight_characters_survives(self) -> None:
+        """The alphabet is the boundary for these, not the floor: both are
+        long enough to be candidates and are kept only because `.` and `/`
+        are outside `[A-Za-z0-9_-]`. Red when either character joins it.
+        """
+        record = (
+            encode_field_varint(1, 1)
+            + encode_field_bytes(2, b"V1.0.1.2")
+            + encode_field_bytes(3, self.SN.encode())
+            + encode_field_bytes(4, b"Asia/Tokyo")
+        )
+        frame = self._wrap(3, record)
+
+        result = _mask_anchored_strings(frame)
+
+        assert result == frame
+
+    def test_the_anchor_itself_is_not_a_candidate(self) -> None:
+        """A serial matches the candidate shape too, and is left to the
+        serial pass: the anchored pass never touches it, so two serials in
+        one message anchor each other and both survive this pass intact.
+        Red when the anchor exclusion is dropped.
+        """
+        other = "HJ31OTHERPACK001"
+        record = (
+            encode_field_varint(1, 1)
+            + encode_field_bytes(2, self.FIELD2)
+            + encode_field_bytes(3, self.SN.encode())
+            + encode_field_bytes(4, other.encode())
+        )
+        frame = self._wrap(3, record)
+
+        result = _mask_anchored_strings(frame)
+
+        assert self.SN.encode() in result
+        assert other.encode() in result
+        assert self.FIELD2 not in result
+
+    def test_the_anchor_does_not_reach_across_messages(self) -> None:
+        anchored = self._record(field2=None, field3=self.SN.encode())
+        unanchored = encode_field_varint(1, 2) + encode_field_bytes(2, b"Guest_Network")
+        pdata = encode_field_bytes(9, anchored) + encode_field_bytes(10, unanchored)
+        frame = self._wrap(2, pdata)
+
+        result = sanitize_frame(frame, [])
+
+        assert self.FIELD5 not in result
+        assert b"Guest_Network" in result
+
+    def test_masking_preserves_length_and_the_bytes_around_it(self) -> None:
+        """Isolate the pass: `sanitize_frame` would also mask the serial
+        between the two spans through the free-running shape pass, which
+        would make the "everything else is untouched" claim false for the
+        wrong reason.
+        """
+        frame = self._depth3_frame()
+        field2_offset = frame.index(self.FIELD2)
+        field5_offset = frame.index(self.FIELD5)
+
+        result = _mask_anchored_strings(frame)
+
+        assert len(result) == len(frame)
+        assert result[:field2_offset] == frame[:field2_offset]
+        between_start = field2_offset + len(self.FIELD2)
+        assert result[between_start:field5_offset] == frame[between_start:field5_offset]
+        after_start = field5_offset + len(self.FIELD5)
+        assert result[after_start:] == frame[after_start:]
+
+    def test_a_truncated_frame_comes_out_no_worse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # (a) cut inside the record itself: no exception, and whatever the
+        # six earlier passes already masked must not be undone.
+        frame = self._depth3_frame()
+        cut = frame[:-4]
+
+        result = sanitize_frame(cut, [])
+        assert result == _plain_passes(cut, [])
+
+        import ecoflow_energy.ecoflow.frame_capture as frame_capture_module
+
+        monkeypatch.setattr(frame_capture_module, "_mask_anchored_strings", lambda p: p)
+        six_passes_only = sanitize_frame(cut, [])
+        for index, byte in enumerate(six_passes_only):
+            if byte == ord("X"):
+                assert result[index] == ord("X")
+        monkeypatch.undo()
+
+        # (b) a two-header frame whose second header is cut short: the
+        # intact first header's record is still masked. The second header
+        # uses different values so the assertions below can only pass if
+        # they came from the intact first one.
+        header1 = self._wrap(3, self._record(field3=self.SN.encode()))
+        header2 = self._wrap(
+            3,
+            self._record(
+                field2=b"AABBCCDD", field3=self.SN.encode(), field5=b"Other_0001"
+            ),
+        )[:-6]
+        two_header_frame = header1 + header2
+
+        result2 = sanitize_frame(two_header_frame, [])
+
+        assert self.FIELD5 not in result2
+        assert self.FIELD2 not in result2
+
+    def test_a_record_at_the_depth_cap_is_masked_and_one_below_is_not(self) -> None:
+        """Isolate the pass itself: `sanitize_frame` would still mask the
+        serial at any depth through the free-running shape pass, which would
+        hide whether the anchored pass reached the record at all.
+        """
+        record = self._record(field3=self.SN.encode())
+        at_cap = self._wrap(_ANCHOR_DEPTH, record)
+        below_cap = self._wrap(_ANCHOR_DEPTH + 1, record)
+
+        result_at_cap = _mask_anchored_strings(at_cap)
+        result_below_cap = _mask_anchored_strings(below_cap)
+
+        assert self.FIELD5 not in result_at_cap
+        assert result_below_cap == below_cap
+        # The cap is the depth the collateral was measured at (ADR-025
+        # decision 3), so moving it is a measurement, not an edit. Pinned
+        # here because the two assertions above move with the constant.
+        assert _ANCHOR_DEPTH == 6
+
+
+class TestUUIDMasking:
+    """`_UUID_RUN`, shipped in #348 without a unit test of its own.
+
+    A UUID is lower case and hyphenated, so no pass around it can see one:
+    `_SERIAL_RUN` needs upper case, the delimited pass needs a whole
+    alphanumeric field, and the joined-hex pass needs a serial behind it.
+    Its own shape is the boundary, found 2026-09-04 in a reporter's
+    diagnostics download for #234.
+    """
+
+    UUID = b"a2e0d4a0-8b4d-4e16-9e3b-fd5777dcb68b"
+
+    def test_a_uuid_is_masked_by_shape(self) -> None:
+        payload = b"\x7a\x24" + self.UUID
+
+        result = sanitize_frame(payload, [])
+
+        assert self.UUID not in result
+        assert b"X" * len(self.UUID) in result
+
+    def test_uuid_masking_preserves_length(self) -> None:
+        payload = b"\x7a\x24" + self.UUID + b"\x10\x01"
+
+        result = sanitize_frame(payload, [])
+
+        assert len(result) == len(payload)
+        assert result.startswith(b"\x7a\x24")
+        assert result.endswith(b"\x10\x01")
+
+
+class TestJoinedHexRunMasking:
+    """The fourth pass: a lower-case hex run a hyphen joins to a serial.
+
+    No pass above it can see this value: it is lower case, so `_SERIAL_RUN`
+    and the delimited pass both refuse it, and it has none of a UUID's
+    hyphenated shape for `_UUID_RUN`. The field is not a whole
+    length-delimited value either - the hyphen sits inside a longer string -
+    so the delimited pass could not reach it under any alphabet. The serial
+    half is the boundary: `_SERIAL_RUN` has already turned it into a run of
+    `X`, which still satisfies `[A-Z0-9]{15,}`.
+
+    The synthetic value below is the shape a reporter's diagnostics download
+    for #234 carried, not the value itself - a run of digits and `ab`
+    identifies nobody, the reporter's unit does.
+    """
+
+    SERIAL = b"HJ31TEST00000001"
+    # Tag for a length-delimited field, length 29: 12 hex characters, a
+    # hyphen, and a 16-character serial.
+    REAL_SHAPE = b"\x22\x1d" + b"0123456789ab-" + SERIAL
+
+    def test_a_hex_run_joined_to_a_serial_is_masked(self) -> None:
+        result = sanitize_frame(self.REAL_SHAPE, [])
+
+        assert b"0123456789ab" not in result
+        assert result == b"\x22\x1d" + b"X" * 12 + b"-" + b"X" * 16
+
+    def test_the_joined_run_keeps_its_hyphen_and_length(self) -> None:
+        result = sanitize_frame(self.REAL_SHAPE, [])
+
+        assert result.startswith(b"\x22\x1d")
+        assert b"-" in result
+        assert len(result) == len(self.REAL_SHAPE)
+
+    def test_a_hex_run_without_a_serial_behind_it_stays(self) -> None:
+        """The anchor: nothing serial-shaped follows, so the run must stay.
+
+        Ordinary binary does not join a lower-case hex run to a serial by
+        chance (0 hits in 1556 frames outside the download this was found
+        in), which is what makes the anchor safe. A bare run earns no such
+        guarantee and must be left alone.
+        """
+        payload = b"\x22\x0c" + b"0123456789ab"
+
+        assert sanitize_frame(payload, []) == payload
+
+    def test_a_hex_run_below_the_floor_before_a_serial_stays(self) -> None:
+        """The width floor is 12, pinned rather than measured.
+
+        No frame on file shows an identifier this short joined to a serial,
+        so an eight-character hex run must stay untouched even with a serial
+        right behind it - the serial itself is still masked, by
+        `_SERIAL_RUN`, which is a different pass and not under test here.
+        """
+        payload = b"\x22\x19" + b"01234567-" + self.SERIAL
+
+        result = sanitize_frame(payload, [])
+
+        assert b"01234567-" in result
+        assert self.SERIAL not in result
+
+    def test_a_lower_case_run_outside_hex_is_not_masked(self) -> None:
+        """The alphabet is hex, and widening it must fail a test here.
+
+        A pattern of `[0-9a-z]` would still mask everything this class
+        checks, so without this case a widening of the alphabet passes the
+        suite unnoticed. Lower-case letters beyond `f` are ordinary text,
+        not an identifier this device writes.
+        """
+        payload = b"\x22\x1d" + b"ghijklmnopqr-" + self.SERIAL
+
+        result = sanitize_frame(payload, [])
+
+        assert b"ghijklmnopqr" in result
+
+    def test_a_hex_run_touching_a_serial_without_a_hyphen_stays(self) -> None:
+        """The hyphen is part of the shape, not decoration.
+
+        Making it optional would let the pattern reach into any byte string
+        that happens to end in hex before a serial, which is the free-running
+        behaviour the anchor exists to avoid.
+        """
+        payload = b"\x22\x1c" + b"0123456789ab" + self.SERIAL
+
+        result = sanitize_frame(payload, [])
+
+        assert b"0123456789ab" in result
+
+    def test_the_anchor_needs_a_full_length_serial_behind_it(self) -> None:
+        """The anchor floor is 15, the same one `_SERIAL_RUN` uses.
+
+        Lowering it would make the pattern fire on shorter upper-case runs,
+        which ordinary binary produces often enough that the narrow alphabet
+        elsewhere in this module exists to avoid exactly that.
+        """
+        payload = b"\x22\x19" + b"0123456789ab-" + b"HJ31TEST0000"
+
+        result = sanitize_frame(payload, [])
+
+        assert b"0123456789ab" in result
+
+    def test_a_run_longer_than_a_uuid_is_masked_whole(self) -> None:
+        """No upper bound: a partial mask is worse than none.
+
+        A capped run masks its tail and leaves its front standing, and a
+        front of twelve or more characters is itself the shape the fixture
+        gate refuses. Nothing on file carries a run this long; the case is
+        pinned so a later edit cannot reintroduce the cap unnoticed.
+        """
+        long_run = b"0123456789ab" * 10  # 120 characters
+        payload = b"\x22\x7f" + long_run + b"-" + self.SERIAL
+
+        result = sanitize_frame(payload, [])
+
+        assert result == b"\x22\x7f" + b"X" * 120 + b"-" + b"X" * 16
+
+    def test_a_json_timestamp_is_not_an_identifier(self) -> None:
+        """The anchor against the free-running variant that was rejected.
+
+        A free-running `[0-9a-f]{12,}` would also match a 13-digit
+        millisecond timestamp inside a JSON set frame - 29 distinct values
+        across 27 frames in the local capture corpus. None of them is
+        followed by a serial-shaped run, so the anchored pass must leave
+        this alone.
+        """
+        payload = b'{"timestamp":1786556254405,"cmdFunc":50}'
+
+        assert sanitize_frame(payload, []) == payload
+
+
+class TestTimeZoneMasking:
+    """The city half of a time zone goes, the region stays.
+
+    A Delta 3 reports the owner's time zone as an IANA name, and it reached a
+    diagnostics file attached to a public issue while the serial beside it was
+    masked. It is not an identifier, so neither of the passes before this one
+    could see it: lower case and a slash sit outside the identifier alphabet
+    on purpose.
+
+    Dropping it whole would cost something real, though. The region says which
+    side of the world a device is on, and that is what a schedule behaving
+    oddly is read against. So the region is kept.
+    """
+
+    def test_the_city_is_masked_and_the_region_survives(self) -> None:
+        payload = b"\xb2\x08\x0fEurope/Budapest\xb8\x08"
+
+        result = sanitize_frame(payload, [])
+
+        assert result == b"\xb2\x08\x0fEurope/XXXXXXXX\xb8\x08"
+
+    def test_neither_earlier_pass_would_have_caught_it(self) -> None:
+        """Control for the test above, so it cannot pass for a wrong reason."""
+        from ecoflow_energy.ecoflow.frame_capture import (
+            _SERIAL_RUN,
+            _mask_delimited_identifiers,
+        )
+
+        zone = b"Europe/Budapest"
+
+        assert _SERIAL_RUN.search(zone) is None
+        assert _mask_delimited_identifiers(b"\x12\x0f" + zone) == b"\x12\x0f" + zone
+
+    @pytest.mark.parametrize(
+        ("zone", "expected"),
+        [
+            (b"America/Denver", b"America/XXXXXX"),
+            (b"Asia/Kolkata", b"Asia/XXXXXXX"),
+            (b"Australia/Sydney", b"Australia/XXXXXX"),
+            # Three-part zones exist and the whole tail goes, not just the
+            # first component: the country is the part being removed.
+            (b"America/Argentina/Salta", b"America/XXXXXXXXXXXXXXX"),
+        ],
+    )
+    def test_other_regions_are_handled_the_same(
+        self, zone: bytes, expected: bytes
+    ) -> None:
+        assert sanitize_frame(zone, []) == expected
+
+    @pytest.mark.parametrize(
+        "payload", [b"MODEL/NAME", b"AC/DC", b"\x12\x03H/P", b"V1.0.1"]
+    )
+    def test_a_slash_is_not_enough_to_look_like_a_place(self, payload: bytes) -> None:
+        """The region is matched against the real area names, not by shape.
+
+        A pattern that took any capitalised word before a slash would start
+        masking model names, which is what a capture is read for.
+        """
+        assert sanitize_frame(payload, []) == payload
+
+    def test_masking_preserves_length(self) -> None:
+        payload = b"\xb2\x08\x0fEurope/Budapest\xb8\x08"
+
+        assert len(sanitize_frame(payload, [])) == len(payload)
+
+
+class TestEncryptedRegionMasking:
+    """The mask under the mask: a header can flag its own `pdata` XOR-ed.
+
+    `enc_type == 1` on a header means that header's `pdata` (or, on a
+    single-header frame with no `pdata`, the shared field-2 payload) is
+    XOR-ed with the low byte of that same header's `seq`. None of the plain
+    passes above can see a string once this sits on top of it, which is how
+    36 serial numbers and 4 time zones reached the sanitized output
+    unchanged before this fix (PLAN-128).
+
+    Most fixtures below use `_KEY`, a key chosen high enough (0x99) that
+    XOR-ing any printable ASCII byte with it lands outside every alphabet
+    the plain passes look for - so the ciphertext itself never coincides
+    with a shape one of those passes would touch on its own. That keeps
+    each test isolated to the one property its name describes.
+    `test_a_region_the_raw_pass_touched_is_read_from_the_original` picks the
+    opposite kind of key on purpose - one whose ciphertext IS shaped like a
+    serial - because that coincidence is exactly the case it exists to
+    catch.
+    """
+
+    _KEY = 0x99
+
+    def test_a_serial_under_the_mask_is_masked(self) -> None:
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"X" * 16
+
+    def test_the_frame_is_unchanged_outside_the_region(self) -> None:
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+        region = _encrypted_regions(frame)[0]
+
+        result = sanitize_frame(frame, [])
+
+        assert result[: region.start] == frame[: region.start]
+        assert result[region.end :] == frame[region.end :]
+
+    def test_masking_under_the_mask_preserves_length(self) -> None:
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        assert len(sanitize_frame(frame, [])) == len(frame)
+
+    def test_the_header_numbers_survive(self) -> None:
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, enc_type=1, seq=self._KEY)
+
+        before = _decode_first_header(frame)
+        after = _decode_first_header(sanitize_frame(frame, []))
+
+        for name in ("enc_type", "seq", "cmd_func", "cmd_id"):
+            assert after[name] == before[name]
+
+    def test_the_region_stays_masked(self) -> None:
+        """A naive reader must still see ciphertext, not plaintext."""
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        ciphertext = bytes.fromhex(header["pdata"])
+        assert ciphertext == bytes(b ^ self._KEY for b in b"X" * 16)
+        assert ciphertext != b"X" * 16
+
+    def test_the_raw_pass_alone_would_have_missed_it(self) -> None:
+        """The mutation control: without the region walk, nothing fires.
+
+        `_plain_passes` alone runs over the whole frame including the
+        encrypted region, and the serial's ciphertext is not any of the
+        shapes it looks for - so it must survive byte for byte. Without
+        this test, `test_a_serial_under_the_mask_is_masked` passing would
+        prove nothing about the region walk at all.
+        """
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+        ciphertext = bytes(b ^ self._KEY for b in plain)
+
+        raw_only = _plain_passes(frame, [])
+
+        assert ciphertext in raw_only
+
+    def test_a_time_zone_under_the_mask_is_masked(self) -> None:
+        plain = b"Europe/Budapest"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"Europe/XXXXXXXX"
+
+    def test_a_uuid_under_the_mask_is_masked(self) -> None:
+        plain = b"a2e0d4a0-8b4d-4e16-9e3b-fd5777dcb68b"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"X" * len(plain)
+
+    def test_a_delimited_identifier_under_the_mask_is_masked(self) -> None:
+        plain = b"\x12\x0cAABBCCDDEEFF"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"\x12\x0c" + b"X" * 12
+
+    def test_a_named_secret_under_the_mask_is_masked(self) -> None:
+        """The account id, an example of a secret only `secrets` can see.
+
+        `"a1b2c3d4e5"` is invisible to every shape-based pass - too short
+        and mixed with digits for `_SERIAL_RUN`, no hyphens for `_UUID_RUN`
+        or `_JOINED_HEX_RUN`, no region prefix for `_TIME_ZONE`, and mixed
+        case rules out `_mask_delimited_identifiers`. A serial-shaped value
+        here would pass whether or not `secrets` ever reached the region.
+        """
+        secret = "a1b2c3d4e5"
+        plain = secret.encode()
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [secret])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"X" * len(secret)
+
+    def test_a_header_without_a_seq_is_left_alone(self) -> None:
+        """No `seq` means no key - the region must not be damaged.
+
+        `_enc_header` stores `pdata_plain` unmasked when `seq` is absent
+        (there is nothing to derive a key from), so the plaintext sits in
+        the frame exactly as if the plain passes alone had run.
+        """
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, enc_type=1, seq=None)
+
+        result = sanitize_frame(frame, [])
+
+        assert result == _plain_passes(frame, [])
+
+    def test_a_zero_key_region_is_still_masked(self) -> None:
+        """`seq & 0xFF == 0`: the plaintext sits there unencrypted, and it
+        is still masked - XOR by zero is a no-op, not a reason to skip.
+
+        This assertion also holds with the region walk removed entirely: a
+        key-0 region is plaintext before that walk ever runs, and the
+        whole-frame `_SERIAL_RUN` pass finds it there on its own. The test
+        exists to document the intent - `key is None` skips, `key == 0`
+        does not - not to guard an outcome the region path alone produces.
+        """
+        plain = b"HJ31TESTMASK0001"
+        seq = 256  # seq & 0xFF == 0
+
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=seq)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert bytes.fromhex(header["pdata"]) == b"X" * 16
+
+    def test_each_header_uses_its_own_seq(self) -> None:
+        """A frame-wide key would mask at most one of these two headers."""
+        header_a = _enc_header(254, 39, pdata_plain=b"HJ31TESTMASK0001", seq=self._KEY)
+        header_b = _enc_header(
+            254, 40, pdata_plain=b"HJ31TESTMASK0002", seq=self._KEY + 1
+        )
+        frame = header_a + header_b
+
+        result = sanitize_frame(frame, [])
+
+        from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+        headers, _ = decode_header_message(result)
+        assert len(headers) == 2
+        assert _unmask_pdata(headers[0]) == b"X" * 16
+        assert _unmask_pdata(headers[1]) == b"X" * 16
+
+    def test_a_plain_header_is_not_treated_as_encrypted(self) -> None:
+        """`enc_type=0`: the region walk must emit nothing for this header,
+        and the serial - which was never actually encrypted - is still
+        masked exactly once, by the plain pass over the whole frame.
+        """
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, enc_type=0, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert bytes.fromhex(header["pdata"]) == b"X" * 16
+
+    def test_a_single_header_frame_masks_its_field_two_payload(self) -> None:
+        """No `pdata`, `enc_type=1`, exactly one header: the shared
+        field-2 payload is the analyzer-parity fallback region.
+        """
+        plain = b"HJ31TESTMASK0001"
+        header = _enc_header(254, 39, pdata_plain=None, enc_type=1, seq=self._KEY)
+        frame = header + encode_field_bytes(2, bytes(b ^ self._KEY for b in plain))
+
+        result = sanitize_frame(frame, [])
+
+        from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+        _, payload = decode_header_message(result)
+        assert bytes(b ^ self._KEY for b in payload) == b"X" * 16
+
+    def test_a_multi_header_frame_does_not_claim_the_shared_payload(self) -> None:
+        """Two headers sharing one field-2 payload: which one owns it is
+        undecidable, so nothing about the payload is spliced at all.
+        """
+        header_a = _enc_header(254, 39, pdata_plain=None, enc_type=1, seq=self._KEY)
+        header_b = _enc_header(254, 40, pdata_plain=None, enc_type=0, seq=self._KEY + 1)
+        plain = b"HJ31TESTMASK0001"
+        ciphertext = bytes(b ^ self._KEY for b in plain)
+        frame = header_a + header_b + encode_field_bytes(2, ciphertext)
+
+        result = sanitize_frame(frame, [])
+
+        assert result == _plain_passes(frame, [])
+
+    def test_a_truncated_frame_is_masked_at_least_as_well_as_before(self) -> None:
+        """Cut mid-header: the region walk must give up cleanly rather than
+        act on a span that runs past the end of the frame.
+        """
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY)
+        truncated = frame[: len(frame) - 5]
+
+        result = sanitize_frame(truncated, [])
+
+        assert result == _plain_passes(truncated, [])
+
+    def test_a_frame_that_does_not_parse_does_not_raise(self) -> None:
+        for payload in (
+            b"",
+            b"\xff" * 20,
+            b"\x0a",
+            bytes(range(256)),
+            b"\x08" + b"\xff" * 12,  # oversized varint
+        ):
+            sanitize_frame(payload, [])  # must not raise
+
+    def test_a_region_the_raw_pass_touched_is_read_from_the_original(self) -> None:
+        """The property: a region's ciphertext is always sliced from `payload`.
+
+        The plaintext here is itself serial-shaped, and - by construction of
+        this particular key - so is its ciphertext. The very first,
+        whole-frame `_plain_passes` call therefore already replaces the
+        ciphertext with `X` * 16 in `sanitized`, before the region loop ever
+        runs. Slicing from `sanitized` at that point would XOR that `X` run
+        instead of the real ciphertext, never reach the actual plaintext
+        underneath, and re-splice a value the unmask below would not accept.
+        """
+        plain = b"HJDEFGKILMNPQRST"
+        key = 3
+        ciphertext = bytes(b ^ key for b in plain)
+        assert re.fullmatch(rb"[A-Z0-9]{16}", ciphertext), (
+            "fixture must look like a serial"
+        )
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=key)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"X" * 16
+
+    def test_the_region_pass_leaves_an_untouched_region_alone(self) -> None:
+        plain = b"no identifiers in here."
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=7)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == plain
+
+    def test_the_region_pass_does_not_overwrite_the_raw_pass_mask(self) -> None:
+        """The "leave an unchanged region alone" short-circuit, pinned.
+
+        The plaintext here has nothing any pass can mask - lowercase
+        letters match none of them - but at key `0x20` its ciphertext
+        happens to spell an upper-case run the whole-frame pass masks
+        before the region walk ever starts (XOR-ing ASCII with `0x20`
+        flips case, nothing more). Unmasking that region again recovers
+        the same harmless plaintext, so the region pass finds nothing to
+        change. Without the short-circuit it splices the *original*
+        ciphertext back into that span regardless, undoing the mask the
+        whole-frame pass had already written there. Plan decision 4 calls
+        the combination of the two passes strictly additive; this is the
+        case that additivity depends on.
+        """
+        plain = b"abcdefghijklmnop"
+        key = 0x20
+        ciphertext = bytes(b ^ key for b in plain)
+        assert re.fullmatch(rb"[A-Z]{16}", ciphertext), "must mask under the raw pass"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=key)
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert bytes.fromhex(header["pdata"]) == b"X" * 16
+
+    def test_a_prefix_the_whole_frame_pass_masks_is_still_read_from_the_original(
+        self,
+    ) -> None:
+        """The property: regions are walked from `payload`, not `sanitized`.
+
+        An 18-byte identifier-shaped run placed before this header's own
+        `enc_type` field is exactly what `_SERIAL_RUN` looks for on the
+        whole frame - and being greedy, it also swallows the adjacent
+        `enc_type` tag byte (`0x30`, itself `[A-Z0-9]`), leaving only the
+        tag's *value* byte standing alone where a field boundary used to
+        be. Walking that masked span as if it were the frame - the
+        property this test pins - never lands on a byte pair that reads
+        `enc_type == 1` again, so the header's real region would be walked
+        straight past. Walking the pristine `payload` still finds it,
+        which the two assertions below check separately: first that the
+        walk itself diverges, then that `sanitize_frame` uses the walk that
+        still finds the header.
+        """
+        prefix = b"PLPOQNY5B2NPSEJEJ6"
+        plain = b"HJ31TESTMASK0001"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=self._KEY, prefix=prefix)
+
+        payload_regions = _encrypted_regions(frame)
+        sanitized_regions = _encrypted_regions(_plain_passes(frame, []))
+        assert payload_regions and not sanitized_regions, (
+            payload_regions,
+            sanitized_regions,
+        )
+
+        result = sanitize_frame(frame, [])
+
+        header = _decode_first_header(result)
+        assert _unmask_pdata(header) == b"X" * 16
+
+    def test_an_anchored_record_under_the_mask_is_masked(self) -> None:
+        """A neighbour's name beside a serial is masked under the XOR mask too.
+
+        The seventh pass runs inside `_plain_passes`, so a region a header
+        declares masked gets it by the same route as the six before it
+        (ADR-025 decision 5). Red when the pass is called from
+        `sanitize_frame` over the raw frame instead of from the helper.
+        """
+        record = (
+            encode_field_varint(1, 1)
+            + encode_field_bytes(2, b"A1B2C3D4")
+            + encode_field_bytes(3, b"HJ31TESTBAM40TX5")
+            + encode_field_bytes(5, b"Ecoflow_1234")
+        )
+        plain = encode_field_bytes(1, record)
+        frame = _enc_header(2, 133, pdata_plain=plain, seq=self._KEY)
+
+        result = sanitize_frame(frame, [])
+
+        assert len(result) == len(frame)
+        regions = _encrypted_regions(frame)
+        assert len(regions) == 1 and regions[0].key == self._KEY, regions
+        region = regions[0]
+        unmasked = _xor(result[region.start : region.end], self._KEY)
+        for value in (b"A1B2C3D4", b"HJ31TESTBAM40TX5", b"Ecoflow_1234"):
+            assert value not in unmasked
+            at = plain.index(value)
+            assert unmasked[at : at + len(value)] == b"X" * len(value), value
+        assert result[: region.start] == frame[: region.start]
+        assert result[region.end :] == frame[region.end :]
+
+
+class TestMaskingDoesNotCorruptRealFrames:
+    """The guard the history of this mask asks for.
+
+    `diagnostics.py` records an over-broad mask that came back with 25 of 25
+    captured frames destroyed. A rule written against a synthetic payload
+    cannot see that, because a synthetic payload has no readings to lose. So
+    the check is run over every recorded frame this repo holds: mask it, parse
+    both versions, and require every number to survive.
+    """
+
+    @staticmethod
+    def _captures() -> list[tuple[str, bytes]]:
+        import json
+        from pathlib import Path
+
+        found: list[tuple[str, bytes]] = []
+        root = Path(__file__).parent / "fixtures"
+        for path in sorted(root.rglob("*.json")):
+            try:
+                data = json.loads(path.read_text())
+            except ValueError:  # pragma: no cover - not a frame fixture
+                continue
+            if not isinstance(data, dict):
+                continue
+            # A fixture holding exactly one frame stores it inline, keyed
+            # `frame_hex` or `hex`, with no `frames` list around it -
+            # `tests/fixtures/delta3/p231_status_frame.json` is this shape.
+            frames = data.get("frames") or (
+                [data] if data.get("frame_hex") or data.get("hex") else []
+            )
+            for frame in frames:
+                raw = frame.get("hex") or frame.get("frame_hex")
+                if raw:
+                    found.append((path.name, bytes.fromhex(raw)))
+        return found
+
+    @staticmethod
+    def _captures_with_family() -> list[tuple[str, str, bytes]]:
+        """Every recorded frame, tagged with its fixture family directory.
+
+        `test_no_header_field_changes_under_masking` needs the family so a
+        broken decode that silently emptied one device's frames shows up as
+        a family with a checked count of zero, rather than disappearing into
+        one repo-wide total.
+        """
+        import json
+        from pathlib import Path
+
+        found: list[tuple[str, str, bytes]] = []
+        root = Path(__file__).parent / "fixtures"
+        for path in sorted(root.rglob("*.json")):
+            try:
+                data = json.loads(path.read_text())
+            except ValueError:  # pragma: no cover - not a frame fixture
+                continue
+            if not isinstance(data, dict):
+                continue
+            family = path.relative_to(root).parts[0]
+            frames = data.get("frames") or (
+                [data] if data.get("frame_hex") or data.get("hex") else []
+            )
+            for frame in frames:
+                raw = frame.get("hex") or frame.get("frame_hex")
+                if raw:
+                    found.append((family, path.name, bytes.fromhex(raw)))
+        return found
+
+    def test_there_are_frames_to_check(self) -> None:
+        """Positive control. A rglob that matched nothing would let the test
+        below pass while checking no frame at all.
+        """
+        assert len(self._captures()) >= 50
+
+    def test_every_recorded_frame_keeps_its_length(self) -> None:
+        for name, raw in self._captures():
+            assert len(sanitize_frame(raw, [])) == len(raw), name
+
+    def test_no_reading_changes_under_masking(self) -> None:
+        """Every pure parser that takes a raw frame, not the ES 5000 alone.
+
+        A masking bug that corrupted a Stream or Smart Meter reading would
+        have passed unnoticed while only the ES 5000 parser ran it back.
+        """
+        from ecoflow_energy.ecoflow.parsers.smart_meter_proto import (
+            parse_smart_meter_message,
+        )
+        from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+            parse_stream_ac5000_message,
+        )
+        from ecoflow_energy.ecoflow.parsers.stream_proto import (
+            parse_stream_proto_message,
+        )
+
+        parsers = (
+            parse_stream_ac5000_message,
+            parse_stream_proto_message,
+            parse_smart_meter_message,
+        )
+        checked: dict[str, int] = {}
+        for name, raw in self._captures():
+            for parser in parsers:
+                before = parser(raw) or {}
+                if not before:
+                    continue
+                after = parser(sanitize_frame(raw, [])) or {}
+                numeric_before = {
+                    key: value
+                    for key, value in before.items()
+                    if isinstance(value, (int, float))
+                }
+                numeric_after = {
+                    key: value
+                    for key, value in after.items()
+                    if isinstance(value, (int, float))
+                }
+                assert numeric_before == numeric_after, (parser.__name__, name)
+                checked[parser.__name__] = checked.get(parser.__name__, 0) + len(
+                    numeric_before
+                )
+
+        # Second positive control, per parser, counting VALUES COMPARED and
+        # not frames visited. A counter that increments once per frame stays
+        # healthy even when every parser has stopped returning numbers at
+        # all - a stub returning `{"only": "text"}` passed the earlier shape
+        # of this assertion with zero numbers compared. The floors sit just
+        # under what the fixtures hold today (988, 382, 114), so a parser
+        # that quietly stops reading most of its fields is caught, not only
+        # one whose import fails outright.
+        assert checked.get("parse_stream_ac5000_message", 0) >= 900
+        assert checked.get("parse_stream_proto_message", 0) >= 350
+        assert checked.get("parse_smart_meter_message", 0) >= 100
+
+    def test_no_header_field_changes_under_masking(self) -> None:
+        """The family-agnostic negative control.
+
+        `parse_stream_ac5000_message` only understands one family's payload,
+        so the check above cannot see whether masking disturbed a PowerOcean
+        or Delta 3 frame's routing. `decode_header_message` reads the outer
+        frame header every family shares, so this runs over all of them.
+
+        String-typed fields (the serial, the account id, the payload itself)
+        are excluded on purpose - masking changes those by design. Every
+        other header field - `cmd_func`, `cmd_id`, `seq`, `src`, `dest`, and
+        the rest of the routing fields - must be byte-for-byte identical.
+        """
+        from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+        checked: dict[str, int] = {}
+        for family, name, raw in self._captures_with_family():
+            headers_before, _ = decode_header_message(raw)
+            headers_after, _ = decode_header_message(sanitize_frame(raw, []))
+            assert len(headers_before) == len(headers_after), (family, name)
+            for before, after in zip(headers_before, headers_after, strict=True):
+                for key, value in before.items():
+                    if not isinstance(value, (int, float)):
+                        continue  # string-typed: serial, account id, pdata
+                    assert after.get(key) == value, (family, name, key)
+                    checked[family] = checked.get(family, 0) + 1
+
+        # Positive control, per family, counting FIELDS COMPARED and not
+        # frames visited. A decoder returning no headers at all satisfies
+        # `len(before) == len(after)` as `0 == 0`, never enters the loop,
+        # and left the earlier per-frame counter looking healthy - measured
+        # green with a decoder stubbed to return nothing. Counting inside
+        # the comparison ties the number to the decoder's own output. The
+        # floors sit just under what each family holds today.
+        assert set(checked) >= {
+            "delta3",
+            "smart_meter",
+            "solar_tracker",
+            "stream",
+            "stream_ac5000",
+        }, checked
+        assert checked["delta3"] >= 40, checked
+        assert checked["smart_meter"] >= 180, checked
+        assert checked["solar_tracker"] >= 90, checked
+        assert checked["stream"] >= 320, checked
+        assert checked["stream_ac5000"] >= 1050, checked
+
+    def test_sanitizing_the_products_own_output_again_changes_nothing(
+        self,
+    ) -> None:
+        """A masked region must survive a second pass unchanged.
+
+        `X ^ key` is alphanumeric for many keys, so on the wire a masked
+        serial can spell a sixteen-character run that the plain passes read
+        as a serial and overwrite, and under the mask that overwrite is no
+        longer `X`. Measured 2026-09-11 on the PowerPulse 2 settings-report
+        fixture: two of nine frames (keys 0x1e and 0x0a, wire runs `F` and
+        `R`) came back corrupted. Every frame of that fixture is the control.
+        """
+        import json
+        from pathlib import Path
+
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "powerpulse"
+            / "c376_run_data_sync_20260824.json"
+        )
+        frames = json.loads(fixture.read_text())["frames"]
+        wire_runs_seen = 0
+        for frame in frames:
+            raw = bytes.fromhex(frame["hex"])
+            if re.search(rb"[A-Z0-9]{12,}", raw):
+                wire_runs_seen += 1
+            assert sanitize_frame(raw, []) == raw
+        # The control only means something if the shape is present.
+        assert wire_runs_seen >= 2, wire_runs_seen
+
+    def test_a_wire_run_reaching_past_a_masked_serial_is_restored(self) -> None:
+        """A masked serial whose wire run spills into the next field survives.
+
+        On the DELTA Pro Ultra fixture (#464) the battery heartbeat carries the
+        masked serial under key 0x61, which spells `9` sixteen times, and the
+        field tag after it (`0x20`) spells `A`, so the plain passes rewrote a
+        seventeen-byte run whose plaintext was not all mask bytes. The second
+        pass turned the masked serial into nines and broke the field tag.
+        Every frame of that fixture is the control.
+        """
+        import json
+        from pathlib import Path
+
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "delta_pro_ultra"
+            / "y711_frames_issue464.json"
+        )
+        frames = json.loads(fixture.read_text())["frames"]
+        spill_seen = 0
+        for frame in frames:
+            raw = bytes.fromhex(frame["hex"])
+            if b"9" * 16 + b"A" in raw:
+                spill_seen += 1
+            assert sanitize_frame(raw, []) == raw
+        # The control only means something if the shape is present.
+        assert spill_seen >= 1, spill_seen
+
+    def test_a_wire_run_over_unmasked_plaintext_is_still_rewritten(self) -> None:
+        """Negative control for the restore above: it is limited to bytes whose
+        plaintext already carries the mask byte. Plaintext `y` under key 0x3e
+        reads as `G` on the wire; the plain passes leave lowercase alone and
+        rewrite the uppercase wire run, and that rewrite must stay.
+        """
+        key = 0x3E
+        plain = b"y" * 16
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))  # enc_type = XOR
+        header.extend(encode_field_varint(14, key))  # seq
+        header.extend(encode_field_bytes(1, _xor(plain, key)))  # pdata
+        frame = encode_field_bytes(1, bytes(header))
+        assert b"G" * 16 in frame
+        sanitized = sanitize_frame(frame, [])
+        assert b"X" * 16 in sanitized
+        assert b"G" * 16 not in sanitized
+
+    def test_a_plain_serial_in_a_region_that_only_declares_a_key_stays_masked(
+        self,
+    ) -> None:
+        """Negative control for the restore: a header that declares the mask
+        but sends plain bytes carries the serial on the wire. The raw pass
+        masks it; the restore must not hand any byte of it back, even the
+        ones that equal `X ^ key` by coincidence (with key 0x1e, `F`), which
+        a per-byte restore did (review finding of 2026-09-11).
+        """
+        key = 0x1E
+        serial = b"C376TESTPLAINFF1"  # two F, the byte `X ^ 0x1e` spells
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))  # enc_type = XOR, declared
+        header.extend(encode_field_varint(14, key))  # seq
+        header.extend(encode_field_bytes(1, serial))  # pdata NOT masked
+        frame = encode_field_bytes(1, bytes(header))
+        sanitized = sanitize_frame(frame, [])
+        assert b"X" * 16 in sanitized
+        assert serial not in sanitized
+        assert b"F" not in sanitized[frame.index(serial) : frame.index(serial) + 16]
+
+    @pytest.mark.parametrize("key", [0x07, 0x1E, 0x30, 0x61])
+    def test_a_rebuilt_region_does_not_write_a_plain_serial_back(
+        self, key: int
+    ) -> None:
+        """The region rebuild must not undo what the plain passes masked.
+
+        The header declares a key and sends plain bytes, so the serial is on
+        the wire and the plain passes mask it there. The bytes behind it spell
+        `A` under the key, which makes the plaintext pass change something
+        too, and the rebuild from the plaintext used to write the serial back
+        (full serial for 0x1e and 0x30, a 12-character piece for 0x61;
+        PLAN-167).
+        """
+        frame = _case_e_frame(key)
+        assert _CASE_E_SERIAL in frame  # the serial is there to be found
+        sanitized = sanitize_frame(frame, [])
+        assert len(sanitized) == len(frame)
+        for piece in _serial_pieces(_CASE_E_SERIAL):
+            assert piece not in sanitized
+
+    def test_a_sanitized_declared_key_frame_is_a_fixed_point(self) -> None:
+        """Sanitizing the output again changes nothing.
+
+        The wire carries `X` where the serial was. Under key 0x07 `X ^ key` is
+        `_`, which no plain pass looks for, so the plaintext pass finds nothing
+        in it and the second pass leaves the frame alone. Measured over all 255
+        keys: 221 are fixed points, the other 34 are the next test.
+        """
+        frame = _case_e_frame(0x07)
+        once = sanitize_frame(frame, [])
+        assert once != frame  # the first pass does mask something
+        assert sanitize_frame(once, []) == once
+
+    @pytest.mark.parametrize("key", [0x1E, 0x61])
+    def test_a_declared_key_frame_under_an_alphanumeric_mask_settles_by_the_second_pass(
+        self, key: int
+    ) -> None:
+        """Where `X ^ key` is alphanumeric, the second pass is the last one.
+
+        0x1e turns the wire's `X` into `F` and 0x61 into `9`. Read under the
+        key, the run of them is serial-shaped, the plaintext pass masks it,
+        and the rebuild writes `X ^ key` onto the wire: the second pass
+        changes the frame, the third does not. Nothing of the serial is back
+        at either step. This is the boundary of the fixed-point test above
+        stated rather than hidden.
+        """
+        once = sanitize_frame(_case_e_frame(key), [])
+        second = sanitize_frame(once, [])
+        assert sanitize_frame(second, []) == second
+        for piece in _serial_pieces(_CASE_E_SERIAL):
+            assert piece not in once
+            assert piece not in second
+
+    @pytest.mark.parametrize("key", [0x1E, 0x30, 0x61, 0x80])
+    def test_a_real_masked_region_still_comes_out_masked_under_the_mask(
+        self, key: int
+    ) -> None:
+        """Positive control for the rebuild: an encrypted serial stays masked.
+
+        The serial is XOR-ed the way a device does it, so only the plaintext
+        pass can see it. It has to come out as `X` under the key, the bytes
+        around it have to be untouched, and the frame still has to decode.
+        """
+        serial = b"HJ31TESTMASK0001"
+        plain = b"\x12\x10" + serial + b"\x18\x01"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=key)
+        sanitized = sanitize_frame(frame, [])
+        assert len(sanitized) == len(frame)
+        header = _decode_first_header(sanitized)
+        assert _unmask_pdata(header) == b"\x12\x10" + b"X" * 16 + b"\x18\x01"
+
+    def test_an_encrypted_serial_with_an_alphanumeric_tag_still_unmasks_to_x(
+        self,
+    ) -> None:
+        """Positive control for the per-byte guard.
+
+        Under key 2 both the ciphertext of this serial and the tag after it
+        (0x3a) are alphanumeric, so the wire pass masks seventeen bytes. The
+        guard lets the plaintext mask win at the sixteen serial bytes, which
+        must unmask to `X`, not to `X ^ key`. The tag byte keeps the wire mask
+        (the accepted spill), so at most that one byte beside the serial
+        differs from the plaintext.
+        """
+        serial = b"HJ31TESTSPILL001"
+        plain = b"\x0a\x10" + serial + b"\x3a\x01\x61"
+        frame = _enc_header(254, 39, pdata_plain=plain, seq=2)
+        sanitized = sanitize_frame(frame, [])
+        assert len(sanitized) == len(frame)
+        unmasked = _unmask_pdata(_decode_first_header(sanitized))
+        assert unmasked[2:18] == b"X" * 16
+        outside = [
+            i for i in range(len(plain)) if not 2 <= i < 18 and unmasked[i] != plain[i]
+        ]
+        assert len(outside) <= 1
+
+    def test_the_accepted_spill_is_what_keeps_a_plain_serial_hidden(self) -> None:
+        """Guard against the obvious fix of the one-byte spill.
+
+        A header that declares key 2 but sends plain bytes: here the spill
+        rule is what keeps every serial character masked. Excusing a span
+        whose plaintext is a masked serial (the way to stop the spill) hands
+        a character of this serial back, which an earlier rebuild also did.
+        """
+        serial = b"HJ31TESTSPILL008"
+        pdata = b"\x0a\x10" + serial + b"\x10\x01"
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))  # enc_type = XOR, declared
+        header.extend(encode_field_varint(14, 2))  # seq
+        header.extend(encode_field_bytes(1, pdata))  # pdata NOT masked
+        frame = encode_field_bytes(1, bytes(header))
+        start = frame.index(serial)
+        sanitized = sanitize_frame(frame, [])
+        assert len(sanitized) == len(frame)
+        for offset, char in enumerate(serial):
+            assert sanitized[start + offset] != char, offset
+
+    def test_a_plain_serial_beside_a_run_of_mask_bytes_stays_masked(self) -> None:
+        """Third negative control for the restore: the run is not the span.
+
+        A header that declares key 0x61 but sends plain bytes carries a serial
+        followed by sixteen `9`, which is `X ^ 0x61`. The wire is one
+        thirty-two byte run and the plain pass masks all of it. Under the key
+        the span reads as sixteen foreign bytes and then sixteen mask bytes, so
+        the restore must not treat it as a masked serial that merely spilled
+        a byte: a search for fifteen mask bytes anywhere in the span did, and
+        handed the whole plaintext serial back (review finding of 2026-10-02).
+        The #464 fixture next to it is the positive control: one foreign byte
+        on each side still restores.
+        """
+        key = 0x61
+        serial = b"C376TESTPLAINABC"  # no `9`, so no byte of it equals X ^ key
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))  # enc_type = XOR, declared
+        header.extend(encode_field_varint(14, key))  # seq
+        header.extend(encode_field_bytes(1, serial + b"9" * 16))  # pdata plain
+        frame = encode_field_bytes(1, bytes(header))
+        sanitized = sanitize_frame(frame, [])
+        assert serial not in sanitized
+        assert serial[:15] not in sanitized
+        assert b"X" * 32 in sanitized
+
+    def test_no_identifier_survives_under_the_mask(self) -> None:
+        """The guard for PLAN-128: an encrypted region must be clean too.
+
+        Measured before this fix: 40 such regions across 40 frames in this
+        corpus carried an identifier with nothing to catch it - 36 serials
+        and 4 time zones. This walks every capture and every tracked
+        fixture exactly the way `_encrypted_regions` does, unmasks each
+        region of the **masked output**, and asserts none of them do
+        anymore.
+
+        The floor counts REGIONS UNMASKED, not frames visited - a walk that
+        silently stopped finding regions would satisfy an empty loop just
+        as well as a clean one.
+        """
+        identifier = re.compile(rb"[0-9A-Za-z]{12,}")
+        checked = 0
+        for name, raw in self._captures():
+            sanitized = sanitize_frame(raw, [])
+            for region in _encrypted_regions(sanitized):
+                if region.key is None:
+                    continue
+                unmasked = _xor(sanitized[region.start : region.end], region.key)
+                checked += 1
+                for match in identifier.findall(unmasked):
+                    assert set(match) == {ord("X")}, (name, match)
+
+        # Measured on this corpus after the `frame_hex` fixture fix: 65
+        # regions unmasked. The floor sits below that with headroom, not on
+        # it, so one fixture removed does not silently pass.
+        assert checked >= 61, checked
+
+    def test_no_string_beside_a_serial_survives_in_a_tracked_frame(self) -> None:
+        """The guard for PLAN-133: nothing beside a serial is left standing.
+
+        Walks every tracked frame through `sanitize_frame`, then asks the
+        product's own walker what still sits beside a serial - on the frame
+        and under every region it unmasks - and requires every answer to be
+        a run of X. The floor counts ANCHORED MESSAGES the walker found, not
+        frames visited: a walker that silently stopped finding serials would
+        satisfy an empty loop just as well as a clean one.
+        """
+        anchored = 0
+        for name, raw in self._captures():
+            sanitized = sanitize_frame(raw, [])
+            views = [sanitized]
+            for region in _encrypted_regions(sanitized):
+                if region.key is None:
+                    continue
+                views.append(_xor(sanitized[region.start : region.end], region.key))
+            for view in views:
+                for spans in _delimited_spans_by_message(view):
+                    if any(_SERIAL_RUN.fullmatch(view, s, e) for s, e in spans):
+                        anchored += 1
+                for start, end in _anchored_string_fields(view):
+                    assert set(view[start:end]) == {ord("X")}, (name, view[start:end])
+
+        # Measured on this corpus on 2026-09-09: 162 anchored messages over
+        # 162 frames - every frame's header carries the device serial, so
+        # the header itself is the anchored message. The floor sits below
+        # that with headroom, so one fixture removed does not silently pass.
+        assert anchored >= 150, anchored
+
+
+class TestIsProtoFrame:
+    def test_protobuf_header(self) -> None:
+        assert is_proto_frame(b"\x0a\x10abc") is True
+
+    def test_json_payload(self) -> None:
+        assert is_proto_frame(b'{"soc": 50}') is False
+
+    def test_empty_payload(self) -> None:
+        assert is_proto_frame(b"") is False
+
+
+class TestBuildFrameEntry:
+    def test_masking_happens_before_truncation(self) -> None:
+        """Truncating first could leave half a serial in the stored hex."""
+        sn = "RE11TEST00000001"
+        payload = b"\x0a" + sn.encode() + b"\xff" * 100
+
+        entry = build_frame_entry("/app/device/property/x", payload, [sn], max_bytes=12)
+
+        stored = bytes.fromhex(entry["hex"])
+        assert len(stored) == 12
+        assert b"RE11" not in stored
+
+    def test_size_reports_the_original_length(self) -> None:
+        payload = b"\x0a" + b"\x00" * 999
+
+        entry = build_frame_entry("/topic", payload, [], max_bytes=16)
+
+        assert entry["size"] == 1000
+        assert len(bytes.fromhex(entry["hex"])) == 16
+
+    def test_topic_is_classified(self) -> None:
+        assert build_frame_entry("/a/get_reply", b"\x0a", [], 8)["topic"] == "get_reply"
+        assert build_frame_entry("/a/property/x", b"\x0a", [], 8)["topic"] == "property"
+
+    def test_parsed_keys_optional(self) -> None:
+        assert "parsed_keys" not in build_frame_entry("/t", b"\x0a", [], 8)
+        assert (
+            build_frame_entry("/t", b"\x0a", [], 8, parsed_keys=3)["parsed_keys"] == 3
+        )
+
+    def test_a_cut_frame_says_so(self) -> None:
+        """The mismatch was always derivable and nobody derived it."""
+        entry = build_frame_entry("/t", b"\x0a" + b"\x00" * 999, [], 16)
+
+        assert entry["truncated"] is True
+
+    def test_a_whole_frame_carries_no_marker(self) -> None:
+        """Absent, not False: an entry says nothing unless it was cut."""
+        entry = build_frame_entry("/t", b"\x0a" + b"\x00" * 10, [], 512)
+
+        assert "truncated" not in entry
+
+    def test_a_serial_past_the_old_cap_is_masked(self) -> None:
+        """Masking runs over the whole frame, not over the first 512 B.
+
+        The larger budget stores bytes that used to be discarded, so a serial
+        sitting a kilobyte into a bundle is now published unless the mask
+        reaches it. This frame stays under its budget, so it proves the mask
+        has no length assumption; the ordering against truncation is pinned
+        by the straddle case below.
+        """
+        sn = "ES22TEST00000001"
+        payload = b"\x0a" + b"\x00" * 700 + sn.encode() + b"\x00" * 700
+
+        entry = build_frame_entry("/t", payload, [sn], RAW_FRAME_BUNDLE_MAX_BYTES)
+
+        stored = bytes.fromhex(entry["hex"])
+        assert len(stored) == len(payload)
+        assert sn.encode() not in stored
+        assert b"X" * len(sn) in stored
+
+    def test_a_serial_cut_by_the_budget_leaves_no_fragment(self) -> None:
+        """Masked first, truncated second - and this is the case that proves it.
+
+        A serial straddling the cut is the only frame that tells the two
+        orderings apart. Masked first, the cut lands inside a run of filler
+        and the stored frame ends in mask bytes. Truncated first, the stored
+        frame ends in the front half of a real serial - a fragment too short
+        for the shape-based pass to ever catch, in a download users attach
+        to public issues.
+        """
+        sn = "ES22TEST00000001"
+        budget = 64
+        # The serial starts 8 bytes before the cut, so exactly half of it
+        # falls inside the stored window.
+        payload = b"\x0a" + b"\x00" * (budget - 1 - 8) + sn.encode() + b"\x00" * 40
+
+        entry = build_frame_entry("/t", payload, [sn], budget)
+
+        stored = bytes.fromhex(entry["hex"])
+        assert entry["truncated"] is True
+        assert len(stored) == budget
+        assert sn[:8].encode() not in stored
+        assert stored.endswith(b"X" * 8)
+
+
+class TestFrameBudget:
+    """How much of a frame is kept follows from what the frame carries."""
+
+    def test_a_single_message_gets_the_message_budget(self) -> None:
+        cmds = [{"cmd_func": 254, "cmd_id": 39}]
+
+        assert frame_budget(cmds, 1024, 2048, 8192) == 1024
+
+    def test_an_undecoded_frame_gets_the_message_budget(self) -> None:
+        """Nothing proves it carries more than one message."""
+        assert frame_budget([], 1024, 2048, 8192) == 1024
+
+    def test_a_bundle_gets_the_bundle_budget(self) -> None:
+        cmds = [{"cmd_func": 32, "cmd_id": 50}, {"cmd_func": 254, "cmd_id": 39}]
+
+        assert frame_budget(cmds, 1024, 2048, 8192) == 2048
+
+    def test_a_wide_bundle_claims_one_message_budget_per_message(self) -> None:
+        """What a fixed bundle number cannot do: follow the frame's own width."""
+        cmds = [{"cmd_func": 254, "cmd_id": 46}] * 14
+
+        assert frame_budget(cmds, 1024, 4096, 65536) == 14 * 1024
+
+    def test_the_cap_bounds_the_claim(self) -> None:
+        cmds = [{"cmd_func": 254, "cmd_id": 46}] * 40
+
+        assert frame_budget(cmds, 1024, 4096, 16384) == 16384
+
+    def test_a_narrow_bundle_keeps_the_floor(self) -> None:
+        """Two wide messages were covered before this and stay covered.
+
+        Their own width says nothing here - only the count is known at this
+        point - so a budget of count alone would have cut a two-message frame
+        to half of what it kept before.
+        """
+        cmds = [{"cmd_func": 96, "cmd_id": 1}, {"cmd_func": 96, "cmd_id": 8}]
+
+        assert frame_budget(cmds, 1024, 4096, 16384) == 4096
+
+    def test_the_ocean2_battery_report_survives_whole(self) -> None:
+        """The frame this change exists for.
+
+        The first RE11 capture (#145) holds nine of these across 16 hours, 12
+        to 14 messages at 4956 to 5899 B, and the 4096 B bundle budget cut
+        every single one. This is the widest of them.
+        """
+        payload = _frame_of(5899, *(((254, 46),) * 14))
+        cmds = decode_cmd_headers(payload)
+
+        entry = build_frame_entry(
+            "/app/device/property/x",
+            payload,
+            [],
+            frame_budget(
+                cmds,
+                RAW_FRAME_MAX_BYTES,
+                RAW_FRAME_BUNDLE_MAX_BYTES,
+                RAW_FRAME_BUNDLE_HARD_CAP,
+            ),
+        )
+
+        assert len(cmds) == 14
+        assert entry["size"] == 5899
+        assert len(bytes.fromhex(entry["hex"])) == 5899
+        assert "truncated" not in entry
+
+    def test_the_stream_ac5000_get_reply_survives_whole(self) -> None:
+        """The frame this whole split exists for.
+
+        Reporter captures put it at 1434 to 1448 B in six messages, and the
+        flat 512 B cap stored a third of it - the last three messages and the
+        config block of the full-state message were simply gone, in a download
+        that said nothing about it.
+        """
+        payload = _frame_of(1440, *_ES22_BUNDLE)
+        cmds = decode_cmd_headers(payload)
+
+        entry = build_frame_entry(
+            "/app/device/property/x",
+            payload,
+            [],
+            frame_budget(
+                cmds,
+                RAW_FRAME_MAX_BYTES,
+                RAW_FRAME_BUNDLE_MAX_BYTES,
+                RAW_FRAME_BUNDLE_HARD_CAP,
+            ),
+        )
+
+        assert len(cmds) == 6
+        assert entry["size"] == 1440
+        assert len(bytes.fromhex(entry["hex"])) == 1440
+        assert "truncated" not in entry
+
+    def test_a_single_message_frame_above_the_budget_is_cut_and_marked(self) -> None:
+        """The ceiling still exists; it just says when it applies."""
+        payload = _frame_of(1100, (254, 39))
+        cmds = decode_cmd_headers(payload)
+
+        entry = build_frame_entry(
+            "/app/device/property/x",
+            payload,
+            [],
+            frame_budget(
+                cmds,
+                RAW_FRAME_MAX_BYTES,
+                RAW_FRAME_BUNDLE_MAX_BYTES,
+                RAW_FRAME_BUNDLE_HARD_CAP,
+            ),
+        )
+
+        assert len(cmds) == 1
+        assert entry["size"] == 1100
+        assert len(bytes.fromhex(entry["hex"])) == RAW_FRAME_MAX_BYTES
+        assert entry["truncated"] is True
+
+
+class TestFrameKey:
+    def test_proto_is_keyed_by_its_first_command(self) -> None:
+        entry = {
+            "format": "proto",
+            "topic": "property",
+            "cmds": [{"cmd_func": 254, "cmd_id": 21}],
+        }
+
+        assert frame_key(entry, b"\x0a\x01", []) == "property:proto/254.21"
+
+    def test_a_bundle_keys_on_the_head_command(self) -> None:
+        """An appended optional command must not split one message type."""
+        head = {"cmd_func": 32, "cmd_id": 50}
+        one = {"format": "proto", "topic": "property", "cmds": [head]}
+        two = {
+            "format": "proto",
+            "topic": "property",
+            "cmds": [head, {"cmd_func": 254, "cmd_id": 21}],
+        }
+
+        assert frame_key(one, b"\x0a\x01", []) == frame_key(two, b"\x0a\x01", [])
+
+    def test_undecodable_proto_gets_its_own_bucket(self) -> None:
+        entry = {"format": "proto", "topic": "property", "cmds": []}
+
+        assert frame_key(entry, b"\x0a\x01", []) == "property:proto/undecoded"
+
+    def test_get_reply_never_shares_a_bucket_with_a_push(self) -> None:
+        """The full state dump is the richest frame; it keeps its own budget."""
+        cmds = [{"cmd_func": 254, "cmd_id": 21}]
+        push = {"format": "proto", "topic": "property", "cmds": cmds}
+        reply = {"format": "proto", "topic": "get_reply", "cmds": cmds}
+
+        assert frame_key(push, b"\x0a", []) != frame_key(reply, b"\x0a", [])
+
+    def test_json_is_keyed_by_command_when_present(self) -> None:
+        entry = {"format": "json", "topic": "property"}
+
+        key = frame_key(entry, b'{"cmdFunc": 254, "cmdId": 21, "param": {}}', [])
+
+        assert key == "property:json/254.21"
+
+    def test_json_falls_back_to_the_type_code(self) -> None:
+        entry = {"format": "json", "topic": "property"}
+
+        key = frame_key(entry, b'{"typeCode": "pdStatus", "params": {}}', [])
+
+        assert key == "property:json/typeCode=pdStatus"
+
+    def test_json_without_a_discriminator_shares_one_bucket(self) -> None:
+        entry = {"format": "json", "topic": "property"}
+
+        assert frame_key(entry, b'{"soc": 50}', []) == "property:json"
+        assert frame_key(entry, b'{"soc": 60}', []) == "property:json"
+
+    def test_unparsable_json_is_kept_apart(self) -> None:
+        entry = {"format": "json", "topic": "property"}
+
+        assert frame_key(entry, b"not json at all", []) == "property:json/unparsed"
+
+    def test_a_long_discriminator_cannot_grow_the_key(self) -> None:
+        """The value is device-controlled and ends up in a diagnostics dump."""
+        entry = {"format": "json", "topic": "property"}
+
+        key = frame_key(entry, b'{"typeCode": "' + b"A" * 500 + b'"}', [])
+
+        assert len(key) < 80
+
+    def test_a_serial_in_a_discriminator_never_reaches_the_key(self) -> None:
+        """Keys are exported, and diagnostics get attached to public issues.
+
+        The discriminator is a string lifted straight out of the payload, so
+        it goes through the same masking as the stored frame.
+        """
+        entry = {"format": "json", "topic": "property"}
+        sn = "RE11TEST00000001"
+
+        key = frame_key(entry, b'{"typeCode": "' + sn.encode() + b'"}', [sn])
+
+        assert sn not in key
+
+    def test_an_unnamed_serial_in_a_discriminator_is_masked_too(self) -> None:
+        """Pack and accessory serials are never known to the caller."""
+        entry = {"format": "json", "topic": "property"}
+
+        key = frame_key(entry, b'{"typeCode": "BP5000TEST000001"}', [])
+
+        assert "BP5000TEST000001" not in key
+
+
+class TestTypedFrameBuffer:
+    """The buffer that a six-hour Stream Micro capture proved was needed."""
+
+    def test_a_rare_type_survives_a_flood_of_a_frequent_one(self) -> None:
+        """The reported failure: 24 slots, all of one message type.
+
+        The battery report and the frames carrying state of charge had been
+        evicted by a push arriving every two seconds.
+        """
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=4)
+
+        for i in range(1000):
+            buffer.add("property:proto/254.21", _entry(float(i)))
+            if i % 300 == 0:
+                buffer.add("property:proto/32.50", _entry(float(i), rare=True))
+
+        kept = buffer.frames()
+        rare = [frame["ts"] - _T0 for frame in kept if frame.get("rare")]
+        assert rare == [0.0, 300.0, 600.0, 900.0]
+
+    def test_a_long_recording_keeps_its_span(self) -> None:
+        """Six hours must not collapse into the last few minutes."""
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=10)
+
+        for i in range(10_800):  # 6 h of one message type every 2 s
+            buffer.add("property:proto/254.21", _entry(i * 2.0))
+
+        kept = buffer.frames()
+        assert len(kept) <= 10
+        assert kept[0]["ts"] == _T0  # the first sighting always survives
+        assert kept[-1]["ts"] == _T0 + 21_598.0  # so does the newest
+        # The reported capture spanned 199 s out of six recorded hours.
+        assert kept[-1]["ts"] - kept[0]["ts"] > 6 * 3600 - 5
+
+    def test_a_long_recording_is_covered_end_to_end(self) -> None:
+        """Every part of the window must be represented, not just the ends.
+
+        This is the assertion the first attempt at this fix failed. Dropping
+        every second frame keeps the span intact - first frame and newest
+        frame both survive - while the middle quietly empties out, because
+        the freed slots refill at the arrival rate.
+        """
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=10)
+        window = 6 * 3600.0
+
+        for i in range(10_800):
+            buffer.add("property:proto/254.21", _entry(i * 2.0))
+
+        offsets = [frame["ts"] - _T0 for frame in buffer.frames()]
+        sixths = [
+            [off for off in offsets if window * n / 6 <= off < window * (n + 1) / 6]
+            for n in range(6)
+        ]
+        assert all(sixths), f"gap in coverage: {[len(part) for part in sixths]}"
+
+    def test_a_recording_that_outruns_the_budget_many_times_over(self) -> None:
+        """A 24 h capture is the documented maximum; coverage must hold there."""
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=10)
+        window = 24 * 3600.0
+
+        for i in range(86_400):  # 24 h, one frame per second
+            buffer.add("property:proto/254.21", _entry(float(i)))
+
+        offsets = [frame["ts"] - _T0 for frame in buffer.frames()]
+        quarters = [
+            [off for off in offsets if window * n / 4 <= off < window * (n + 1) / 4]
+            for n in range(4)
+        ]
+        assert all(quarters), f"gap in coverage: {[len(part) for part in quarters]}"
+        assert len(offsets) <= 10
+
+    def test_a_burst_after_a_quiet_stretch_cannot_overshoot(self) -> None:
+        """Thousands of frames in one instant still leave the caps intact."""
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=10)
+
+        buffer.add("k", _entry(0.0))
+        for _ in range(5_000):
+            buffer.add("k", _entry(3600.0))
+
+        assert len(buffer.frames()) <= 10
+
+    def test_key_budget_is_capped(self) -> None:
+        buffer = TypedFrameBuffer(keys_max=3, per_key_max=4)
+
+        for key in range(50):
+            buffer.add(f"key{key}", _entry(1.0))
+
+        stats = buffer.stats()
+        assert stats["keys_tracked"] == 3
+        assert stats["frames_dropped_key_budget"] == 47
+
+    def test_dropped_types_are_named_not_only_counted(self) -> None:
+        """A saturated capture must say which types it turned away.
+
+        #247: a reporter's capture hit the ceiling and discarded 48 frames.
+        The question that mattered was whether one particular message was
+        among them, and the count alone could not answer it either way.
+        """
+        buffer = TypedFrameBuffer(keys_max=2, per_key_max=4)
+
+        buffer.add("kept-a", _entry(1.0))
+        buffer.add("kept-b", _entry(1.0))
+        buffer.add("turned-away", _entry(1.0))
+        buffer.add("turned-away", _entry(2.0))
+        buffer.add("also-turned-away", _entry(3.0))
+
+        stats = buffer.stats()
+        assert stats["frames_dropped_key_budget"] == 3
+        assert stats["dropped_per_key"] == {
+            "turned-away": 2,
+            "also-turned-away": 1,
+        }
+        assert stats["dropped_keys_untracked"] == 0
+
+    def test_the_dropped_name_list_is_bounded_too(self) -> None:
+        """The names come off the wire, so the list cannot grow freely.
+
+        Past the cap the count of further distinct names is kept, which is
+        what tells a reader the list is partial rather than complete.
+        """
+        buffer = TypedFrameBuffer(keys_max=2, per_key_max=4)
+
+        for key in range(50):
+            buffer.add(f"key{key}", _entry(1.0))
+
+        stats = buffer.stats()
+        assert len(stats["dropped_per_key"]) == 2
+        assert stats["dropped_keys_untracked"] == 46
+        assert stats["frames_dropped_key_budget"] == 48
+
+    def test_worst_case_stays_inside_both_caps(self) -> None:
+        keys_max, per_key_max = 3, 4
+        buffer = TypedFrameBuffer(keys_max, per_key_max)
+
+        for key in range(50):
+            for i in range(200):
+                buffer.add(f"key{key}", _entry(float(i)))
+
+        stats = buffer.stats()
+        assert len(buffer.frames()) <= keys_max * per_key_max
+        assert stats["keys_tracked"] == keys_max
+        assert all(entry["kept"] <= per_key_max for entry in stats["per_key"].values())
+
+    def test_frames_are_ordered_by_timestamp_across_buckets(self) -> None:
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=4)
+
+        buffer.add("b", _entry(30.0))
+        buffer.add("a", _entry(10.0))
+        buffer.add("b", _entry(20.0))
+
+        assert [frame["ts"] - _T0 for frame in buffer.frames()] == [10.0, 20.0, 30.0]
+
+    def test_same_timestamp_keeps_arrival_order(self) -> None:
+        """Frames captured within one clock tick must not shuffle."""
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=4)
+
+        buffer.add("a", _entry(5.0, n=1))
+        buffer.add("b", _entry(5.0, n=2))
+        buffer.add("a", _entry(5.0, n=3))
+
+        assert [frame["n"] for frame in buffer.frames()] == [1, 2, 3]
+
+    def test_stats_tell_a_quiet_device_from_a_thinned_capture(self) -> None:
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=4)
+
+        for i in range(100):
+            buffer.add("property:proto/254.21", _entry(float(i)))
+        buffer.add("property:proto/32.50", _entry(100.0))
+
+        stats = buffer.stats()
+        assert stats["frames_seen"] == 101
+        assert stats["frames_kept"] == len(buffer.frames())
+        assert stats["frames_kept"] < stats["frames_seen"]
+        assert stats["per_key"]["property:proto/254.21"]["seen"] == 100
+        assert stats["per_key"]["property:proto/32.50"] == {
+            "seen": 1,
+            "kept": 1,
+            "novel": 0,
+        }
+
+    def test_span_covers_the_capture_window_not_the_last_bucket(self) -> None:
+        """The span is what the reader uses to judge how long it ran."""
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=4)
+
+        for i in range(10_800):
+            buffer.add("property:proto/254.21", _entry(i * 2.0))
+
+        assert buffer.stats()["span_s"] == 21_598.0
+
+    def test_a_clock_step_backwards_does_not_hang(self) -> None:
+        """A single NTP correction backwards used to hang the Paho thread.
+
+        A frame older than the bucket's first one took a negative slot, and
+        _thin_to_slots only compares each frame against its predecessor, so
+        the pattern [0, -1, 0] survived every doubling of the slot width and
+        the loop in _sample widened forever. These are the coordinator's own
+        buffer settings, where the budget leaves room for two samples.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=3)
+
+        with _must_finish_within(5):
+            for offset in (0.0, -1.0, 0.5, 1.0, 1.5):
+                buffer.add("property:proto/254.21", _entry(offset))
+
+        assert len(buffer.frames()) <= 3
+
+    def test_an_oscillating_clock_does_not_hang(self) -> None:
+        """A guard, not a regression test - and labelled as one deliberately.
+
+        The proven regression detector is the single backwards step above,
+        which hangs on the unfixed code. This one does not: no oscillating
+        sequence tried against the pre-fix implementation reproduced the hang,
+        at either the coordinator's budget or the probe's. It stays because a
+        clock moving both ways repeatedly is what a machine without a real
+        time clock actually does, and a future change to the slot geometry
+        could break it where the single step still passes.
+
+        The offsets deliberately start above their own minimum: the first
+        frame sets ``first_ts``, so a sequence beginning at its lowest value
+        never produces a frame before the start of the recording at all.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=3)
+        offsets = [0.0] + [(-1.0 if i % 2 else float(i)) for i in range(1, 40)]
+        assert min(offsets) < offsets[0], "frames must fall before first_ts"
+
+        with _must_finish_within(5):
+            for offset in offsets:
+                buffer.add("property:proto/254.21", _entry(offset))
+
+        assert len(buffer.frames()) <= 3
+
+    def test_a_frame_older_than_the_first_shares_the_oldest_slot(self) -> None:
+        """The clamp itself, not just the absence of a hang.
+
+        Asserting only ordering would pass without the clamp: the point is
+        that a frame before the start of the recording lands in slot 0
+        alongside the oldest one instead of taking a slot of its own below
+        zero, which is the shape no widening can merge.
+        """
+        key = "property:proto/254.21"
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=3)
+        # Enough frames that the budget was exceeded at least once, so the
+        # bucket has a real slot width. Before that every frame gets its own
+        # slot by arrival order and the clamp has nothing to act on.
+        for offset in (0.0, 10.0, 20.0, 30.0, 40.0, 50.0):
+            buffer.add(key, _entry(offset))
+        bucket = buffer._buckets[key]
+        assert bucket.slot_s > 0, "precondition: slot geometry must be active"
+
+        assert _slot((998, _entry(0.0)), bucket) == 0
+        assert _slot((999, _entry(-5.0)), bucket) == 0
+
+    def test_an_empty_capture_reports_no_span(self) -> None:
+        assert TypedFrameBuffer(keys_max=4, per_key_max=4).stats() == {
+            "frames_seen": 0,
+            "frames_kept": 0,
+            "span_s": None,
+            "keys_tracked": 0,
+            "keys_max": 4,
+            "write_slots_reserved": 8,
+            "per_key_max": 4,
+            "frames_dropped_key_budget": 0,
+            "dropped_per_key": {},
+            "dropped_keys_untracked": 0,
+            "write_keys_evicted": {},
+            "per_key": {},
+        }
+
+
+class TestPowerOceanGetAllSurvivesTheBudget:
+    """The size that raised the bundle cap, pinned against the real path.
+
+    A PowerOcean answers a full-state request with one bundled frame. The
+    measured one (#225) is 2906 B, against a cap that stood at 2048, and the
+    eight message types in its tail reached the diagnostics download as names
+    with no bytes behind them.
+
+    The frame itself cannot become a fixture - the serial sits in the envelope
+    of a live unit. What is reproduced here is its shape and its size, driven
+    through the same two functions the ingest path calls.
+    """
+
+    _OBSERVED_GET_ALL_BYTES = 2906
+
+    # Offset of the second serial, chosen to sit above the budget this
+    # commit replaced. Bytes past 2048 are the ones a PowerOcean download
+    # never contained before, so they are the ones whose masking was never
+    # witnessed by any test.
+    _TAIL_SERIAL_AT = 2500
+
+    def _bundle(self, size: int, sn: str) -> bytes:
+        """A multi-command frame of exactly `size` bytes, serial included.
+
+        The serial appears twice: once in the head, where every budget ever
+        reached, and once in the tail that only the raised budget exports.
+        """
+        head = b"\x0a" + b"\x00" * 40 + sn.encode()
+        body = bytearray(b"\x2d" + b"\x00" * (size - len(head) - 1))
+        at = self._TAIL_SERIAL_AT - len(head)
+        body[at : at + len(sn)] = sn.encode()
+        return head + bytes(body)
+
+    def test_the_measured_get_all_is_stored_whole(self) -> None:
+        sn = "HJ31TEST00000001"
+        payload = self._bundle(self._OBSERVED_GET_ALL_BYTES, sn)
+        budget = frame_budget(
+            [{"cmd_func": 96, "cmd_id": 1}, {"cmd_func": 96, "cmd_id": 8}],
+            RAW_FRAME_MAX_BYTES,
+            RAW_FRAME_BUNDLE_MAX_BYTES,
+            RAW_FRAME_BUNDLE_HARD_CAP,
+        )
+
+        entry = build_frame_entry("/t", payload, [sn], budget)
+
+        assert "truncated" not in entry
+        assert entry["size"] == self._OBSERVED_GET_ALL_BYTES
+        assert len(bytes.fromhex(entry["hex"])) == self._OBSERVED_GET_ALL_BYTES
+
+    def test_the_serial_is_still_masked_in_the_newly_exported_tail(self) -> None:
+        """The bytes this commit newly exports are the untested ones.
+
+        Masking runs over the whole payload before truncation, so a serial in
+        the head is masked under any budget - an assertion about it would have
+        passed before this change and proves nothing about it. The serial that
+        matters sits past 2048, in the region a PowerOcean download never
+        carried until the budget was raised. This repo has shipped two serial
+        leaks into downloads users attach to public issues; both were in a
+        region nobody was asserting over.
+        """
+        sn = "HJ31TEST00000001"
+        payload = self._bundle(self._OBSERVED_GET_ALL_BYTES, sn)
+        assert payload.count(sn.encode()) == 2
+        assert payload.index(sn.encode(), 2048) > 2048
+
+        entry = build_frame_entry("/t", payload, [sn], RAW_FRAME_BUNDLE_MAX_BYTES)
+
+        stored = bytes.fromhex(entry["hex"])
+        assert len(stored) == self._OBSERVED_GET_ALL_BYTES
+        assert sn.encode() not in stored
+
+    def test_a_single_push_is_not_given_the_bundle_budget(self) -> None:
+        """The split still holds: one command, one message budget."""
+        budget = frame_budget(
+            [{"cmd_func": 96, "cmd_id": 8}],
+            RAW_FRAME_MAX_BYTES,
+            RAW_FRAME_BUNDLE_MAX_BYTES,
+            RAW_FRAME_BUNDLE_HARD_CAP,
+        )
+
+        assert budget == RAW_FRAME_MAX_BYTES
+
+
+class TestNovelReadingsSurviveThinning:
+    """The frame a capture was opened for must not be thinned away.
+
+    Shaped after the recording on #284, and deliberately not claiming what
+    that recording shows. An owner changed a power limit in the vendor app
+    while the raw capture ran. In his file the configuration block appears
+    only in the device's answers to a get - five of them, all kept, all
+    before the change - and never once on the incremental push bucket, whose
+    118 frames were thinned to 8. So the file does not show a frame carrying
+    the new value being dropped. What it shows is that the value never
+    reached the recording at all, and either route to that is what these
+    tests cover: a first appearance on a bucket, and a change to a value the
+    bucket had been carrying unchanged.
+    """
+
+    # From the capture: frames and span of the incremental push bucket.
+    _FRAMES = 118
+    _SPAN_S = 213.0
+    _CHANGE_AT = 127.0
+
+    # Timestamps are wall clock, so a stored offset does not come back out
+    # of `ts - _T0` bit for bit. Frames are seconds apart and the tolerance
+    # is microseconds, so it cannot make a neighbouring frame match.
+    _TS_EPSILON = 1e-6
+
+    def _kept_at(self, buffer: TypedFrameBuffer, offset: float) -> bool:
+        """Return whether the frame recorded at `offset` survived."""
+        step = self._SPAN_S / self._FRAMES
+        return any(
+            offset - self._TS_EPSILON <= (entry["ts"] - _T0) < offset + step
+            for entry in buffer.frames()
+        )
+
+    def _telemetry(self, i: int) -> dict[str, float]:
+        """Readings that move on every frame, as live power does."""
+        return {"grid_w": 100.0 + i, "soc_pct": 50.0 + (i % 7)}
+
+    def _run(self, buffer: TypedFrameBuffer, *, config_from: int = 0) -> None:
+        """Replay the capture with a limit that changes partway through.
+
+        `config_from` is the frame at which the configuration block starts
+        riding the push, so the same replay covers both the case where it
+        was there all along and the case where it appears mid-recording.
+        """
+        step = self._SPAN_S / self._FRAMES
+        for i in range(self._FRAMES):
+            at = i * step
+            readings = self._telemetry(i)
+            if i >= config_from:
+                readings["max_grid_input_power_w"] = (
+                    2500 if at >= self._CHANGE_AT else 1200
+                )
+            buffer.add("property:proto/254.39", _entry(at), readings=readings)
+
+    def test_a_changed_setting_is_kept(self) -> None:
+        """The #284 question: the limit moves, on a key already being carried.
+
+        This is the case a first-appearance rule does not catch, and the one
+        that matters - the first appearance of that key carries the *old*
+        value.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        self._run(buffer)
+
+        step = self._SPAN_S / self._FRAMES
+        # The first frame at or after the change, which is the one that
+        # carried the new value.
+        changed_at = -(-self._CHANGE_AT // step) * step
+        assert self._kept_at(buffer, changed_at)
+
+    def test_a_setting_appearing_mid_recording_is_kept(self) -> None:
+        """The other route to the same miss: the block starts arriving late."""
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+        appears_at = 60
+
+        self._run(buffer, config_from=appears_at)
+
+        assert self._kept_at(buffer, appears_at * self._SPAN_S / self._FRAMES)
+
+    def test_live_telemetry_claims_no_slots(self) -> None:
+        """Power moves on every frame and must never count as new.
+
+        Otherwise every frame is novel, the cap keeps only the last four,
+        and the mechanism becomes a second ring buffer.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        for i in range(self._FRAMES):
+            buffer.add(
+                "property:proto/254.39", _entry(float(i)), readings=self._telemetry(i)
+            )
+
+        # One: the first frame, where every key appears for the first time.
+        assert buffer.stats()["per_key"]["property:proto/254.39"]["novel"] == 1
+
+    def test_the_recording_keeps_its_shape(self) -> None:
+        """A novelty slot must not buy its frame out of the thinned history.
+
+        The sampling exists so a long capture still has a middle. Novel
+        frames are kept on top of the per-type budget rather than out of it,
+        and there are at most a handful of them.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        self._run(buffer)
+
+        stats = buffer.stats()["per_key"]["property:proto/254.39"]
+        assert stats["seen"] == self._FRAMES
+        assert stats["kept"] <= 10 + 4
+        kept = sorted(entry["ts"] - _T0 for entry in buffer.frames())
+        assert kept[0] == 0.0
+        assert kept[-1] > self._SPAN_S * 0.9
+
+    def test_a_repeated_reading_is_not_novel(self) -> None:
+        """Novelty is a change, not every appearance."""
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        for i in range(50):
+            buffer.add(
+                "property:proto/254.39", _entry(float(i)), readings={"soc_pct": 50.0}
+            )
+
+        assert buffer.stats()["per_key"]["property:proto/254.39"]["novel"] == 1
+
+    def test_a_change_before_the_value_settled_is_not_novel(self) -> None:
+        """A reading has to hold still first, or telemetry qualifies too.
+
+        Four frames of one value then a change is inside the run length and
+        must not claim a slot; the boundary is worth pinning because it is
+        what separates a setting from a fast-moving reading.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        for i in range(4):
+            buffer.add("property:proto/254.39", _entry(float(i)), readings={"x": 1.0})
+        buffer.add("property:proto/254.39", _entry(4.0), readings={"x": 2.0})
+
+        assert buffer.stats()["per_key"]["property:proto/254.39"]["novel"] == 1
+
+    def test_novelty_is_judged_per_message_type(self) -> None:
+        """A field in a full dump says nothing about whether it is pushed.
+
+        That a get answered with a configuration block is not evidence the
+        device ever reports it on its own, and the second is the question a
+        control needs answered. So the buckets do not share what they have
+        seen.
+        """
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        buffer.add(
+            "get_reply:proto/254.39",
+            _entry(0.0),
+            readings={"max_grid_input_power_w": 1200},
+        )
+        buffer.add(
+            "property:proto/254.39",
+            _entry(1.0),
+            readings={"max_grid_input_power_w": 1200},
+        )
+
+        per_key = buffer.stats()["per_key"]
+        assert per_key["get_reply:proto/254.39"]["novel"] == 1
+        assert per_key["property:proto/254.39"]["novel"] == 1
+
+    def test_a_frame_with_no_readings_is_sampled_as_before(self) -> None:
+        """A write or a reply carries no parsed keys and claims no slot."""
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        for i in range(50):
+            buffer.add("set:proto/254.38", _entry(float(i)))
+
+        assert buffer.stats()["per_key"]["set:proto/254.38"]["novel"] == 0
+
+    def test_an_unhashable_reading_does_not_break_the_capture(self) -> None:
+        """Parsers emit lists too, and capture must never affect ingest."""
+        buffer = TypedFrameBuffer(keys_max=20, per_key_max=10)
+
+        for i in range(10):
+            buffer.add(
+                "property:proto/254.39", _entry(float(i)), readings={"packs": [1, 2]}
+            )
+
+        assert buffer.stats()["per_key"]["property:proto/254.39"]["seen"] == 10
+
+
+class TestWriteSlotReserve:
+    """Writes keep a place of their own, whatever telemetry arrived first.
+
+    Rebuilt from the 2026-08-27 PowerOcean capture (#247): 20 of 20 type
+    slots taken by telemetry, and every user write of the session evicted
+    with nothing kept but a name and a count.
+    """
+
+    def test_a_write_gets_in_after_telemetry_filled_the_budget(self) -> None:
+        buffer = TypedFrameBuffer(keys_max=3, per_key_max=4, write_reserve=2)
+
+        for i in range(3):
+            buffer.add(f"property:proto/96.{i}", _entry(float(i)))
+        # The budget is full before the user touches anything.
+        assert buffer.stats()["keys_tracked"] == 3
+
+        buffer.add("set:proto/241.102", _entry(10.0, write=True))
+        buffer.add("set_reply:proto/241.102", _entry(11.0, write=True))
+
+        stats = buffer.stats()
+        assert "set:proto/241.102" in stats["per_key"]
+        assert "set_reply:proto/241.102" in stats["per_key"]
+        assert stats["dropped_per_key"] == {}
+        assert [f["ts"] - _T0 for f in buffer.frames() if f.get("write")] == [
+            10.0,
+            11.0,
+        ]
+
+    def test_the_reserve_does_not_come_out_of_the_telemetry_budget(self) -> None:
+        """The guarantee this buffer already had must survive the new one.
+
+        Taking the reserve out of `keys_max` would have starved telemetry -
+        the first shape of this fix did exactly that and broke eleven tests.
+        """
+        buffer = TypedFrameBuffer(keys_max=4, per_key_max=4, write_reserve=8)
+
+        for i in range(4):
+            buffer.add(f"property:proto/96.{i}", _entry(float(i)))
+
+        assert buffer.stats()["keys_tracked"] == 4
+        assert buffer.stats()["dropped_per_key"] == {}
+
+    def test_the_write_reserve_is_itself_bounded(self) -> None:
+        buffer = TypedFrameBuffer(keys_max=2, per_key_max=4, write_reserve=1)
+
+        buffer.add("set:proto/241.100", _entry(1.0, write=True))
+        buffer.add("set:proto/241.102", _entry(2.0, write=True))
+
+        stats = buffer.stats()
+        assert "set:proto/241.100" in stats["per_key"]
+        assert stats["dropped_per_key"] == {"set:proto/241.102": 1}
+
+    def test_a_periodic_write_yields_its_slot_to_a_rare_one(self) -> None:
+        """Rebuilt from the 2026-08-28 beta.24 capture (#247).
+
+        The reserve was first-come among writes, and the app's own periodic
+        write (96/97, 1157 frames in six hours) had taken a slot before the
+        reporter touched anything. His mode changes (241/102, two frames)
+        and every reply were dropped - the second capture in a row that lost
+        exactly what it was opened for.
+        """
+        buffer = TypedFrameBuffer(keys_max=2, per_key_max=4, write_reserve=4)
+
+        for i in range(200):
+            buffer.add("set:proto/96.97", _entry(float(i), write=True))
+        # A second periodic write, less busy: the busiest must be the one
+        # to go, not the newest eligible one.
+        for i in range(30):
+            buffer.add("set:proto/96.98", _entry(250.0 + i, write=True))
+        buffer.add("set:proto/96.22", _entry(300.0, write=True))
+        buffer.add("set_reply:proto/96.22", _entry(301.0, write=True))
+        assert buffer.stats()["keys_tracked"] == 4
+
+        buffer.add("set:proto/241.102", _entry(400.0, write=True))
+        buffer.add("set:proto/241.102", _entry(401.0, write=True))
+
+        stats = buffer.stats()
+        assert "set:proto/241.102" in stats["per_key"]
+        assert stats["per_key"]["set:proto/241.102"]["seen"] == 2
+        # The busiest periodic one is gone from the buckets but not from the
+        # record; the less busy periodic one and the genuine writes stay.
+        assert "set:proto/96.97" not in stats["per_key"]
+        assert "set:proto/96.98" in stats["per_key"]
+        assert "set:proto/96.22" in stats["per_key"]
+        assert "set_reply:proto/96.22" in stats["per_key"]
+        assert stats["write_keys_evicted"] == {"set:proto/96.97": 200}
+        assert stats["dropped_per_key"] == {"set:proto/96.97": 200}
+        # Nothing is lost from the count: 200 + 30 + 2 + 2 added.
+        assert stats["frames_seen"] == 234
+        assert stats["frames_dropped_key_budget"] == 200
+
+    def test_an_evicted_periodic_write_does_not_buy_its_slot_back(self) -> None:
+        """The write evicted for repeating is the one certain to come back.
+
+        Eighteen seconds after 96/97 lost its slot its next frame arrived as
+        a "new" write type and, in the first shape of this rule, evicted
+        the next busiest write to retake the slot - spending two evictions
+        per rare newcomer. It stays out and is counted from then on.
+        """
+        buffer = TypedFrameBuffer(keys_max=2, per_key_max=4, write_reserve=2)
+
+        for i in range(200):
+            buffer.add("set:proto/96.97", _entry(float(i), write=True))
+        for i in range(30):
+            buffer.add("set:proto/96.98", _entry(250.0 + i, write=True))
+        buffer.add("set:proto/241.102", _entry(400.0, write=True))
+        assert buffer.stats()["write_keys_evicted"] == {"set:proto/96.97": 200}
+
+        for i in range(30):
+            buffer.add("set:proto/96.97", _entry(500.0 + i, write=True))
+
+        stats = buffer.stats()
+        assert "set:proto/96.97" not in stats["per_key"]
+        assert set(stats["per_key"]) >= {"set:proto/96.98", "set:proto/241.102"}
+        assert stats["write_keys_evicted"] == {"set:proto/96.97": 200}
+        assert stats["dropped_per_key"] == {"set:proto/96.97": 230}
+        assert stats["frames_seen"] == 261
+
+    def test_a_genuine_write_is_never_evicted_for_another(self) -> None:
+        """Only a write that repeats like telemetry gives way.
+
+        Four presses on a button are a settings session, not a heartbeat;
+        with every slot held by such writes the reserve stays bounded the
+        way it was, and the newcomer is counted rather than admitted.
+        """
+        buffer = TypedFrameBuffer(keys_max=2, per_key_max=4, write_reserve=2)
+
+        for i in range(4):
+            buffer.add("set:proto/241.100", _entry(float(i), write=True))
+        for i in range(4):
+            buffer.add("set_reply:proto/241.100", _entry(10.0 + i, write=True))
+
+        buffer.add("set:proto/241.102", _entry(20.0, write=True))
+
+        stats = buffer.stats()
+        assert set(stats["per_key"]) == {"set:proto/241.100", "set_reply:proto/241.100"}
+        assert stats["dropped_per_key"] == {"set:proto/241.102": 1}
+        assert stats["write_keys_evicted"] == {}
+
+    def test_the_download_names_the_reserve(self) -> None:
+        """A reader must be able to date a capture by its own stats block."""
+        assert (
+            TypedFrameBuffer(keys_max=4, per_key_max=4).stats()["write_slots_reserved"]
+            == WRITE_CLASS_RESERVE
+        )
+
+
+class TestCoordinateStringMasking:
+    """A string field that carries an installation address with coordinates.
+
+    A Smart Home Panel 2 reports one in its plain settings frame: country,
+    town, an empty part, then longitude and latitude with fourteen decimals
+    (#464). The place below is made up. Every expectation here is the whole
+    pdata, not a substring, so a mask that reaches a tag or a length byte
+    shows as a difference and not as a pass.
+    """
+
+    PAIR = b"-71.12345678901234,42.12345678901234"
+    ADDRESS = b"United States Springfield,," + PAIR
+    # Shaped like what the device sends: a county between the town and the
+    # empty part makes the length 78, which is the letter `N`.
+    LONG_ADDRESS = b"United States Springfield Hampden County,," + PAIR
+
+    @staticmethod
+    def _pdata(field: int, address: bytes) -> bytes:
+        return (
+            encode_field_varint(1, 5)
+            + encode_field_bytes(field, address)
+            + encode_field_varint(2, 9)
+        )
+
+    @staticmethod
+    def _masked(field: int, address: bytes) -> bytes:
+        return (
+            encode_field_varint(1, 5)
+            + encode_field_bytes(field, b"X" * len(address))
+            + encode_field_varint(2, 9)
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "tag_kind"),
+        [(3, "control byte"), (7, "printable non-letter"), (8, "letter")],
+    )
+    def test_the_address_goes_and_the_frame_still_parses(
+        self, field: int, tag_kind: str
+    ) -> None:
+        # The length is 63, `?`: printable in all three, with a tag of
+        # 0x1a, `:` and `B`. A mask that starts at the first printable byte
+        # or the first letter would take the tag of the last one.
+        assert len(self.ADDRESS) == 63
+        pdata = self._pdata(field, self.ADDRESS)
+        frame = _header(12, 1, pdata)
+
+        out = sanitize_frame(frame, [])
+
+        assert len(out) == len(frame), tag_kind
+        for leaked in (b"Springfield", b"United", b"12345678901234"):
+            assert leaked not in out, tag_kind
+        header = _decode_first_header(out)
+        assert header["pdata"] == self._masked(field, self.ADDRESS).hex(), tag_kind
+        assert (header["cmd_func"], header["cmd_id"]) == (12, 1)
+
+    def test_a_length_byte_and_tag_that_are_letters_survive(self) -> None:
+        # Length 78 is `N` and field 8 is `B`: both letters, both in front of
+        # the string, neither part of the address.
+        assert len(self.LONG_ADDRESS) == ord("N")
+        pdata = self._pdata(8, self.LONG_ADDRESS)
+        frame = _header(12, 1, pdata)
+
+        out = sanitize_frame(frame, [])
+
+        assert _decode_first_header(out)["pdata"] == (
+            self._masked(8, self.LONG_ADDRESS).hex()
+        )
+
+    def test_the_address_under_the_device_mask_goes_too(self) -> None:
+        # enc_type 1 with seq 7: the string is XOR-ed on the wire, so no
+        # plain pass can see it; the region is un-XOR-ed, masked and put back.
+        pdata = self._pdata(8, self.ADDRESS)
+        frame = _enc_header(12, 1, pdata_plain=pdata, enc_type=1, seq=7)
+        assert self.ADDRESS not in frame
+
+        out = sanitize_frame(frame, [])
+
+        assert len(out) == len(frame)
+        header = _decode_first_header(out)
+        assert header["seq"] == 7
+        assert _unmask_pdata(header) == self._masked(8, self.ADDRESS)
+
+    def test_a_decimal_that_is_not_a_pair_is_left_alone(self) -> None:
+        # One long decimal, two readings of one place each, a pair the comma
+        # does not join, and a firmware string: none of them is a position.
+        pdata = (
+            encode_field_bytes(2, b"offset -70.65")
+            + encode_field_bytes(3, b"V1.2,3.4")
+            + encode_field_bytes(4, b"lon -71.12345678901234 lat 42.12345678901234")
+            + encode_field_bytes(5, b"V1.2.3.4567")
+        )
+        frame = _header(12, 1, pdata)
+
+        assert sanitize_frame(frame, []) == frame
+
+    @pytest.mark.parametrize("key", [7, 0x1E])
+    @pytest.mark.parametrize("address", [ADDRESS, LONG_ADDRESS], ids=["63", "78"])
+    def test_sanitizing_twice_changes_nothing(self, key: int, address: bytes) -> None:
+        # Key 0x1e is the one for which `X ^ key` is `F`, alphanumeric on the
+        # wire: the plain passes read the masked region as a serial there. The
+        # 78 is `N` behind a field-8 tag `B`: a masked field with two
+        # alphanumeric bytes stuck to it, which the serial pass used to take
+        # into its run on the second go.
+        pdata = self._pdata(8, address)
+        for frame in (
+            _header(12, 1, pdata),
+            _enc_header(12, 1, pdata_plain=pdata, enc_type=1, seq=key),
+        ):
+            once = sanitize_frame(frame, [])
+            assert once != frame
+            assert sanitize_frame(once, []) == once
+
+    def test_a_frame_cut_off_inside_the_string_is_masked_from_its_first_letter(
+        self,
+    ) -> None:
+        # The walk cannot place a field whose length runs past the frame. The
+        # fallback masks from the first letter of the text through the pair;
+        # the tag `:` and the length `@` in front of it are not letters.
+        whole = encode_field_bytes(7, self.ADDRESS + b"!")
+        frame = whole[: 2 + len(self.ADDRESS)]
+        assert frame[1] == len(self.ADDRESS) + 1  # claims one byte more
+
+        out = sanitize_frame(frame, [])
+
+        assert out == frame[:2] + b"X" * len(self.ADDRESS)
+
+    def test_a_pair_in_text_is_masked_without_its_surroundings(self) -> None:
+        # Not protobuf at all: the walk finds nothing, and the fallback must
+        # stop at the JSON structure instead of running back to the first
+        # letter of the frame.
+        text = b'{"name":"panel","gps":[' + self.PAIR + b"]}"
+
+        out = sanitize_frame(text, [])
+
+        assert out == b'{"name":"panel","gps":[' + b"X" * len(self.PAIR) + b"]}"
+
+    # A tag that spells a digit or a capital, in the three shapes the serial
+    # pass reads as part of a run: field 6 varint is `0`, field 8 fixed64 is
+    # `A`, and field 9 fixed32 is `M` with four alphanumeric bytes behind it.
+    _TAILS = [
+        pytest.param(encode_field_varint(6, 5), id="tag-0"),
+        pytest.param(b"A" + b"\x01" * 8, id="tag-A"),
+        pytest.param(b"M" + b"AB12", id="tag-M"),
+    ]
+    LAT_FIRST = b"United States Springfield,,42.12345678901234, -71.12345678901234"
+
+    @pytest.mark.parametrize("key", [None, 7], ids=["plain", "xor"])
+    @pytest.mark.parametrize(
+        "address", [ADDRESS, LAT_FIRST], ids=["lon-lat", "lat-lon"]
+    )
+    @pytest.mark.parametrize("tail", _TAILS)
+    def test_an_address_followed_by_an_alphanumeric_tag_goes_whole(
+        self, tail: bytes, address: bytes, key: int | None
+    ) -> None:
+        # The fourteen decimals plus that tag byte are a serial-shaped run, and
+        # the serial pass used to mask it first and break the pair, leaving the
+        # country, the town and the first coordinate in clear.
+        pdata = encode_field_varint(1, 5) + encode_field_bytes(8, address) + tail
+        want = (
+            encode_field_varint(1, 5)
+            + encode_field_bytes(8, b"X" * len(address))
+            + tail
+        )
+        if key is None:
+            frame = _header(12, 1, pdata)
+        else:
+            frame = _enc_header(12, 1, pdata_plain=pdata, enc_type=1, seq=key)
+
+        out = sanitize_frame(frame, [])
+
+        header = _decode_first_header(out)
+        got = bytes.fromhex(header["pdata"]) if key is None else _unmask_pdata(header)
+        assert got == want
+        assert (header["cmd_func"], header["cmd_id"]) == (12, 1)
+        assert len(out) == len(frame)
+
+    def test_a_pair_that_runs_past_its_field_does_not_reach_the_tags(self) -> None:
+        # Ten decimals and a next tag of `8`: the pair match takes the tag for
+        # one more digit and ends a byte past the field. The pair is still in
+        # the field, and the tag `B`, the length `C` and that next tag are not
+        # part of it. The fallback used to mask all three.
+        address = b"United States Springfield Hampden Cty,,-71.1234567890,42.1234567890"
+        assert chr(len(address)) == "C"
+        tail = encode_field_varint(7, 5)
+        assert tail[:1] == b"8"
+        pdata = encode_field_varint(1, 5) + encode_field_bytes(8, address) + tail
+        want = (
+            encode_field_varint(1, 5)
+            + encode_field_bytes(8, b"X" * len(address))
+            + tail
+        )
+
+        out = sanitize_frame(_header(12, 1, pdata), [])
+
+        header = _decode_first_header(out)
+        assert header["pdata"] == want.hex()
+        assert (header["cmd_func"], header["cmd_id"]) == (12, 1)
+
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            b"-71.12345678901234,42.12345678901234",
+            b"-71.1234567,  42.1234567",
+            b"-71.1234567,\t42.1234567",
+            b"-71.1234567;42.1234567",
+            b"-71.1234567; 42.1234567",
+            b"-71,1234567;42,1234567",
+            b"-71.123,42.123",
+            b"-71.12,42.12",
+        ],
+        ids=[
+            "fourteen",
+            "two-spaces",
+            "tab",
+            "semicolon",
+            "semicolon-space",
+            "decimal-commas",
+            "three-places",
+            "two-places",
+        ],
+    )
+    def test_the_address_goes_whatever_the_pair_looks_like(self, pair: bytes) -> None:
+        # Fewer places name a block or a neighbourhood, and any other
+        # separator is still a position: the field must not stay in clear
+        # because the pair is written another way.
+        address = b"United States Springfield,," + pair
+        pdata = self._pdata(8, address)
+        out = sanitize_frame(_header(12, 1, pdata), [])
+        assert _decode_first_header(out)["pdata"] == self._masked(8, address).hex()
+
+    @pytest.mark.parametrize("key", [None, 220], ids=["plain", "xor"])
+    def test_a_town_in_a_string_that_reads_as_a_message_goes_too(
+        self, key: int | None
+    ) -> None:
+        # Field 16, the text of a made-up address, happens to read as a
+        # message whose last field holds the pair. Masking only that field left
+        # the country and the town in front of it.
+        address = b"Espa\xc3\xb1a qnuJrWaR Bezirk,,-55.4781023, 64.19257583"
+        inner = _delimited_fields(address, 0, len(address), strict=True)
+        assert inner and any(_COORDINATE_PAIR.search(address, s, e) for s, e in inner)
+        pdata = self._pdata(16, address)
+        if key is None:
+            frame = _header(12, 1, pdata)
+        else:
+            frame = _enc_header(12, 1, pdata_plain=pdata, enc_type=1, seq=key)
+
+        out = sanitize_frame(frame, [])
+
+        header = _decode_first_header(out)
+        got = bytes.fromhex(header["pdata"]) if key is None else _unmask_pdata(header)
+        assert got == self._masked(16, address)
+
+    def test_a_message_of_one_printable_field_keeps_its_tag_and_length(self) -> None:
+        # Field 8 is `B` and a length of 63 is `?`: a pdata that is only that
+        # field is printable end to end and still no text. It has no varint
+        # or fixed-width field in it, which is what a text string that parses
+        # as a message always has.
+        pdata = encode_field_bytes(8, self.ADDRESS)
+        out = sanitize_frame(_header(12, 1, pdata), [])
+        header = _decode_first_header(out)
+        assert header["pdata"] == encode_field_bytes(8, b"X" * 63).hex()
+        assert (header["cmd_func"], header["cmd_id"]) == (12, 1)
+
+    def test_a_masked_field_is_not_read_as_an_identifier_with_its_length_byte(
+        self,
+    ) -> None:
+        # A varint whose value byte is 0x2a ends in the bits of a
+        # length-delimited tag, so the identifier walk reads the next byte, the
+        # tag 0x12 (18), as a length: eighteen bytes from the length byte `N`.
+        # With the field already masked those are `N` and seventeen `X`, all
+        # in the identifier alphabet, and `N` was masked too.
+        assert len(self.LONG_ADDRESS) == ord("N")
+        pdata = encode_field_varint(1, 0x2A) + encode_field_bytes(2, self.LONG_ADDRESS)
+        want = encode_field_varint(1, 0x2A) + encode_field_bytes(
+            2, b"X" * len(self.LONG_ADDRESS)
+        )
+
+        out = sanitize_frame(_header(12, 1, pdata), [])
+
+        assert _decode_first_header(out)["pdata"] == want.hex()
+
+    def test_an_escaped_character_does_not_cut_the_address_short(self) -> None:
+        # `json.dumps` writes a town's `ue` as `\u00fc`; the backslash must not
+        # end the text, or the country in front of it stays.
+        before = b'{"address":"'
+        text = b"Deutschland M\\u00fcnchen,,11.57,48.13"
+        out = sanitize_frame(before + text + b'"}', [])
+        assert out == before + b"X" * len(text) + b'"}'
+
+    def test_text_after_the_pair_in_the_same_string_goes_too(self) -> None:
+        before = b'{"address":"'
+        text = b"Springfield," + self.PAIR + b",12 Main Street"
+        out = sanitize_frame(before + text + b'"}', [])
+        assert out == before + b"X" * len(text) + b'"}'
+
+    def test_a_pdata_that_does_not_read_exactly_is_masked_whole(self) -> None:
+        # One stray byte after an otherwise valid pdata: the message cannot be
+        # read exactly, so every field of it goes, the other fields too. That
+        # leaks nothing; the alternative, reading the string's bytes as
+        # fields, is how a town gets left behind.
+        pdata = self._pdata(8, self.ADDRESS) + b"\x00"
+        out = sanitize_frame(_header(12, 1, pdata), [])
+        header = _decode_first_header(out)
+        assert header["pdata"] == (b"X" * len(pdata)).hex()
+        assert (header["cmd_func"], header["cmd_id"]) == (12, 1)
+
+
+class TestNullPaddingUnderTheMask:
+    """Zero padding whose wire bytes spell a serial (#464).
+
+    A bytes field of nulls under key 0x38 is `8` repeated on the wire, and
+    twenty of them match the serial shape. The Smart Home Panel 2 sends one
+    in header 254.32 (enc_type 1, seq low byte 0x38). The plaintext has
+    nothing to mask, so the only damage is the plain pass overwriting the
+    wire run, which decodes to 0x60 instead of the nulls.
+    """
+
+    KEY = 0x38
+
+    def _padded(self, tail: bytes) -> bytes:
+        pdata = encode_field_varint(2, 9) + encode_field_bytes(3, b"\x00" * 20) + tail
+        return _enc_header(254, 32, pdata_plain=pdata, enc_type=1, seq=self.KEY)
+
+    @pytest.mark.parametrize(
+        ("tail", "on_the_wire"),
+        [
+            # The next tag spells `(`: the run is exactly the padding.
+            (encode_field_varint(2, 9), b"8" * 20),
+            # The next tag is 0x08, which spells `0`: the wire run reaches
+            # one byte into the next field, as the length byte can on a
+            # device frame.
+            (encode_field_varint(1, 5), b"8" * 20 + b"0"),
+        ],
+    )
+    def test_twenty_nulls_that_spell_a_serial_come_back_unchanged(
+        self, tail: bytes, on_the_wire: bytes
+    ) -> None:
+        frame = self._padded(tail)
+        assert on_the_wire in frame  # premise: the serial shape is on the wire
+
+        assert sanitize_frame(frame, []) == frame
+
+    def test_padding_beside_a_masked_serial_survives_a_second_pass(self) -> None:
+        # The serial makes the first pass take the other branch (rewrite the
+        # plaintext, XOR it back); the second pass finds only masked bytes and
+        # padding, and that is the path that has to give the padding back.
+        pdata = (
+            encode_field_bytes(3, b"\x00" * 20)
+            + encode_field_bytes(4, b"HD31TESTPAD00001")
+            + encode_field_varint(2, 9)
+        )
+        frame = _enc_header(254, 32, pdata_plain=pdata, enc_type=1, seq=self.KEY)
+
+        once = sanitize_frame(frame, [])
+
+        assert once != frame
+        assert b"HD31TESTPAD00001" not in _unmask_pdata(_decode_first_header(once))
+        assert b"\x00" * 20 in _unmask_pdata(_decode_first_header(once))
+        assert sanitize_frame(once, []) == once
+
+    def test_a_plain_serial_beside_sixteen_key_bytes_stays_masked(self) -> None:
+        # A header that declares key 0x38 but sends plain bytes. Sixteen `8`
+        # XOR to nulls, the serial in front XORs to sixteen foreign bytes,
+        # which is more than the eleven the padding shape allows on a side.
+        serial = b"HD31TESTPLAIN001"
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))  # enc_type = XOR, declared
+        header.extend(encode_field_varint(14, self.KEY))  # seq
+        header.extend(encode_field_bytes(1, serial + bytes([self.KEY]) * 16))
+        frame = encode_field_bytes(1, bytes(header))
+
+        sanitized = sanitize_frame(frame, [])
+
+        assert serial not in sanitized
+        assert b"X" * 32 in sanitized
+
+    def test_a_plain_serial_with_a_short_key_run_stays_masked(self) -> None:
+        # Fifteen wire bytes: ten foreign and five that XOR to nulls. Few
+        # enough foreign bytes for the margin, too few nulls for the floor.
+        wire = b"HD31TESTPL" + bytes([self.KEY]) * 5
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))
+        header.extend(encode_field_varint(14, self.KEY))
+        header.extend(encode_field_bytes(1, wire))
+        frame = encode_field_bytes(1, bytes(header))
+
+        sanitized = sanitize_frame(frame, [])
+
+        assert wire not in sanitized
+        assert b"X" * 15 in sanitized
+
+    def test_a_serial_split_by_a_literal_mask_byte_stays_masked(self) -> None:
+        # A header that declares key 0x30 but sends plain bytes. The `X` in the
+        # serial is not rewritten by the mask, so the rewritten span after it
+        # is eleven serial characters and twelve key bytes: a margin of eleven
+        # took that for padding and handed the eleven back.
+        key = 0x30
+        wire = b"HJ31XABCDEFGHIJK" + bytes([key]) * 12
+        header = bytearray()
+        header.extend(encode_field_varint(6, 1))  # enc_type = XOR, declared
+        header.extend(encode_field_varint(14, key))  # seq
+        header.extend(encode_field_bytes(1, wire))
+        frame = encode_field_bytes(1, bytes(header))
+
+        sanitized = sanitize_frame(frame, [])
+
+        assert b"ABCDEFGHIJK" not in sanitized
+        assert b"HJ31" not in sanitized

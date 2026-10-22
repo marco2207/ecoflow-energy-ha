@@ -1,0 +1,3449 @@
+"""Tests for the EcoFlow Energy config flow."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import aiohttp
+import pytest
+from homeassistant import config_entries
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigFlowContext,
+    ConfigFlowResult,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.ecoflow_energy.const import (
+    AUTH_METHOD_APP,
+    CONF_ACCESS_KEY,
+    CONF_AUTH_METHOD,
+    CONF_DEVICES,
+    CONF_EMAIL,
+    CONF_MODE,
+    CONF_PASSWORD,
+    CONF_RAW_CAPTURE,
+    CONF_RAW_CAPTURE_UNTIL,
+    CONF_SECRET_KEY,
+    CONF_USER_ID,
+    DOMAIN,
+    MODE_ENHANCED,
+    MODE_STANDARD,
+    RAW_CAPTURE_DURATION_S,
+)
+
+from .conftest import (  # noqa: F401
+    MOCK_DELTA_DEVICE,
+    MOCK_MQTT_CREDENTIALS,
+    MOCK_POWEROCEAN_DEVICE,
+)
+
+# Fixed wall-clock reference - never derive a deadline from the real clock.
+FIXED_NOW = 1_800_000_000.0
+
+POWERSTREAM_DEVICE = {
+    "sn": "HW51TEST00000001",
+    "name": "PowerStream",
+    "product_name": "PowerStream",
+    "device_type": "powerstream",
+    "online": 1,
+}
+
+
+# ===========================================================================
+# Helper: advance through mode selection
+# ===========================================================================
+
+
+async def _select_mode(hass: HomeAssistant, mode: str = MODE_STANDARD):
+    """Init the config flow and select connection mode, return the result."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_MODE: mode},
+    )
+
+
+async def _past_reconfigure_menu(hass: HomeAssistant, result: ConfigFlowResult):
+    """Take the credentials branch of the reconfigure menu, if one is shown.
+
+    An entry holding exactly one PowerOcean first asks how to connect (cloud
+    credentials or the local Modbus connection); every other entry opens its
+    credentials form directly.
+    """
+    if result["type"] is FlowResultType.MENU:
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconfigure_credentials"}
+        )
+    return result
+
+
+async def _advance_app_flow_with_powerstream(hass: HomeAssistant):
+    result = await _select_mode(hass, MODE_ENHANCED)
+    with (
+        patch(
+            "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "jwt_token", "user_id": "uid123"},
+        ),
+        patch(
+            "custom_components.ecoflow_energy.config_flow_setup.get_app_device_list",
+            new_callable=AsyncMock,
+            return_value=[
+                POWERSTREAM_DEVICE,
+                {
+                    "sn": "HJ31TEST00000001",
+                    "product_name": "PowerOcean",
+                    "device_type": "powerocean",
+                    "online": 1,
+                },
+            ],
+        ),
+    ):
+        return await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "secret"},
+        )
+
+
+class TestPowerStreamModeBoundary:
+    async def test_app_flow_shows_but_does_not_preselect_powerstream(
+        self, hass: HomeAssistant
+    ) -> None:
+        result = await _advance_app_flow_with_powerstream(hass)
+
+        marker = next(
+            key
+            for key in result["data_schema"].schema
+            if getattr(key, "schema", None) == CONF_DEVICES
+        )
+        options = result["data_schema"].schema[marker].config["options"]
+        assert any(
+            option["value"] == POWERSTREAM_DEVICE["sn"]
+            and "requires Standard Mode" in option["label"]
+            for option in options
+        )
+        assert marker.default() == ["HJ31TEST00000001"]
+
+    async def test_app_flow_rejects_explicit_powerstream_selection(
+        self, hass: HomeAssistant
+    ) -> None:
+        result = await _advance_app_flow_with_powerstream(hass)
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_DEVICES: [POWERSTREAM_DEVICE["sn"]]}
+        )
+
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "powerstream_requires_standard"
+
+    async def test_app_auth_options_reject_before_entry_mutation(
+        self, hass: HomeAssistant
+    ) -> None:
+        powerocean = {
+            "sn": "HJ31TEST00000001",
+            "name": "PowerOcean",
+            "product_name": "PowerOcean",
+            "device_type": "powerocean",
+            "online": 1,
+        }
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "test@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid123",
+                CONF_DEVICES: [powerocean, POWERSTREAM_DEVICE],
+            },
+            unique_id="test@example.com",
+        )
+        entry.add_to_hass(hass)
+        before = dict(entry.data)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options."
+            "_async_fetch_app_devices",
+            new_callable=AsyncMock,
+            return_value=[powerocean, POWERSTREAM_DEVICE],
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {
+                    CONF_MODE: MODE_ENHANCED,
+                    CONF_DEVICES: [powerocean["sn"], POWERSTREAM_DEVICE["sn"]],
+                },
+            )
+
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "powerstream_requires_standard"
+        assert entry.data == before
+
+    async def test_options_stored_fallback_keeps_standard_mode_hint(
+        self, hass: HomeAssistant
+    ) -> None:
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "test@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid123",
+                CONF_DEVICES: [POWERSTREAM_DEVICE],
+            },
+            unique_id="test@example.com",
+        )
+        entry.add_to_hass(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options."
+            "_async_fetch_app_devices",
+            new_callable=AsyncMock,
+            side_effect=TimeoutError,
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        options = schema.schema[CONF_DEVICES].config["options"]
+        assert options == [
+            {
+                "value": POWERSTREAM_DEVICE["sn"],
+                "label": "PowerStream (HW51...0001) - requires Standard Mode",
+            }
+        ]
+
+
+SMART_METER_DEVICE = {
+    "sn": "BK21TEST00000001",
+    "name": "Smart Meter",
+    "product_name": "Smart Meter",
+    "device_type": "smart_meter",
+    "online": 1,
+}
+
+SOLAR_TRACKER_DEVICE = {
+    "sn": "HZ31TEST00000001",
+    "name": "Solar Tracker",
+    "product_name": "Solar Tracker",
+    "device_type": "solar_tracker",
+    "online": 1,
+}
+
+WAVE3_DEVICE = {
+    "sn": "AC71TEST00000001",
+    "name": "WAVE 3",
+    "product_name": "",
+    "device_type": "wave3",
+    "online": 1,
+}
+
+OCEAN2_DEVICE = {
+    "sn": "RE11TEST00000001",
+    "name": "Ocean 2",
+    "product_name": "",
+    "device_type": "ocean2",
+    "online": 1,
+}
+
+POWERPULSE2_DEVICE = {
+    "sn": "C376TEST00000001",
+    "name": "PowerPulse 2",
+    "product_name": "",
+    "device_type": "powerpulse2",
+    "online": 1,
+}
+
+SMART_PANEL_40_DEVICE = {
+    "sn": "HR61TEST00000001",
+    "name": "Smart Panel 40",
+    "product_name": "",
+    "device_type": "smart_panel_40",
+    "online": 1,
+}
+
+DELTA_PRO_ULTRA_DEVICE = {
+    "sn": "Y711TEST00000001",
+    "name": "DELTA Pro Ultra",
+    "product_name": "",
+    "device_type": "delta_pro_ultra",
+    "online": 1,
+}
+
+STREAM_AC5000_DEVICE = {
+    "sn": "ES22TEST00000001",
+    "name": "STREAM AC 5000",
+    "product_name": "",
+    "device_type": "stream_ac5000",
+    "online": 1,
+}
+
+SMART_HOME_PANEL_2_DEVICE = {
+    "sn": "HD31TEST00000001",
+    "name": "Smart Home Panel 2",
+    "product_name": "",
+    "device_type": "smart_home_panel_2",
+    "online": 1,
+}
+
+# One case per member of ENHANCED_ONLY_DEVICE_TYPES. A type dropped from
+# that set silently loses its guard coverage along with its parametrize
+# case, so this list is the thing to extend when another type joins it.
+ENHANCED_ONLY_DEVICE_CASES = [
+    pytest.param(
+        SMART_METER_DEVICE,
+        "Smart Meter (0001) (BK21...0001) - requires Enhanced Mode",
+        id="smart_meter",
+    ),
+    pytest.param(
+        SOLAR_TRACKER_DEVICE,
+        "Solar Tracker (0001) (HZ31...0001) - requires Enhanced Mode",
+        id="solar_tracker",
+    ),
+    pytest.param(
+        WAVE3_DEVICE,
+        "WAVE 3 (0001) (AC71...0001) - requires Enhanced Mode",
+        id="wave3",
+    ),
+    pytest.param(
+        OCEAN2_DEVICE,
+        "Ocean 2 (0001) (RE11...0001) - requires Enhanced Mode",
+        id="ocean2",
+    ),
+    pytest.param(
+        POWERPULSE2_DEVICE,
+        "PowerPulse 2 (C376...0001) - requires Enhanced Mode",
+        id="powerpulse2",
+    ),
+    pytest.param(
+        SMART_PANEL_40_DEVICE,
+        "OCEAN Smart Electrical Panel 40 (0001) (HR61...0001) - requires Enhanced Mode",
+        id="smart_panel_40",
+    ),
+    pytest.param(
+        DELTA_PRO_ULTRA_DEVICE,
+        "DELTA Pro Ultra (0001) (Y711...0001) - requires Enhanced Mode",
+        id="delta_pro_ultra",
+    ),
+    pytest.param(
+        SMART_HOME_PANEL_2_DEVICE,
+        "Smart Home Panel 2 (0001) (HD31...0001) - requires Enhanced Mode",
+        id="smart_home_panel_2",
+    ),
+    pytest.param(
+        STREAM_AC5000_DEVICE,
+        "STREAM AC 5000 (0001) (ES22...0001) - requires Enhanced Mode",
+        id="stream_ac5000",
+    ),
+]
+
+
+def _device_marker(result: Any):
+    """Return the schema marker for the device selector on a devices step."""
+    return next(
+        key
+        for key in result["data_schema"].schema
+        if getattr(key, "schema", None) == CONF_DEVICES
+    )
+
+
+async def _advance_developer_flow_with_enhanced_only_device(
+    hass: HomeAssistant, device: dict[str, Any]
+):
+    with patch(
+        "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+    ) as mock_cls:
+        api = mock_cls.return_value
+        api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+        api.get_device_list = AsyncMock(
+            return_value=[
+                {"sn": device["sn"], "productName": "", "online": 1},
+                {"sn": "HJ31TEST00000001", "productName": "PowerOcean", "online": 1},
+            ]
+        )
+
+        result = await _select_mode(hass, MODE_STANDARD)
+        return await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+        )
+
+
+async def _advance_app_flow_with_enhanced_only_device(
+    hass: HomeAssistant, device: dict[str, Any]
+):
+    result = await _select_mode(hass, MODE_ENHANCED)
+    with (
+        patch(
+            "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "jwt_token", "user_id": "uid123"},
+        ),
+        patch(
+            "custom_components.ecoflow_energy.config_flow_setup.get_app_device_list",
+            new_callable=AsyncMock,
+            return_value=[
+                device,
+                {
+                    "sn": "HJ31TEST00000001",
+                    "product_name": "PowerOcean",
+                    "device_type": "powerocean",
+                    "online": 1,
+                },
+            ],
+        ),
+    ):
+        return await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "secret"},
+        )
+
+
+class TestEnhancedOnlyModeBoundary:
+    """The PowerStream boundary with the modes swapped.
+
+    Every device type in ENHANCED_ONLY_DEVICE_TYPES reports on the app
+    channel only, so a developer-key entry would create entities that can
+    never fill. Before this guard the picker rendered such a device clean
+    and pre-selected, which is worse than the "not supported yet" it used
+    to show.
+    """
+
+    @pytest.mark.parametrize("device,expected_label", ENHANCED_ONLY_DEVICE_CASES)
+    async def test_developer_flow_shows_but_does_not_preselect_the_device(
+        self, hass: HomeAssistant, device: dict[str, Any], expected_label: str
+    ) -> None:
+        result = await _advance_developer_flow_with_enhanced_only_device(hass, device)
+
+        marker = _device_marker(result)
+        options = result["data_schema"].schema[marker].config["options"]
+        assert any(
+            option["value"] == device["sn"]
+            and "requires Enhanced Mode" in option["label"]
+            for option in options
+        )
+        assert marker.default() == ["HJ31TEST00000001"]
+
+    @pytest.mark.parametrize("device,expected_label", ENHANCED_ONLY_DEVICE_CASES)
+    async def test_developer_flow_rejects_explicit_device_selection(
+        self, hass: HomeAssistant, device: dict[str, Any], expected_label: str
+    ) -> None:
+        result = await _advance_developer_flow_with_enhanced_only_device(hass, device)
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_DEVICES: [device["sn"]]}
+        )
+
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "device_requires_enhanced"
+
+    @pytest.mark.parametrize("device,expected_label", ENHANCED_ONLY_DEVICE_CASES)
+    async def test_app_flow_preselects_the_device_and_accepts_it(
+        self, hass: HomeAssistant, device: dict[str, Any], expected_label: str
+    ) -> None:
+        """Negative control for the two mode-dependent assertions above.
+
+        Without it a guard that fired in both modes would satisfy them and
+        take the device away from the only mode it works in. The label
+        marker is deliberately not part of this control: like the
+        PowerStream one it states which mode the device needs, which is
+        true whichever mode the flow is currently in.
+        """
+        result = await _advance_app_flow_with_enhanced_only_device(hass, device)
+
+        marker = _device_marker(result)
+        assert device["sn"] in marker.default()
+
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_DEVICES: [device["sn"]]}
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    @pytest.mark.parametrize("device,expected_label", ENHANCED_ONLY_DEVICE_CASES)
+    async def test_options_reject_switch_to_standard_before_mutation(
+        self, hass: HomeAssistant, device: dict[str, Any], expected_label: str
+    ) -> None:
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "test@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid123",
+                CONF_ACCESS_KEY: "ak",
+                CONF_SECRET_KEY: "sk",
+                CONF_DEVICES: [device],
+            },
+            unique_id="test@example.com",
+        )
+        entry.add_to_hass(hass)
+        before = dict(entry.data)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options."
+            "_async_fetch_app_devices",
+            new_callable=AsyncMock,
+            return_value=[device],
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {
+                    CONF_MODE: MODE_STANDARD,
+                    CONF_DEVICES: [device["sn"]],
+                },
+            )
+
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "device_requires_enhanced"
+        assert entry.data == before
+
+    @pytest.mark.parametrize("device,expected_label", ENHANCED_ONLY_DEVICE_CASES)
+    async def test_options_stored_fallback_keeps_enhanced_mode_hint(
+        self, hass: HomeAssistant, device: dict[str, Any], expected_label: str
+    ) -> None:
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "test@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid123",
+                CONF_DEVICES: [device],
+            },
+            unique_id="test@example.com",
+        )
+        entry.add_to_hass(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options."
+            "_async_fetch_app_devices",
+            new_callable=AsyncMock,
+            side_effect=TimeoutError,
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        options = schema.schema[CONF_DEVICES].config["options"]
+        assert options == [
+            {
+                "value": device["sn"],
+                "label": expected_label,
+            }
+        ]
+
+
+# ===========================================================================
+# Step 1: Mode selection
+# ===========================================================================
+
+
+class TestUserStep:
+    async def test_form_shown(self, hass: HomeAssistant) -> None:
+        """Step 1 shows a form with mode selector."""
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "user"
+
+    async def test_standard_selected_shows_developer_form(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Selecting Standard mode advances to the developer credentials form."""
+        result = await _select_mode(hass, MODE_STANDARD)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "developer"
+
+    async def test_enhanced_selected_shows_app_form(self, hass: HomeAssistant) -> None:
+        """Selecting Enhanced mode advances to the app credentials form."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "app_credentials"
+
+
+# ===========================================================================
+# Step 2a: Developer credentials
+# ===========================================================================
+
+
+class TestDeveloperStep:
+    async def test_invalid_auth(self, hass: HomeAssistant) -> None:
+        """Invalid credentials show error."""
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+            ) as mock_cls,
+        ):
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(return_value=None)
+
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "bad_key", CONF_SECRET_KEY: "bad_secret"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "invalid_auth"
+
+    async def test_no_devices_error(self, hass: HomeAssistant) -> None:
+        """Valid auth but no devices shows error."""
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+            ) as mock_cls,
+        ):
+            api = mock_cls.return_value
+            api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+            api.get_device_list = AsyncMock(return_value=[])
+
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "no_devices"
+
+    async def test_success_advances_to_devices(self, hass: HomeAssistant) -> None:
+        """Valid credentials + devices advances to device selection."""
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+            ) as mock_cls,
+        ):
+            api = mock_cls.return_value
+            api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+            api.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            assert result["step_id"] == "devices"
+
+    @pytest.mark.parametrize(
+        ("side_effect", "expected_error"),
+        [
+            (aiohttp.ClientError("boom"), "cannot_connect"),
+            (KeyError("missing"), "unknown"),
+        ],
+    )
+    async def test_exception_shows_error(
+        self, hass: HomeAssistant, side_effect: Exception, expected_error: str
+    ) -> None:
+        """Network errors map to cannot_connect, parsing errors to unknown."""
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                side_effect=side_effect
+            )
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "test_ak", CONF_SECRET_KEY: "test_sk"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            assert result["step_id"] == "developer"
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == expected_error
+
+
+# ===========================================================================
+# Step 2b: App credentials
+# ===========================================================================
+
+
+class TestAppCredentialsStep:
+    async def test_login_failed(self, hass: HomeAssistant) -> None:
+        """Failed app login shows error."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "wrong"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "enhanced_login_failed"
+
+    async def test_connection_error(self, hass: HomeAssistant) -> None:
+        """Connection error during app login shows cannot_connect."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+            new_callable=AsyncMock,
+            side_effect=aiohttp.ClientError("Connection failed"),
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "secret"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "cannot_connect"
+
+    async def test_unknown_error(self, hass: HomeAssistant) -> None:
+        """A parsing error during app login shows unknown."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+            new_callable=AsyncMock,
+            side_effect=KeyError("token"),
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "test_password"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "unknown"
+
+    async def test_empty_credentials_error(self, hass: HomeAssistant) -> None:
+        """Empty email/password shows enhanced_login_failed without calling login."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+            new_callable=AsyncMock,
+        ) as mock_login:
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "", CONF_PASSWORD: ""},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "enhanced_login_failed"
+            mock_login.assert_not_called()
+
+    async def test_devices_without_sn_shows_no_devices(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Login succeeds but every device lacks an sn - normalization drops all."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+                new_callable=AsyncMock,
+                return_value={"token": "jwt_token", "user_id": "uid123"},
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.get_app_device_list",
+                new_callable=AsyncMock,
+                return_value=[
+                    {"product_name": "PowerOcean", "online": 1},
+                    {"sn": "", "product_name": "Smart Plug", "online": 1},
+                ],
+            ),
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "test_password"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "no_devices"
+
+    async def test_no_devices_shows_error(self, hass: HomeAssistant) -> None:
+        """Successful login but no devices shows error."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+                new_callable=AsyncMock,
+                return_value={"token": "jwt_token", "user_id": "uid123"},
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.get_app_device_list",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "secret"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            errors = result["errors"]
+            assert errors is not None
+            assert errors["base"] == "no_devices"
+
+    async def test_success_advances_to_devices(self, hass: HomeAssistant) -> None:
+        """Successful login + devices advances to device selection."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+                new_callable=AsyncMock,
+                return_value={"token": "jwt_token", "user_id": "uid123"},
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.get_app_device_list",
+                new_callable=AsyncMock,
+                return_value=[
+                    {
+                        "sn": "HJ31TEST00000001",
+                        "product_name": "PowerOcean",
+                        "online": 1,
+                        "device_type": "powerocean",
+                    },
+                ],
+            ),
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "secret"},
+            )
+            assert result["type"] is FlowResultType.FORM
+            assert (
+                result["step_id"] == "devices_app"
+            )  # account sign-in renders its own help text
+
+    async def test_full_path_creates_entry(self, hass: HomeAssistant) -> None:
+        """Full app-auth path: login -> devices -> entry created (no mode step)."""
+        result = await _select_mode(hass, MODE_ENHANCED)
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.enhanced_login",
+                new_callable=AsyncMock,
+                return_value={"token": "jwt_token", "user_id": "uid123"},
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.get_app_device_list",
+                new_callable=AsyncMock,
+                return_value=[
+                    {
+                        "sn": "HJ31TEST00000001",
+                        "product_name": "PowerOcean",
+                        "online": 1,
+                        "device_type": "powerocean",
+                    },
+                ],
+            ),
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "secret"},
+            )
+            # Should be on devices step now
+            assert (
+                result["step_id"] == "devices_app"
+            )  # account sign-in renders its own help text
+
+            # Select the device - should create entry directly (no mode step)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_DEVICES: ["HJ31TEST00000001"]},
+            )
+            assert result["type"] is FlowResultType.CREATE_ENTRY
+            assert result["data"][CONF_AUTH_METHOD] == AUTH_METHOD_APP
+            assert result["data"][CONF_MODE] == MODE_ENHANCED
+            assert result["data"][CONF_EMAIL] == "test@example.com"
+            assert result["data"][CONF_USER_ID] == "uid123"
+            assert CONF_ACCESS_KEY not in result["data"]
+            assert len(result["data"][CONF_DEVICES]) == 1
+
+
+# ===========================================================================
+# Step 3: Device selection
+# ===========================================================================
+
+
+class TestDevicesStep:
+    async def _advance_to_devices(self, hass: HomeAssistant):
+        """Helper: advance flow to device selection step."""
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+            ) as mock_cls,
+        ):
+            api = mock_cls.return_value
+            api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+            api.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                    {"sn": "SN002", "productName": "PowerOcean", "online": 1},
+                ]
+            )
+
+            result = await _select_mode(hass, MODE_STANDARD)
+            return await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+            )
+
+    async def test_devices_form_shown(self, hass: HomeAssistant) -> None:
+        result = await self._advance_to_devices(hass)
+        assert result["step_id"] == "devices"
+
+    async def test_select_devices_creates_entry(self, hass: HomeAssistant) -> None:
+        """Selecting devices with developer auth creates the entry directly."""
+        result = await self._advance_to_devices(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_DEVICES: ["SN001"]},
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert result["data"][CONF_MODE] == MODE_STANDARD
+        assert result["data"][CONF_ACCESS_KEY] == "ak"
+        assert len(result["data"][CONF_DEVICES]) == 1
+
+    async def test_setup_list_marks_unsupported(self, hass: HomeAssistant) -> None:
+        """The list the user actually picks from carries the marker.
+
+        #297: the helper being right is not the same as the form using it.
+        Asserted on the rendered selector rather than on `_device_label`,
+        so that bypassing the helper at this call site fails here instead
+        of passing silently.
+        """
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+        ) as mock_cls:
+            api = mock_cls.return_value
+            api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+            api.get_device_list = AsyncMock(
+                return_value=[
+                    {
+                        "sn": "R351FAKE00000001",
+                        "productName": "Delta 2 Max",
+                        "online": 1,
+                    },
+                    {
+                        "sn": "ZZ99FAKE00000001",
+                        "productName": "Mystery Box",
+                        "online": 1,
+                    },
+                ]
+            )
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+            )
+
+        schema = result["data_schema"]
+        assert schema is not None
+        labels = {
+            opt["value"]: opt["label"]
+            for opt in schema.schema[CONF_DEVICES].config["options"]
+        }
+        assert labels["ZZ99FAKE00000001"].endswith(
+            " - not supported yet (no data exposed)"
+        )
+        assert "not supported" not in labels["R351FAKE00000001"]
+
+    async def test_empty_selection_shows_error(self, hass: HomeAssistant) -> None:
+        """Submitting an empty device selection re-shows the form with no_devices."""
+        result = await self._advance_to_devices(hass)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_DEVICES: []},
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "devices"
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "no_devices"
+
+
+# ===========================================================================
+# Duplicate entry abort
+# ===========================================================================
+
+
+class TestAbort:
+    async def test_already_configured(self, hass: HomeAssistant) -> None:
+        """Second config entry with same access_key is aborted at entry creation."""
+        # Create first entry via flow
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+            ) as mock_cls,
+        ):
+            api = mock_cls.return_value
+            api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+            api.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "same_key", CONF_SECRET_KEY: "sk"},
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_DEVICES: ["SN001"]},
+            )
+            assert result["type"] is FlowResultType.CREATE_ENTRY
+
+        # Second flow with same access_key
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_setup.IoTApiClient",
+            ) as mock_cls,
+        ):
+            api = mock_cls.return_value
+            api.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+            api.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+
+            result = await _select_mode(hass, MODE_STANDARD)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "same_key", CONF_SECRET_KEY: "sk"},
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_DEVICES: ["SN001"]},
+            )
+            assert result["type"] is FlowResultType.ABORT
+            assert result["reason"] == "already_configured"
+
+
+# ===========================================================================
+# Options Flow
+# ===========================================================================
+
+
+class TestOptionsFlow:
+    """Tests for EcoFlowOptionsFlow (runtime reconfiguration)."""
+
+    def _create_standard_entry(self, hass: HomeAssistant) -> MockConfigEntry:
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "ak",
+                CONF_SECRET_KEY: "sk",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    def _create_enhanced_entry(self, hass: HomeAssistant) -> MockConfigEntry:
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "ak",
+                CONF_SECRET_KEY: "sk",
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "user@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    def _create_capture_entry(
+        self, hass: HomeAssistant, **capture: Any
+    ) -> MockConfigEntry:
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "user@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+                **capture,
+            },
+            unique_id="user@example.com",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def _submit_options(
+        self, hass: HomeAssistant, entry: MockConfigEntry, user_input: dict
+    ) -> None:
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options."
+            "_async_fetch_app_devices",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            await hass.config_entries.options.async_configure(
+                result["flow_id"], user_input=user_input
+            )
+            await hass.async_block_till_done()
+
+    async def test_raw_capture_defaults_to_off(self, hass: HomeAssistant) -> None:
+        """Nobody gets a capture connection without asking for one."""
+        entry = self._create_capture_entry(hass)
+
+        await self._submit_options(
+            hass, entry, {CONF_MODE: MODE_ENHANCED, CONF_DEVICES: ["SN001"]}
+        )
+
+        assert entry.data.get(CONF_RAW_CAPTURE, False) is False
+
+    async def test_enabling_raw_capture_sets_a_deadline(
+        self, hass: HomeAssistant
+    ) -> None:
+        entry = self._create_capture_entry(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.time.time",
+            return_value=FIXED_NOW,
+        ):
+            await self._submit_options(
+                hass,
+                entry,
+                {
+                    CONF_MODE: MODE_ENHANCED,
+                    CONF_DEVICES: ["SN001"],
+                    CONF_RAW_CAPTURE: True,
+                },
+            )
+
+        assert entry.data[CONF_RAW_CAPTURE] is True
+        assert entry.data[CONF_RAW_CAPTURE_UNTIL] == FIXED_NOW + RAW_CAPTURE_DURATION_S
+
+    async def test_saving_again_does_not_extend_a_running_window(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Otherwise an unrelated options change silently renews the capture."""
+        original_deadline = FIXED_NOW + 60
+        entry = self._create_capture_entry(
+            hass,
+            raw_capture=True,
+            raw_capture_until=original_deadline,
+        )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.time.time",
+            return_value=FIXED_NOW,
+        ):
+            await self._submit_options(
+                hass,
+                entry,
+                {
+                    CONF_MODE: MODE_ENHANCED,
+                    CONF_DEVICES: ["SN001"],
+                    CONF_RAW_CAPTURE: True,
+                },
+            )
+
+        assert entry.data[CONF_RAW_CAPTURE_UNTIL] == original_deadline
+
+    async def test_switching_it_off_clears_the_deadline(
+        self, hass: HomeAssistant
+    ) -> None:
+        entry = self._create_capture_entry(
+            hass,
+            raw_capture=True,
+            raw_capture_until=FIXED_NOW + 60,
+        )
+
+        await self._submit_options(
+            hass,
+            entry,
+            {
+                CONF_MODE: MODE_ENHANCED,
+                CONF_DEVICES: ["SN001"],
+                CONF_RAW_CAPTURE: False,
+            },
+        )
+
+        assert entry.data[CONF_RAW_CAPTURE] is False
+        assert CONF_RAW_CAPTURE_UNTIL not in entry.data
+
+    async def test_options_init_shows_form(self, hass: HomeAssistant) -> None:
+        """Options flow shows init form with mode and devices."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "init"
+
+    async def test_options_keep_standard_mode(self, hass: HomeAssistant) -> None:
+        """Keeping Standard Mode saves options directly."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_STANDARD, CONF_DEVICES: ["SN001"]},
+            )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+
+    async def test_options_switch_to_enhanced_shows_credentials(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Switching from Standard to Enhanced shows enhanced credentials form."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_ENHANCED, CONF_DEVICES: ["SN001"]},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "enhanced"
+
+    async def test_options_no_devices_error(self, hass: HomeAssistant) -> None:
+        """Selecting no devices shows error."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_STANDARD, CONF_DEVICES: []},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "no_devices"
+
+    async def test_options_enhanced_to_standard_removes_credentials(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Switching from Enhanced to Standard removes email/password."""
+        entry = self._create_enhanced_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_STANDARD, CONF_DEVICES: ["SN001"]},
+            )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        # Credentials should be removed from entry data
+        assert CONF_EMAIL not in entry.data
+        assert CONF_PASSWORD not in entry.data
+        assert CONF_USER_ID not in entry.data
+
+    def _create_app_auth_entry(self, hass: HomeAssistant) -> MockConfigEntry:
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_EMAIL: "user@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="uid",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_options_app_auth_skips_api_fetch(self, hass: HomeAssistant) -> None:
+        """App-auth entries skip IoTApiClient and use the app API instead."""
+        entry = self._create_app_auth_entry(hass)
+        # No IoTApiClient mock needed - it should not be called
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+            ) as mock_cls,
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+                AsyncMock(return_value={"token": "t", "user_id": "uid"}),
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.get_app_device_list",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            mock_cls.assert_not_called()
+        assert result["type"] is FlowResultType.FORM
+        assert (
+            result["step_id"] == "init_app"
+        )  # account sign-in renders its own help text
+
+    async def test_options_app_auth_refreshes_device_list(
+        self, hass: HomeAssistant
+    ) -> None:
+        """App-auth options flow offers devices added after initial setup."""
+        entry = self._create_app_auth_entry(hass)
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+                AsyncMock(return_value={"token": "t", "user_id": "uid"}),
+            ) as mock_login,
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.get_app_device_list",
+                AsyncMock(
+                    return_value=[
+                        {
+                            "sn": "SN001",
+                            "product_name": "Delta 2 Max",
+                            "device_type": "delta",
+                            "online": 1,
+                        },
+                        {
+                            "sn": "SN002",
+                            "product_name": "DELTA 3 Max Plus",
+                            "device_type": "delta3",
+                            "online": 1,
+                        },
+                    ]
+                ),
+            ),
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        mock_login.assert_awaited_once()
+        assert result["type"] is FlowResultType.FORM
+        assert (
+            result["step_id"] == "init_app"
+        )  # account sign-in renders its own help text
+
+        schema = result["data_schema"]
+        assert schema is not None
+        options = schema.schema[CONF_DEVICES].config["options"]
+        values = [opt["value"] for opt in options]
+        assert values == ["SN001", "SN002"]
+
+    async def test_options_fresh_list_marks_unsupported(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The freshly fetched branch marks unsupported devices too.
+
+        #297: this is the branch a user sees whenever the fetch works, so
+        it is asserted on the rendered selector rather than on the label
+        helper it happens to call today.
+        """
+        entry = self._create_app_auth_entry(hass)
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+                AsyncMock(return_value={"token": "t", "user_id": "uid"}),
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.get_app_device_list",
+                AsyncMock(
+                    return_value=[
+                        {
+                            "sn": "R351FAKE00000001",
+                            "product_name": "Delta 2 Max",
+                            "device_type": "delta",
+                            "online": 1,
+                        },
+                        {
+                            "sn": "ZZ99FAKE00000001",
+                            "product_name": "Mystery Box",
+                            "device_type": "unknown",
+                            "online": 1,
+                        },
+                    ]
+                ),
+            ),
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        labels = {
+            opt["value"]: opt["label"]
+            for opt in schema.schema[CONF_DEVICES].config["options"]
+        }
+        assert labels["ZZ99FAKE00000001"].endswith(
+            " - not supported yet (no data exposed)"
+        )
+        assert "not supported" not in labels["R351FAKE00000001"]
+
+    async def test_options_stored_fallback_reclassifies(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A prefix mapped since setup drops the marker without a fetch.
+
+        Setup re-runs the classification on every start and only falls
+        back to the recorded type, so a device recorded as unknown before
+        its prefix was added is supported today. Reading the recorded
+        type alone would keep telling its owner it is not supported, in
+        the one branch that renders when no fetch succeeded - the same
+        confusion #267 was about, one release later.
+        """
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_EMAIL: "user@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    # Recorded as unknown, prefix mapped since.
+                    {"sn": "R351FAKE00000001", "device_type": "unknown", "online": 1},
+                ],
+            },
+            unique_id="uid",
+        )
+        entry.add_to_hass(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            AsyncMock(side_effect=TimeoutError),
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        labels = {
+            opt["value"]: opt["label"]
+            for opt in schema.schema[CONF_DEVICES].config["options"]
+        }
+        assert "not supported" not in labels["R351FAKE00000001"]
+
+    async def test_options_app_auth_login_failure_falls_back(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A failed app login keeps the options flow usable with stored devices."""
+        entry = self._create_app_auth_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            AsyncMock(side_effect=TimeoutError),
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        assert result["type"] is FlowResultType.FORM
+        assert (
+            result["step_id"] == "init_app"
+        )  # account sign-in renders its own help text
+
+        schema = result["data_schema"]
+        assert schema is not None
+        options = schema.schema[CONF_DEVICES].config["options"]
+        assert [opt["value"] for opt in options] == ["SN001"]
+
+    async def test_options_stored_fallback_marks_unsupported(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The stored-list branch marks unsupported devices too.
+
+        #297: two places build these labels, one from a fresh fetch and
+        one from what the entry stored. If only the fresh one carried the
+        marker, the same user would see a different answer depending on
+        whether the fetch happened to succeed.
+        """
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_EMAIL: "user@example.com",
+                CONF_PASSWORD: "secret",
+                CONF_USER_ID: "uid",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {"sn": "R351FAKE00000001", "device_type": "delta", "online": 1},
+                    {"sn": "ZZ99FAKE00000001", "device_type": "unknown", "online": 1},
+                ],
+            },
+            unique_id="uid",
+        )
+        entry.add_to_hass(hass)
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            AsyncMock(side_effect=TimeoutError),
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        labels = {
+            opt["value"]: opt["label"]
+            for opt in schema.schema[CONF_DEVICES].config["options"]
+        }
+        assert labels["ZZ99FAKE00000001"].endswith(
+            " - not supported yet (no data exposed)"
+        )
+        assert "not supported" not in labels["R351FAKE00000001"]
+
+    async def test_options_enhanced_login_validates(self, hass: HomeAssistant) -> None:
+        """Enhanced login in options flow validates credentials."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_ENHANCED, CONF_DEVICES: ["SN001"]},
+            )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "wrong"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+    async def test_options_switch_to_enhanced_saves_credentials(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Successful Enhanced switch persists auth method and app credentials."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_ENHANCED, CONF_DEVICES: ["SN001"]},
+            )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "jwt_token", "user_id": "uid123"},
+        ):
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "test_password"},
+            )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert entry.data[CONF_MODE] == MODE_ENHANCED
+        assert entry.data[CONF_AUTH_METHOD] == AUTH_METHOD_APP
+        assert entry.data[CONF_EMAIL] == "test@example.com"
+        assert entry.data[CONF_PASSWORD] == "test_password"
+        assert entry.data[CONF_USER_ID] == "uid123"
+
+    async def test_options_enhanced_to_standard_keeps_stored_keys(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Switching to Standard without new keys keeps the stored keys unchanged."""
+        entry = self._create_enhanced_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_STANDARD, CONF_DEVICES: ["SN001"]},
+            )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        # _save_options was called without access_key/secret_key arguments;
+        # the previously stored keys stay in place.
+        assert entry.data[CONF_ACCESS_KEY] == "ak"
+        assert entry.data[CONF_SECRET_KEY] == "sk"
+
+    async def test_options_developer_fetch_error_falls_back_to_stored(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A failed device-list fetch keeps the options form usable with stored
+        devices."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                side_effect=aiohttp.ClientError("boom")
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "init"
+        schema = result["data_schema"]
+        assert schema is not None
+        options = schema.schema[CONF_DEVICES].config["options"]
+        assert [opt["value"] for opt in options] == ["SN001"]
+
+
+# ===========================================================================
+# Options Flow: developer step (switch back to Standard without stored keys)
+# ===========================================================================
+
+
+class TestOptionsDeveloperStep:
+    """Tests for EcoFlowOptionsFlow.async_step_developer."""
+
+    def _create_keyless_enhanced_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "test@example.com",
+                CONF_PASSWORD: "test_password",
+                CONF_USER_ID: "uid123",
+                CONF_DEVICES: [
+                    {
+                        "sn": "HJ31FAKE00000001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="test@example.com",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def _advance_to_developer(self, hass: HomeAssistant):
+        """Helper: switch a keyless Enhanced entry to Standard mode."""
+        entry = self._create_keyless_enhanced_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_STANDARD, CONF_DEVICES: ["HJ31FAKE00000001"]},
+            )
+        return entry, result
+
+    async def test_mode_switch_without_keys_routes_to_developer(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Switching away from Enhanced with no stored keys shows developer form."""
+        _entry, result = await self._advance_to_developer(hass)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "developer"
+        assert not result["errors"]
+
+    async def test_empty_keys_show_invalid_auth(self, hass: HomeAssistant) -> None:
+        """Empty access/secret key shows invalid_auth without an API call."""
+        _entry, result = await self._advance_to_developer(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "", CONF_SECRET_KEY: ""},
+            )
+            mock_cls.assert_not_called()
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "developer"
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "invalid_auth"
+
+    async def test_valid_keys_save_options(self, hass: HomeAssistant) -> None:
+        """Valid keys save the options and persist Standard mode credentials."""
+        entry, result = await self._advance_to_developer(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {
+                        "sn": "HJ31FAKE00000001",
+                        "productName": "PowerOcean",
+                        "online": 1,
+                    },
+                ]
+            )
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "test_ak", CONF_SECRET_KEY: "test_sk"},
+            )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert entry.data[CONF_MODE] == MODE_STANDARD
+        assert entry.data[CONF_ACCESS_KEY] == "test_ak"
+        assert entry.data[CONF_SECRET_KEY] == "test_sk"
+        # App credentials are removed on the Standard branch
+        assert CONF_EMAIL not in entry.data
+        assert CONF_PASSWORD not in entry.data
+        assert CONF_USER_ID not in entry.data
+
+    async def test_device_list_none_shows_invalid_auth(
+        self, hass: HomeAssistant
+    ) -> None:
+        """get_device_list returning None shows invalid_auth."""
+        _entry, result = await self._advance_to_developer(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(return_value=None)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "test_ak", CONF_SECRET_KEY: "test_sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "developer"
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "invalid_auth"
+
+    async def test_network_error_shows_cannot_connect(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A network error during key validation shows cannot_connect."""
+        _entry, result = await self._advance_to_developer(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                side_effect=aiohttp.ClientError("boom")
+            )
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "test_ak", CONF_SECRET_KEY: "test_sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "developer"
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "cannot_connect"
+
+
+# ===========================================================================
+# Options Flow: enhanced step error branches
+# ===========================================================================
+
+
+class TestOptionsEnhancedStepErrors:
+    """Exception branches in EcoFlowOptionsFlow.async_step_enhanced."""
+
+    def _create_standard_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "ak",
+                CONF_SECRET_KEY: "sk",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    @pytest.mark.parametrize(
+        "side_effect",
+        [TimeoutError(), KeyError("user_id")],
+        ids=["timeout", "parse_error"],
+    )
+    async def test_login_exception_shows_enhanced_login_failed(
+        self, hass: HomeAssistant, side_effect: Exception
+    ) -> None:
+        """Both network and parsing errors converge on enhanced_login_failed."""
+        entry = self._create_standard_entry(hass)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_device_list = AsyncMock(
+                return_value=[
+                    {"sn": "SN001", "productName": "Delta 2 Max", "online": 1},
+                ]
+            )
+            result = await hass.config_entries.options.async_init(entry.entry_id)
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_MODE: MODE_ENHANCED, CONF_DEVICES: ["SN001"]},
+            )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            new_callable=AsyncMock,
+            side_effect=side_effect,
+        ):
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "test_password"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "enhanced"
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+
+# ===========================================================================
+# Re-authentication Flow
+# ===========================================================================
+
+
+class TestReauthFlow:
+    """Tests for the re-authentication flow."""
+
+    def _create_standard_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "old_ak",
+                CONF_SECRET_KEY: "old_sk",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old_ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    def _create_enhanced_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "old_ak",
+                CONF_SECRET_KEY: "old_sk",
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "old@example.com",
+                CONF_PASSWORD: "old_pass",
+                CONF_USER_ID: "old_uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old_ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_reauth_shows_confirm_form(self, hass: HomeAssistant) -> None:
+        """Reauth flow shows the confirm form."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reauth_confirm"
+
+    async def test_reauth_invalid_credentials(self, hass: HomeAssistant) -> None:
+        """Invalid credentials show error on reauth."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(return_value=None)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "bad_key", CONF_SECRET_KEY: "bad_secret"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "invalid_auth"
+
+    async def test_reauth_success_standard(self, hass: HomeAssistant) -> None:
+        """Successful reauth for Standard Mode updates entry and aborts."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reauth_successful"
+        assert entry.data[CONF_ACCESS_KEY] == "new_ak"
+        assert entry.data[CONF_SECRET_KEY] == "new_sk"
+
+    async def test_reauth_enhanced_shows_second_step(self, hass: HomeAssistant) -> None:
+        """Reauth for Enhanced Mode shows enhanced credentials form after API
+        validation."""
+        entry = self._create_enhanced_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reauth_enhanced"
+
+    async def test_reauth_enhanced_full_flow(self, hass: HomeAssistant) -> None:
+        """Complete Enhanced Mode reauth updates all credentials."""
+        entry = self._create_enhanced_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "new_jwt", "user_id": "new_uid"},
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "new@example.com", CONF_PASSWORD: "new_pass"},
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reauth_successful"
+        assert entry.data[CONF_ACCESS_KEY] == "new_ak"
+        assert entry.data[CONF_SECRET_KEY] == "new_sk"
+        assert entry.data[CONF_EMAIL] == "new@example.com"
+        assert entry.data[CONF_PASSWORD] == "new_pass"
+        assert entry.data[CONF_USER_ID] == "new_uid"
+
+    async def test_reauth_enhanced_login_failed(self, hass: HomeAssistant) -> None:
+        """Failed Enhanced login during reauth shows error."""
+        entry = self._create_enhanced_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "wrong"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+    async def test_reauth_connection_error(self, hass: HomeAssistant) -> None:
+        """Connection error during reauth shows cannot_connect."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                side_effect=aiohttp.ClientError("Connection failed")
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "cannot_connect"
+
+
+# ===========================================================================
+# Reconfigure Flow (user-initiated credential update)
+# ===========================================================================
+
+
+class TestReconfigureFlow:
+    """Tests for the user-initiated reconfigure flow."""
+
+    def _create_standard_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "old_ak",
+                CONF_SECRET_KEY: "old_sk",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old_ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    def _create_enhanced_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "old_ak",
+                CONF_SECRET_KEY: "old_sk",
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "old@example.com",
+                CONF_PASSWORD: "old_pass",
+                CONF_USER_ID: "old_uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old_ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_reconfigure_shows_form(self, hass: HomeAssistant) -> None:
+        """Reconfigure flow shows the credentials form."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reconfigure_confirm"
+
+    async def test_reconfigure_invalid_credentials(self, hass: HomeAssistant) -> None:
+        """Invalid credentials show error."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(return_value=None)
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "bad_key", CONF_SECRET_KEY: "bad_secret"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "invalid_auth"
+
+    async def test_reconfigure_success_standard(self, hass: HomeAssistant) -> None:
+        """Successful reconfigure for Standard Mode updates entry."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_ACCESS_KEY] == "new_ak"
+        assert entry.data[CONF_SECRET_KEY] == "new_sk"
+
+    async def test_reconfigure_enhanced_full_flow(self, hass: HomeAssistant) -> None:
+        """Reconfigure Enhanced Mode updates all credentials."""
+        entry = self._create_enhanced_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        result = await _past_reconfigure_menu(hass, result)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reconfigure_enhanced"
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "new_jwt", "user_id": "new_uid"},
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "new@example.com", CONF_PASSWORD: "new_pass"},
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_ACCESS_KEY] == "new_ak"
+        assert entry.data[CONF_EMAIL] == "new@example.com"
+        assert entry.data[CONF_USER_ID] == "new_uid"
+
+    async def test_reconfigure_enhanced_login_failed(self, hass: HomeAssistant) -> None:
+        """Failed Enhanced login during reconfigure shows error."""
+        entry = self._create_enhanced_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        result = await _past_reconfigure_menu(hass, result)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "wrong"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reconfigure_enhanced"
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+    async def test_reconfigure_connection_error(self, hass: HomeAssistant) -> None:
+        """Connection error shows cannot_connect."""
+        entry = self._create_standard_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                side_effect=aiohttp.ClientError("Connection failed")
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "ak", CONF_SECRET_KEY: "sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "cannot_connect"
+
+
+# ===========================================================================
+# App-Auth Re-authentication Flow
+# ===========================================================================
+
+
+class TestAppAuthReauthFlow:
+    """Tests for re-authentication flow with app-auth entries."""
+
+    def _create_app_auth_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "old@example.com",
+                CONF_PASSWORD: "old_pass",
+                CONF_USER_ID: "old_uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old@example.com",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_reauth_shows_app_form(self, hass: HomeAssistant) -> None:
+        """App-auth reauth shows email/password form directly (no Developer Keys)."""
+        entry = self._create_app_auth_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reauth_app"
+
+    async def test_reauth_app_success(self, hass: HomeAssistant) -> None:
+        """Successful app-auth reauth updates credentials."""
+        entry = self._create_app_auth_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "new_jwt", "user_id": "new_uid"},
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "new@example.com", CONF_PASSWORD: "new_pass"},
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reauth_successful"
+        assert entry.data[CONF_EMAIL] == "new@example.com"
+        assert entry.data[CONF_PASSWORD] == "new_pass"
+        assert entry.data[CONF_USER_ID] == "new_uid"
+
+    async def test_reauth_app_login_failed(self, hass: HomeAssistant) -> None:
+        """Failed app-auth reauth shows error."""
+        entry = self._create_app_auth_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=entry.data,
+        )
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reauth.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "wrong"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+
+# ===========================================================================
+# App-Auth Reconfigure Flow
+# ===========================================================================
+
+
+class TestAppAuthReconfigureFlow:
+    """Tests for user-initiated reconfigure flow with app-auth entries."""
+
+    def _create_app_auth_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "old@example.com",
+                CONF_PASSWORD: "old_pass",
+                CONF_USER_ID: "old_uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old@example.com",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_reconfigure_shows_app_form(self, hass: HomeAssistant) -> None:
+        """App-auth reconfigure shows email/password form directly."""
+        entry = self._create_app_auth_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        result = await _past_reconfigure_menu(hass, result)
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == "reconfigure_app"
+
+    async def test_reconfigure_app_success(self, hass: HomeAssistant) -> None:
+        """Successful app-auth reconfigure updates credentials."""
+        entry = self._create_app_auth_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        result = await _past_reconfigure_menu(hass, result)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.enhanced_login",
+            new_callable=AsyncMock,
+            return_value={"token": "new_jwt", "user_id": "new_uid"},
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "new@example.com", CONF_PASSWORD: "new_pass"},
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        assert entry.data[CONF_EMAIL] == "new@example.com"
+        assert entry.data[CONF_USER_ID] == "new_uid"
+
+    async def test_reconfigure_app_login_failed(self, hass: HomeAssistant) -> None:
+        """Failed app-auth reconfigure shows error."""
+        entry = self._create_app_auth_entry(hass)
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+        )
+        result = await _past_reconfigure_menu(hass, result)
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_reconfigure.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "wrong"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+
+# ===========================================================================
+# Reauth/Reconfigure: exception branches
+# ===========================================================================
+
+
+EXCEPTION_ERROR_CASES = [
+    pytest.param(aiohttp.ClientError("boom"), "cannot_connect", id="client_error"),
+    pytest.param(KeyError("missing"), "unknown", id="parse_error"),
+]
+
+# Module that owns the confirm/enhanced/app steps per flow source. Patch
+# targets must point at the module where the step code looks up its
+# collaborators.
+FLOW_STEP_MODULE = {
+    SOURCE_REAUTH: "custom_components.ecoflow_energy.config_flow_reauth",
+    SOURCE_RECONFIGURE: "custom_components.ecoflow_energy.config_flow_reconfigure",
+}
+
+
+class TestReauthReconfigureExceptions:
+    """Exception branches of all reauth and reconfigure steps."""
+
+    def _create_standard_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "old_ak",
+                CONF_SECRET_KEY: "old_sk",
+                CONF_MODE: MODE_STANDARD,
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "Delta 2 Max",
+                        "product_name": "Delta 2 Max",
+                        "device_type": "delta",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old_ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    def _create_enhanced_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_ACCESS_KEY: "old_ak",
+                CONF_SECRET_KEY: "old_sk",
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "old@example.com",
+                CONF_PASSWORD: "old_pass",
+                CONF_USER_ID: "old_uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old_ak",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    def _create_app_auth_entry(self, hass: HomeAssistant):
+        from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="EcoFlow Energy",
+            data={
+                CONF_AUTH_METHOD: AUTH_METHOD_APP,
+                CONF_MODE: MODE_ENHANCED,
+                CONF_EMAIL: "old@example.com",
+                CONF_PASSWORD: "old_pass",
+                CONF_USER_ID: "old_uid",
+                CONF_DEVICES: [
+                    {
+                        "sn": "SN001",
+                        "name": "PowerOcean",
+                        "product_name": "PowerOcean",
+                        "device_type": "powerocean",
+                        "online": 1,
+                    },
+                ],
+            },
+            unique_id="old@example.com",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def _init_flow(self, hass: HomeAssistant, entry, source: str):
+        context: ConfigFlowContext = {"source": source, "entry_id": entry.entry_id}
+        data = entry.data if source == SOURCE_REAUTH else None
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context=context, data=data
+        )
+        return await _past_reconfigure_menu(hass, result)
+
+    async def _pass_confirm_step(self, hass: HomeAssistant, result, source: str):
+        """Submit valid developer keys to advance past the confirm step."""
+        with patch(
+            f"{FLOW_STEP_MODULE[source]}.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                return_value=MOCK_MQTT_CREDENTIALS
+            )
+            return await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "new_ak", CONF_SECRET_KEY: "new_sk"},
+            )
+
+    @pytest.mark.parametrize(("side_effect", "expected_error"), EXCEPTION_ERROR_CASES)
+    @pytest.mark.parametrize(
+        ("source", "step_id"),
+        [
+            (SOURCE_REAUTH, "reauth_confirm"),
+            (SOURCE_RECONFIGURE, "reconfigure_confirm"),
+        ],
+    )
+    async def test_confirm_step_exception(
+        self,
+        hass: HomeAssistant,
+        source: str,
+        step_id: str,
+        side_effect: Exception,
+        expected_error: str,
+    ) -> None:
+        """Exceptions during key validation re-show the confirm form with an error."""
+        entry = self._create_standard_entry(hass)
+        result = await self._init_flow(hass, entry, source)
+        with patch(
+            f"{FLOW_STEP_MODULE[source]}.IoTApiClient",
+        ) as mock_cls:
+            mock_cls.return_value.get_mqtt_credentials = AsyncMock(
+                side_effect=side_effect
+            )
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_ACCESS_KEY: "test_ak", CONF_SECRET_KEY: "test_sk"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == step_id
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == expected_error
+
+    @pytest.mark.parametrize(("side_effect", "expected_error"), EXCEPTION_ERROR_CASES)
+    @pytest.mark.parametrize(
+        ("source", "step_id"),
+        [
+            (SOURCE_REAUTH, "reauth_enhanced"),
+            (SOURCE_RECONFIGURE, "reconfigure_enhanced"),
+        ],
+    )
+    async def test_enhanced_step_exception(
+        self,
+        hass: HomeAssistant,
+        source: str,
+        step_id: str,
+        side_effect: Exception,
+        expected_error: str,
+    ) -> None:
+        """Exceptions during Enhanced login re-show the enhanced form with an error."""
+        entry = self._create_enhanced_entry(hass)
+        result = await self._init_flow(hass, entry, source)
+        result = await self._pass_confirm_step(hass, result, source)
+        assert result["step_id"] == step_id
+
+        with patch(
+            f"{FLOW_STEP_MODULE[source]}.enhanced_login",
+            new_callable=AsyncMock,
+            side_effect=side_effect,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "test_password"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == step_id
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == expected_error
+
+    @pytest.mark.parametrize(("side_effect", "expected_error"), EXCEPTION_ERROR_CASES)
+    @pytest.mark.parametrize(
+        ("source", "step_id"),
+        [
+            (SOURCE_REAUTH, "reauth_app"),
+            (SOURCE_RECONFIGURE, "reconfigure_app"),
+        ],
+    )
+    async def test_app_step_exception(
+        self,
+        hass: HomeAssistant,
+        source: str,
+        step_id: str,
+        side_effect: Exception,
+        expected_error: str,
+    ) -> None:
+        """Exceptions during app login re-show the app form with an error."""
+        entry = self._create_app_auth_entry(hass)
+        result = await self._init_flow(hass, entry, source)
+        assert result["step_id"] == step_id
+
+        with patch(
+            f"{FLOW_STEP_MODULE[source]}.enhanced_login",
+            new_callable=AsyncMock,
+            side_effect=side_effect,
+        ):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "test@example.com", CONF_PASSWORD: "test_password"},
+            )
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == step_id
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == expected_error
+
+    @pytest.mark.parametrize(
+        ("source", "step_id"),
+        [
+            (SOURCE_REAUTH, "reauth_enhanced"),
+            (SOURCE_RECONFIGURE, "reconfigure_enhanced"),
+        ],
+    )
+    async def test_enhanced_step_empty_credentials(
+        self, hass: HomeAssistant, source: str, step_id: str
+    ) -> None:
+        """Empty email/password on the enhanced step never calls the login API."""
+        entry = self._create_enhanced_entry(hass)
+        result = await self._init_flow(hass, entry, source)
+        result = await self._pass_confirm_step(hass, result, source)
+        assert result["step_id"] == step_id
+
+        with patch(
+            f"{FLOW_STEP_MODULE[source]}.enhanced_login",
+            new_callable=AsyncMock,
+        ) as mock_login:
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "", CONF_PASSWORD: ""},
+            )
+            mock_login.assert_not_called()
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == step_id
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+    @pytest.mark.parametrize(
+        ("source", "step_id"),
+        [
+            (SOURCE_REAUTH, "reauth_app"),
+            (SOURCE_RECONFIGURE, "reconfigure_app"),
+        ],
+    )
+    async def test_app_step_empty_credentials(
+        self, hass: HomeAssistant, source: str, step_id: str
+    ) -> None:
+        """Empty email/password on the app step never calls the login API."""
+        entry = self._create_app_auth_entry(hass)
+        result = await self._init_flow(hass, entry, source)
+        assert result["step_id"] == step_id
+
+        with patch(
+            f"{FLOW_STEP_MODULE[source]}.enhanced_login",
+            new_callable=AsyncMock,
+        ) as mock_login:
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"],
+                {CONF_EMAIL: "", CONF_PASSWORD: ""},
+            )
+            mock_login.assert_not_called()
+        assert result["type"] is FlowResultType.FORM
+        assert result["step_id"] == step_id
+        errors = result["errors"]
+        assert errors is not None
+        assert errors["base"] == "enhanced_login_failed"
+
+
+# ===========================================================================
+# Helper functions: _device_label, _normalize_*, _async_fetch_app_devices
+# ===========================================================================
+
+
+class TestDeviceLabel:
+    """Tests for the _device_label helper."""
+
+    def test_fallback_to_bare_sn(self) -> None:
+        """No name, product_name, or known device type yields the bare SN label."""
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        label = _device_label({"sn": "HW52FAKE00000001", "online": 1})
+        assert label == "HW52...0001"
+
+    def test_fallback_to_bare_sn_offline(self) -> None:
+        """Offline device without name gets the offline suffix on the bare SN."""
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        label = _device_label({"sn": "HW52FAKE00000001", "online": 0})
+        assert label == "HW52...0001 (offline)"
+
+    def test_short_sn_not_truncated(self) -> None:
+        """SNs of 8 characters or fewer are used verbatim."""
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        label = _device_label({"sn": "R351", "online": 1})
+        assert label == "R351"
+
+    def test_unknown_device_type_is_marked(self) -> None:
+        """A device with no parser says so in its own label.
+
+        #297: picking one succeeded silently and produced two diagnostic
+        sensors, which reads as a broken setup rather than an unsupported
+        model.
+        """
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        label = _device_label(
+            {
+                "sn": "ZZ99FAKE00000001",
+                "product_name": "Mystery Box",
+                "device_type": "unknown",
+                "online": 1,
+            }
+        )
+        assert (
+            label == "Mystery Box (ZZ99...0001) - not supported yet (no data exposed)"
+        )
+
+    def test_known_device_type_is_not_marked(self) -> None:
+        """A supported device carries no marker."""
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        label = _device_label(
+            {
+                "sn": "R351FAKE00000001",
+                "product_name": "Delta 2 Max",
+                "device_type": "delta",
+                "online": 1,
+            }
+        )
+        assert label == "Delta 2 Max (R351...0001)"
+
+    def test_missing_device_type_is_not_marked(self) -> None:
+        """An unclassified entry is not the same as an unsupported one.
+
+        Marking on an absent field would tell the owner of a working
+        device that it is not supported, which is the confusion that
+        refused an HJ36 once (#267).
+        """
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        assert "not supported" not in _device_label(
+            {"sn": "HJ36FAKE00000001", "product_name": "PowerOcean", "online": 1}
+        )
+        assert "not supported" not in _device_label(
+            {
+                "sn": "HJ36FAKE00000001",
+                "product_name": "PowerOcean",
+                "device_type": "",
+                "online": 1,
+            }
+        )
+
+    def test_app_path_device_without_product_name_is_not_marked(self) -> None:
+        """A prefix-classified device survives the app path unmarked.
+
+        The app API returns no product name, so the serial prefix is the
+        only classification such an entry ever gets. #326 reported what
+        happens when the prefix is missing: a `J329` was listed and then
+        skipped for having no parser. Walking the config-flow half of the
+        classification is what neither half covers on its own.
+        """
+        from custom_components.ecoflow_energy.config_flow import (
+            EcoFlowEnergyConfigFlow,
+        )
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        devices = EcoFlowEnergyConfigFlow._normalize_app_devices(
+            [
+                {"sn": "J329FAKE00000001", "product_name": "", "online": 1},
+            ]
+        )
+
+        # The rendered label first: it is the thing the user sees, and it
+        # pins the whole name fallback chain, not only the type field.
+        assert _device_label(devices[0]) == "PowerOcean (J329...0001)"
+        assert devices[0]["device_type"] == "powerocean"
+
+    def test_marker_and_offline_both_show(self) -> None:
+        """Being offline and being unsupported are separate facts."""
+        from custom_components.ecoflow_energy.config_flow_setup import _device_label
+
+        label = _device_label(
+            {
+                "sn": "ZZ99FAKE00000001",
+                "product_name": "Mystery Box",
+                "device_type": "unknown",
+                "online": 0,
+            }
+        )
+        assert (
+            label == "Mystery Box (ZZ99...0001) (offline) - not supported yet (no data "
+            "exposed)"
+        )
+
+
+class TestNormalizeDevices:
+    """Tests for the _normalize_devices / _normalize_app_devices helpers."""
+
+    def test_normalize_devices_drops_missing_sn(self) -> None:
+        """IoT API devices without an sn are silently dropped."""
+        from custom_components.ecoflow_energy.config_flow import (
+            EcoFlowEnergyConfigFlow,
+        )
+
+        result = EcoFlowEnergyConfigFlow._normalize_devices(
+            [
+                {"productName": "Delta 2 Max", "online": 1},
+                {"sn": "", "productName": "PowerOcean", "online": 1},
+                {"sn": "R351FAKE00000001", "productName": "Delta 2 Max", "online": 1},
+            ]
+        )
+        assert len(result) == 1
+        assert result[0]["sn"] == "R351FAKE00000001"
+
+    def test_normalize_app_devices_drops_missing_sn(self) -> None:
+        """App API devices without an sn are silently dropped."""
+        from custom_components.ecoflow_energy.config_flow import (
+            EcoFlowEnergyConfigFlow,
+        )
+
+        result = EcoFlowEnergyConfigFlow._normalize_app_devices(
+            [
+                {"product_name": "PowerOcean", "online": 1},
+                {"sn": "", "product_name": "Smart Plug", "online": 1},
+                {"sn": "HJ31FAKE00000001", "product_name": "PowerOcean", "online": 1},
+            ]
+        )
+        assert len(result) == 1
+        assert result[0]["sn"] == "HJ31FAKE00000001"
+
+    def test_normalize_app_devices_reclassifies_unknown_type_by_sn(self) -> None:
+        """An unknown app API device type falls back to SN classification."""
+        from custom_components.ecoflow_energy.config_flow import (
+            EcoFlowEnergyConfigFlow,
+        )
+
+        result = EcoFlowEnergyConfigFlow._normalize_app_devices(
+            [
+                {
+                    "sn": "HJ31FAKE00000001",
+                    "product_name": "",
+                    "online": 1,
+                    "device_type": "unknown",
+                },
+            ]
+        )
+
+        assert result[0]["device_type"] == "powerocean"
+
+    def test_normalize_app_devices_reclassifies_empty_type_by_sn(self) -> None:
+        """An empty app API device type falls back to SN classification."""
+        from custom_components.ecoflow_energy.config_flow import (
+            EcoFlowEnergyConfigFlow,
+        )
+
+        result = EcoFlowEnergyConfigFlow._normalize_app_devices(
+            [
+                {
+                    "sn": "HJ31FAKE00000001",
+                    "product_name": "",
+                    "online": 1,
+                    "device_type": "",
+                },
+            ]
+        )
+
+        assert result[0]["device_type"] == "powerocean"
+
+    def test_normalize_app_devices_reclassifies_none_type_by_sn(self) -> None:
+        """A null app API device type falls back to SN classification."""
+        from custom_components.ecoflow_energy.config_flow import (
+            EcoFlowEnergyConfigFlow,
+        )
+
+        result = EcoFlowEnergyConfigFlow._normalize_app_devices(
+            [
+                {
+                    "sn": "HJ31FAKE00000001",
+                    "product_name": "",
+                    "online": 1,
+                    "device_type": None,
+                },
+            ]
+        )
+
+        assert result[0]["device_type"] == "powerocean"
+
+
+class TestFetchAppDevices:
+    """Tests for the module-level _async_fetch_app_devices helper.
+
+    The helper is only called from EcoFlowOptionsFlow.async_step_init;
+    it is tested directly here for the empty-result paths.
+    """
+
+    async def test_login_failure_returns_empty(self, hass: HomeAssistant) -> None:
+        """A failed login yields an empty device list."""
+        from custom_components.ecoflow_energy.config_flow_options import (
+            _async_fetch_app_devices,
+        )
+
+        with patch(
+            "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            devices = await _async_fetch_app_devices(
+                hass, "test@example.com", "test_password"
+            )
+        assert devices == []
+
+    async def test_empty_raw_devices_returns_empty(self, hass: HomeAssistant) -> None:
+        """An empty raw device list yields an empty normalized list."""
+        from custom_components.ecoflow_energy.config_flow_options import (
+            _async_fetch_app_devices,
+        )
+
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.enhanced_login",
+                new_callable=AsyncMock,
+                return_value={"token": "jwt_token", "user_id": "uid123"},
+            ),
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options.get_app_device_list",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            devices = await _async_fetch_app_devices(
+                hass, "test@example.com", "test_password"
+            )
+        assert devices == []
+
+
+class TestPickerHelpMatchesTheModeItRenders:
+    """The help text and the form it sits in, checked against each other.
+
+    #296 shipped a single help text naming both sign-in methods and ending
+    with an instruction that only one of them can follow: switch on the
+    recording "below", where the switch below exists for account sign-in
+    only. The reporter ran developer keys, went looking for a control this
+    dialog deliberately never rendered, and could not find it.
+
+    Every test that passed while that shipped asserted a property of the
+    string on its own. The defect is not in the string, it is in the
+    relation between the string and the schema of the step showing it, so
+    the assertions here render the text with the flow's own placeholders
+    and compare it against the schema from the same result.
+    """
+
+    RECORDING_PHRASES = ("recording below", "Aufzeichnung der Diagnosedaten")
+
+    @staticmethod
+    def _render(template: str, placeholders: Mapping[str, str]) -> str:
+        """Resolve a translation string the way the frontend would.
+
+        Only the two forms this repo uses are handled: plain `{token}` and
+        the ICU `select` that carries a per-mode sentence. A token the flow
+        did not supply raises, because in the frontend it does not degrade
+        quietly either - the whole slot renders as a format error.
+        """
+        import re
+
+        def one_select(match: re.Match) -> str:
+            token, body = match.group(1), match.group(2)
+            if token not in placeholders:
+                raise AssertionError(f"flow supplied no placeholder {token!r}")
+            arms: dict[str, str] = dict(re.findall(r"(\w+)\s*\{([^{}]*)\}", body))
+            return arms.get(placeholders[token], arms.get("other", ""))
+
+        rendered = re.sub(
+            r"\{(\w+),\s*select,\s*((?:\w+\s*\{[^{}]*\}\s*)+)\}", one_select, template
+        )
+        for token in re.findall(r"\{(\w+)\}", rendered):
+            if token not in placeholders:
+                raise AssertionError(f"flow supplied no placeholder {token!r}")
+            rendered = rendered.replace("{" + token + "}", placeholders[token])
+        return rendered
+
+    @staticmethod
+    async def _open(hass: HomeAssistant, entry) -> ConfigFlowResult:
+        """Open the options form without letting it reach the network.
+
+        Both branches of the device-list fetch are stubbed, so which mode is
+        under test decides the text and nothing else.
+        """
+        with (
+            patch(
+                "custom_components.ecoflow_energy.config_flow_options."
+                "_async_fetch_app_devices",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "custom_components.ecoflow_energy.ecoflow.iot_api."
+                "IoTApiClient.get_device_list",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            return await hass.config_entries.options.async_init(entry.entry_id)
+
+    @classmethod
+    def _devices_help(cls, result: ConfigFlowResult) -> str:
+        """The help text the user is shown, for the step actually rendered.
+
+        Reading the step id off the result rather than assuming `init` is
+        the whole point: the flow picks the key, so a test that hard-coded
+        one would check text half the users never see.
+        """
+        import json
+        from pathlib import Path
+
+        strings = json.loads(
+            Path("custom_components/ecoflow_energy/strings.json").read_text()
+        )
+        step = strings["options"]["step"][result["step_id"]]
+        return cls._render(
+            step["data_description"]["devices"],
+            result.get("description_placeholders") or {},
+        )
+
+    async def test_developer_keys_are_never_sent_to_a_switch_they_do_not_have(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The reported defect, as an assertion.
+
+        Red before the fix: the text said "switch on the recording below"
+        while this schema has no such field.
+        """
+        entry = TestOptionsFlow()._create_standard_entry(hass)
+        result = await self._open(hass, entry)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        schema_keys = {key.schema for key in schema.schema}
+        assert CONF_RAW_CAPTURE not in schema_keys
+
+        text = self._devices_help(result)
+        for phrase in self.RECORDING_PHRASES:
+            assert phrase not in text, f"sends a developer-keys user to {phrase!r}"
+
+    async def test_account_sign_in_is_told_about_the_switch_it_has(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The mirror. Without it, deleting the sentence for everyone would
+        satisfy the test above and leave the other half of the users with no
+        instruction at all.
+        """
+        entry = TestOptionsFlow()._create_enhanced_entry(hass)
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_AUTH_METHOD: AUTH_METHOD_APP}
+        )
+        result = await self._open(hass, entry)
+
+        schema = result["data_schema"]
+        assert schema is not None
+        schema_keys = {key.schema for key in schema.schema}
+        assert CONF_RAW_CAPTURE in schema_keys
+
+        assert "recording below" in self._devices_help(result)
+
+    async def test_the_two_modes_do_not_get_the_same_text(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The claim #301's commit message made, as an assertion.
+
+        It said both texts "stop giving one instruction to two modes" while
+        its diff changed no flow code at all. This is the line that would
+        have refused that commit.
+        """
+        developer = TestOptionsFlow()._create_standard_entry(hass)
+        developer_text = self._devices_help(await self._open(hass, developer))
+
+        account = TestOptionsFlow()._create_enhanced_entry(hass)
+        hass.config_entries.async_update_entry(
+            account, data={**account.data, CONF_AUTH_METHOD: AUTH_METHOD_APP}
+        )
+        account_text = self._devices_help(await self._open(hass, account))
+
+        assert developer_text != account_text
+        # Both still explain the marker, so a split that dropped the
+        # explanation for one mode would not pass as a difference.
+        for text in (developer_text, account_text):
+            assert "not supported yet" in text
+            assert "diagnostics download" in text
+
+    async def test_an_entry_from_before_the_key_existed_reads_as_developer(
+        self, hass: HomeAssistant
+    ) -> None:
+        """No `auth_method` stored is an old developer-keys entry.
+
+        Without the default it would fall through to whichever branch a
+        missing value happens to take, and the user would be told to switch
+        on something their dialog does not have.
+        """
+        entry = TestOptionsFlow()._create_standard_entry(hass)
+        assert CONF_AUTH_METHOD not in entry.data
+
+        result = await self._open(hass, entry)
+
+        assert result["step_id"] == "init"
+        assert "recording below" not in self._devices_help(result)
+
+
+class TestEveryStepSuppliesItsOwnPlaceholders:
+    """A token no flow fills is a visible error, not a missing word.
+
+    The frontend runs the whole string through a formatter and, on an
+    unresolved token, renders the format error in place of the text. So the
+    tokens in the translation files and the placeholders the flows pass have
+    to agree exactly, in both directions, for every step.
+    """
+
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        import re
+
+        return set(re.findall(r"\{(\w+)[,}]", text))
+
+    def _all_step_texts(self) -> dict[str, set[str]]:
+        import json
+        from pathlib import Path
+
+        strings = json.loads(
+            Path("custom_components/ecoflow_energy/strings.json").read_text()
+        )
+        found: dict[str, set[str]] = {}
+        for section in ("config", "options"):
+            for step, body in strings.get(section, {}).get("step", {}).items():
+                tokens: set[str] = set()
+                tokens |= self._tokens(body.get("description", ""))
+                for value in (body.get("data_description") or {}).values():
+                    tokens |= self._tokens(value)
+                if tokens:
+                    found[f"{section}.{step}"] = tokens
+        return found
+
+    def test_the_only_token_in_use_is_supplied_by_a_flow(self) -> None:
+        """Every step carrying a token has a call site that fills it.
+
+        Kept as a grep rather than by driving every flow, because the point
+        is the pairing: a token added to a translation file without touching
+        the flow is exactly how the text and the code drift apart.
+        """
+        from pathlib import Path
+
+        sources = "\n".join(
+            path.read_text()
+            for path in Path("custom_components/ecoflow_energy").glob("config_flow*.py")
+        )
+        steps = self._all_step_texts()
+
+        # Positive control: if this ever finds nothing, the walk above broke
+        # and the loop below would pass while checking nothing.
+        assert steps, "no step carries a placeholder, so this test is blind"
+
+        for step, tokens in steps.items():
+            for token in tokens:
+                assert f'"{token}"' in sources, (
+                    f"{step} uses {{{token}}} and no config flow passes it"
+                )
+
+
+class TestSecretFieldsAreMasked:
+    """The EcoFlow secret key and the app password must never render as plain text.
+
+    Both fields used to be typed as ``str``, which the frontend renders as an
+    unmasked text input - the value is visible while the user types it and in
+    any screen share or over-the-shoulder view during setup. PLAN-141 replaced
+    both with a password :class:`TextSelector` at all ten call sites across
+    the four config-flow files.
+    """
+
+    def test_every_secret_and_password_field_uses_a_password_selector(self) -> None:
+        """Every ``CONF_SECRET_KEY``/``CONF_PASSWORD`` schema entry is masked.
+
+        Kept as a grep across the source rather than driving every step
+        through a running flow, because the point is exhaustive coverage of
+        the schema *definitions* - including the reauth and reconfigure
+        secret-key field, which no other test in this file drives - not
+        coverage of one runtime path to reach them.
+
+        The grep alone only proves a site *names* a password selector, not
+        that the name resolves to one at runtime - a `_PASSWORD_SELECTOR`
+        constant reassigned to `str`, or built with `TextSelectorType.TEXT`,
+        would still read as a password selector by name (PLAN-141 review
+        finding 2). So every module that had a match is also imported and
+        its `_PASSWORD_SELECTOR` constant is checked directly.
+
+        The regex allows the field name and the closing paren to be on
+        separate lines - the shape `CONF_ACCESS_KEY`/`CONF_EMAIL` already use
+        elsewhere in these files with a `default=...` clause - even though no
+        current `CONF_SECRET_KEY`/`CONF_PASSWORD` site is written that way
+        (finding 3): a future site in that form must still be caught.
+        """
+        import importlib
+        import re
+        from pathlib import Path
+
+        from homeassistant.helpers.selector import TextSelector
+
+        pattern = re.compile(
+            r"vol\.Required\(\s*(CONF_SECRET_KEY|CONF_PASSWORD)\b[^:]*?\)\s*:\s*([^,\n]+)",
+            re.DOTALL,
+        )
+        sources = {
+            path: path.read_text()
+            for path in Path("custom_components/ecoflow_energy").glob("config_flow*.py")
+        }
+        matches: list[tuple[Path, str, str]] = []
+        for path, text in sources.items():
+            for field, validator in pattern.findall(text):
+                matches.append((path, field, validator.strip()))
+
+        # Positive control: PLAN-141 names exactly ten sites across four
+        # files. Fewer means the walk missed a file, or the pattern no
+        # longer matches the code - either way this test would otherwise
+        # pass while checking nothing.
+        assert len(matches) >= 10, (
+            f"found only {len(matches)} CONF_SECRET_KEY/CONF_PASSWORD sites "
+            "(expected at least 10) - the walk or the pattern is broken"
+        )
+
+        for path, field, validator in matches:
+            assert validator != "str", (
+                f"{path.name}: {field} is still a plain str input and renders unmasked"
+            )
+            assert (
+                "TextSelectorType.PASSWORD" in validator
+                or "_PASSWORD_SELECTOR" in validator
+            ), f"{path.name}: {field} uses {validator!r}, not a password selector"
+
+        for path in {path for path, _, _ in matches}:
+            mod = importlib.import_module(
+                f"custom_components.ecoflow_energy.{path.stem}"
+            )
+            selector = mod._PASSWORD_SELECTOR
+            assert isinstance(selector, TextSelector), (
+                f"{path.name}: _PASSWORD_SELECTOR is {selector!r}, not a TextSelector"
+            )
+            assert selector.config["type"] == "password", (
+                f"{path.name}: _PASSWORD_SELECTOR type is "
+                f"{selector.config['type']!r}, not 'password'"
+            )
+
+    async def test_developer_and_app_credential_steps_render_password_selectors(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The two steps reachable through a live flow mask their secret field.
+
+        Complements the source-level grep above with the same check HA
+        itself performs when rendering the form: the schema key's validator
+        must actually be a password :class:`TextSelector` instance, not just
+        text that mentions one.
+        """
+        from homeassistant.helpers.selector import TextSelector
+
+        developer_result = await _select_mode(hass, MODE_STANDARD)
+        assert developer_result["step_id"] == "developer"
+
+        app_result = await _select_mode(hass, MODE_ENHANCED)
+        assert app_result["step_id"] == "app_credentials"
+
+        for result, conf_key in (
+            (developer_result, CONF_SECRET_KEY),
+            (app_result, CONF_PASSWORD),
+        ):
+            schema = result["data_schema"].schema
+            marker = next(
+                key for key in schema if getattr(key, "schema", None) == conf_key
+            )
+            validator = schema[marker]
+            assert isinstance(validator, TextSelector)
+            assert validator.config["type"] == "password"

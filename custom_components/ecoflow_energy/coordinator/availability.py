@@ -1,0 +1,321 @@
+"""Availability staging and stale detection for the EcoFlow device coordinator."""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import timedelta
+from typing import TYPE_CHECKING
+
+from ..const import (
+    DEVICE_TYPE_POWERPULSE2,
+    DEVICE_TYPE_SMARTPLUG,
+    DEVICE_TYPE_WAVE3,
+    HARD_UNAVAILABLE_S,
+    HTTP_FALLBACK_INTERVAL_S,
+    MQTT_HEALTH_CHECK_INTERVAL_S,
+    POWERPULSE2_HARD_UNAVAILABLE_S,
+    POWERPULSE2_SOFT_UNAVAILABLE_S,
+    POWERPULSE2_STALE_THRESHOLD_S,
+    SMARTPLUG_HARD_UNAVAILABLE_S,
+    SMARTPLUG_SOFT_UNAVAILABLE_S,
+    SMARTPLUG_STALE_THRESHOLD_S,
+    SOFT_UNAVAILABLE_S,
+    STALE_THRESHOLD_S,
+    WAVE3_SOFT_UNAVAILABLE_S,
+    WAVE3_STALE_THRESHOLD_S,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ._typing import CoordinatorState as _Base
+else:
+    _Base = object
+
+
+class AvailabilityMixin(_Base):
+    """Mixin providing graduated availability and stale checks."""
+
+    @property
+    def availability_stage(self) -> str:
+        """Return graduated availability stage based on data age.
+
+        Stages (app-auth MQTT-only path):
+        - "healthy": data flowing within stale threshold
+        - "stale": data age > stale threshold, reconnect active, entities still
+          available
+        - "degraded": data age > soft_unavailable, entities available with old values
+        - "unavailable": data age > hard_unavailable, entities go unavailable in HA
+
+        Developer-auth with HTTP fallback: uses _device_available flag (HTTP failures
+        control availability), not data age.
+        """
+        # Developer-auth: HTTP fallback controls availability
+        if self._http_client is not None:
+            if not self._device_available:
+                return "unavailable"
+            age = self._mqtt_data_age()
+            if age > self._stale_threshold_s():
+                return "stale"
+            return "healthy"
+
+        # App-auth: graduated degradation based purely on data age.
+        # This is independent of MQTT connection state - a disconnected
+        # client with recent data is still "healthy" (data is fresh).
+        age = self._mqtt_data_age()
+        if age <= self._stale_threshold_s():
+            return "healthy"
+        if age <= self._soft_unavailable_s():
+            return "stale"
+        if age <= self._hard_unavailable_s():
+            return "degraded"
+        return "unavailable"
+
+    @property
+    def mqtt_status(self) -> str:
+        """Return MQTT connection status for diagnostic sensor.
+
+        Reports transport-level state, independent of availability stage.
+        """
+        if self._mqtt_client is None:
+            return "not_configured"
+        if not self._mqtt_client.is_connected():
+            return "disconnected"
+        if self.data_receiving:
+            return "receiving"
+        return "connected_stale"
+
+    @property
+    def data_receiving(self) -> bool:
+        """Return whether MQTT is actively delivering data (not just TCP-connected)."""
+        if self._mqtt_client is None or not self._mqtt_client.is_connected():
+            return False
+        if self._last_mqtt_ts <= 0:
+            return False
+        age = time.monotonic() - self._last_mqtt_ts
+        return age <= self._stale_threshold_s()
+
+    def _mqtt_data_age(self) -> float:
+        """Return the age of the last MQTT data in seconds."""
+        if self._last_mqtt_ts <= 0:
+            return float("inf")
+        return time.monotonic() - self._last_mqtt_ts
+
+    def _soft_unavailable_s(self) -> float:
+        """Return the soft-unavailable threshold for this device."""
+        if self._enhanced_mode and self.device_type == DEVICE_TYPE_SMARTPLUG:
+            return SMARTPLUG_SOFT_UNAVAILABLE_S
+        if self.device_type == DEVICE_TYPE_POWERPULSE2:
+            return POWERPULSE2_SOFT_UNAVAILABLE_S
+        if self._wave3_idle():
+            return WAVE3_SOFT_UNAVAILABLE_S
+        return SOFT_UNAVAILABLE_S
+
+    def _hard_unavailable_s(self) -> float:
+        """Return the hard-unavailable threshold for this device."""
+        if self._enhanced_mode and self.device_type == DEVICE_TYPE_SMARTPLUG:
+            return SMARTPLUG_HARD_UNAVAILABLE_S
+        if self.device_type == DEVICE_TYPE_POWERPULSE2:
+            return POWERPULSE2_HARD_UNAVAILABLE_S
+        return HARD_UNAVAILABLE_S
+
+    @property
+    def connection_mode(self) -> str:
+        """Return current connection mode for diagnostic sensor."""
+        if not self._enhanced_mode:
+            return "standard"
+        if self.update_interval is not None:
+            return "enhanced_fallback"
+        return "enhanced"
+
+    # ------------------------------------------------------------------
+    # Stale detection + fallback switching (4-tier reconnect tier 4)
+    # ------------------------------------------------------------------
+
+    def _schedule_stale_check(self) -> None:
+        """Schedule a periodic check for stale MQTT data."""
+        stale_threshold_s = min(self._stale_threshold_s(), MQTT_HEALTH_CHECK_INTERVAL_S)
+        self._stale_check_unsub = self.hass.loop.call_later(
+            stale_threshold_s,
+            self._check_stale,
+        )
+
+    def _stale_threshold_s(self) -> float:
+        """Return the MQTT stale threshold for this device."""
+        if self._enhanced_mode and self.device_type == DEVICE_TYPE_SMARTPLUG:
+            return SMARTPLUG_STALE_THRESHOLD_S
+        if self.device_type == DEVICE_TYPE_POWERPULSE2:
+            return POWERPULSE2_STALE_THRESHOLD_S
+        if self._wave3_idle():
+            return WAVE3_STALE_THRESHOLD_S
+        return STALE_THRESHOLD_S
+
+    def _wave3_idle(self) -> bool:
+        """A WAVE 3 that is not running, so it pushes every 120 s, not every 2 s.
+
+        No `_enhanced_mode` gate like the Smart Plug line above: the WAVE 3 is
+        Enhanced-only (error 1006 on developer keys), so there is no other
+        mode to tell apart. `running` absent means no upload yet, which is
+        treated as idle, the slower of the two cadences.
+        """
+        return self.device_type == DEVICE_TYPE_WAVE3 and not self._device_data.get(
+            "running"
+        )
+
+    def _check_stale(self) -> None:
+        """Check MQTT data freshness and manage graduated availability.
+
+        Reconnect strategy (unchanged):
+        1. Paho auto-reconnect (immediate, same ClientID) - handled by Paho
+        2. Force-reconnect with new ClientID - on connected-but-silent
+        3. Counter-reset every 5 min (never give up) - handled by cloud_mqtt
+        4. HTTP fallback - developer-auth only
+
+        Graduated availability (new):
+        - healthy: data within stale threshold
+        - stale: data age > stale threshold, reconnect active, entities available
+        - degraded: data age > soft_unavailable, entities available with old values
+        - unavailable: data age > hard_unavailable, entities go unavailable in HA
+        """
+        from .core import DeviceSnapshot
+
+        if self._shutdown:
+            return
+
+        stale_threshold_s = self._stale_threshold_s()
+        age = self._mqtt_data_age()
+        mqtt_connected = (
+            self._mqtt_client is not None and self._mqtt_client.is_connected()
+        )
+
+        if self._http_client is not None:
+            # Developer-auth: HTTP fallback available
+            if age > stale_threshold_s and self.update_interval is None:
+                _LOGGER.info(
+                    "MQTT stale for %s (%.0fs) - switching to HTTP fallback (tier 4)",
+                    self.device_tag,
+                    age,
+                )
+                self._log_event("stale_detected", f"age={age:.0f}s, http_fallback")
+                self.update_interval = timedelta(seconds=HTTP_FALLBACK_INTERVAL_S)
+            elif age <= stale_threshold_s and self.update_interval is not None:
+                _LOGGER.info(
+                    "MQTT recovered for %s - disabling HTTP fallback", self.device_tag
+                )
+                self._log_event("stale_recovered", "http_fallback_disabled")
+                self.update_interval = None
+        else:
+            # App-auth: graduated degradation based on data age.
+            # Force-reconnect is decoupled from entity availability.
+            hard_unavailable_s = self._hard_unavailable_s()
+
+            if age > stale_threshold_s:
+                # Connected-but-silent escalation. A full reconnect drops the
+                # WSS session and re-runs the whole subscribe handshake, which
+                # is expensive and - on devices that push slowly - happens
+                # every stale interval. Re-sending the post-connect requests
+                # achieves the same wake-up at a fraction of the cost, so it
+                # runs first; the reconnect follows only if the device stays
+                # silent through the next stale interval.
+                now = time.monotonic()
+                if (
+                    mqtt_connected
+                    and self._mqtt_client is not None
+                    and self._last_mqtt_ts > 0.0
+                    and (now - self._last_stale_reconnect_ts) >= stale_threshold_s
+                ):
+                    self._last_stale_reconnect_ts = now
+                    if not self._stale_reactivate_tried:
+                        self._stale_reactivate_tried = True
+                        _LOGGER.debug(
+                            "MQTT stale for %s [%s] (%.0fs) while connected - "
+                            "re-sending initial requests",
+                            self.device_name,
+                            self.device_tag,
+                            age,
+                        )
+                        self._log_event("stale_reactivate", f"age={age:.0f}s")
+                        self.hass.async_add_executor_job(
+                            self._mqtt_client.resend_initial_requests,
+                        )
+                    else:
+                        _LOGGER.info(
+                            "MQTT stale for %s [%s] (%.0fs) while connected - "
+                            "forcing reconnect",
+                            self.device_name,
+                            self.device_tag,
+                            age,
+                        )
+                        self._log_event("stale_force_reconnect", f"age={age:.0f}s")
+                        self.hass.async_add_executor_job(
+                            self._mqtt_client.force_reconnect
+                        )
+                        # Next silence starts with the cheap remedy again.
+                        self._stale_reactivate_tried = False
+
+                # Graduated availability: only mark unavailable after hard threshold
+                if self._device_available and age >= hard_unavailable_s:
+                    reconnect_attempts = (
+                        self._mqtt_client.reconnect_attempts
+                        if self._mqtt_client is not None
+                        else 0
+                    )
+                    # Mirror the MQTT layer's escalation (see the cloud_mqtt
+                    # disconnect handler): a first interruption with no pending
+                    # reconnects is normal broker/device silence and stays at
+                    # INFO, symmetric with the recovery log below. Only a
+                    # sustained failure, where reconnects are already being
+                    # attempted, is a degraded state worth a WARNING. This keeps
+                    # healthy operation free of WARNING noise.
+                    age_str = (
+                        "no data since connect"
+                        if self._last_mqtt_ts <= 0
+                        else f"{age:.0f}s"
+                    )
+                    log = _LOGGER.warning if reconnect_attempts > 0 else _LOGGER.info
+                    log(
+                        "Device %s [%s] became unavailable (%s, reconnect_attempts=%d)",
+                        self.device_name,
+                        self.device_tag,
+                        age_str,
+                        reconnect_attempts,
+                    )
+                    self._log_event(
+                        "stale_unavailable",
+                        f"age={age_str}, attempts={reconnect_attempts}",
+                    )
+                    self._device_available = False
+                    self._snapshot = DeviceSnapshot(
+                        data={},
+                        captured_at=self._snapshot.captured_at,
+                        source=self._snapshot.source,
+                        key_count=0,
+                    )
+                    # No data flows while the stream is down, so entities must
+                    # be told about the availability flip explicitly.
+                    self.async_update_listeners()
+            else:
+                if not self._device_available:
+                    _LOGGER.info(
+                        "MQTT recovered for %s [%s] - device available again",
+                        self.device_name,
+                        self.device_tag,
+                    )
+                    self._log_event("stale_recovered", "device_available")
+                    self._device_available = True
+                    # Push the recovery to entities even before the next data
+                    # frame arrives, so they return from unavailable promptly.
+                    self.async_update_listeners()
+                self._last_stale_reconnect_ts = 0.0
+                self._stale_reactivate_tried = False
+
+        # Tier 2+3: try MQTT reconnect if disconnected
+        if self._mqtt_client is not None and not mqtt_connected:
+            self.hass.async_add_executor_job(self._mqtt_client.try_reconnect)
+
+        # Re-schedule unless shutting down
+        self._stale_check_unsub = self.hass.loop.call_later(
+            min(stale_threshold_s, MQTT_HEALTH_CHECK_INTERVAL_S),
+            self._check_stale,
+        )

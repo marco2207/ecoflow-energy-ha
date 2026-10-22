@@ -1,0 +1,444 @@
+"""Tests for the Delta 3 SET command builders.
+
+The envelope and the value ranges are vendor-specified, see
+docs/reference/ecoflow-api-delta3-max-plus.md. These tests pin both so a
+refactor cannot silently change what reaches the device.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from custom_components.ecoflow_energy.const import DELTA3_NUMBERS
+from custom_components.ecoflow_energy.ecoflow.delta3_commands import (
+    AC_CHARGE_MODE_FIELD,
+    DELTA3_NUMBER_PARAMS,
+    DELTA3_SWITCH_PARAMS,
+    backup_reserve_soc_bounds,
+    build_number_command,
+    build_proto_command,
+    build_switch_command,
+    parse_config_write_ack,
+)
+from custom_components.ecoflow_energy.ecoflow.proto.decoder import (
+    decode_header_message,
+)
+from custom_components.ecoflow_energy.ecoflow.proto_encoding import (
+    encode_field_bytes,
+    encode_field_varint,
+)
+
+
+def _varint_field(pdata: bytes, field_number: int) -> int | None:
+    """Read one varint field out of a pdata blob, or None if it is absent."""
+    i = 0
+    while i < len(pdata):
+        tag = 0
+        shift = 0
+        while i < len(pdata):
+            byte = pdata[i]
+            i += 1
+            tag |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                break
+            shift += 7
+        if tag & 0x07 != 0:
+            return None
+        value = 0
+        shift = 0
+        while i < len(pdata):
+            byte = pdata[i]
+            i += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                break
+            shift += 7
+        if tag >> 3 == field_number:
+            return value
+    return None
+
+
+EXPECTED_ENVELOPE = {
+    "cmdId": 17,
+    "cmdFunc": 254,
+    "dest": 2,
+    "dirDest": 1,
+    "dirSrc": 1,
+    "needAck": True,
+}
+
+
+class TestEnvelope:
+    def test_every_switch_carries_the_documented_envelope(self) -> None:
+        for key in DELTA3_SWITCH_PARAMS:
+            cmd = build_switch_command(key, True)
+            assert cmd is not None
+            for field, value in EXPECTED_ENVELOPE.items():
+                assert cmd[field] == value, f"{key}: {field}"
+
+    def test_every_number_carries_the_documented_envelope(self) -> None:
+        for key in DELTA3_NUMBER_PARAMS:
+            cmd = build_number_command(key, 10)
+            assert cmd is not None
+            for field, value in EXPECTED_ENVELOPE.items():
+                assert cmd[field] == value, f"{key}: {field}"
+
+    def test_source_direction_is_dir_src_not_dir_soc(self) -> None:
+        """The MQTT sample in the vendor docs spells this `dirSoc`.
+
+        That reads like a typo for a direction *source*, and the HTTP samples
+        all use `dirSrc`. Pinned so nobody "fixes" it back.
+        """
+        cmd = build_switch_command("ac_out_switch", True)
+        assert cmd is not None
+        assert "dirSrc" in cmd
+        assert "dirSoc" not in cmd
+
+
+class TestSwitchCommands:
+    @pytest.mark.parametrize(
+        ("key", "params_key"),
+        [
+            ("ac_out_switch", "cfgAcOutOpen"),
+            ("ac2_out_switch", "cfgAc2OutOpen"),
+            ("dc_12v_out_switch", "cfgDc12vOutOpen"),
+            ("xboost_switch", "cfgXboostEn"),
+            ("beeper_switch", "cfgBeepEn"),
+            ("bypass_out_disable_switch", "cfgBypassOutDisable"),
+        ],
+    )
+    def test_flat_switches_map_to_the_documented_param(
+        self, key: str, params_key: str
+    ) -> None:
+        cmd_on = build_switch_command(key, True)
+        cmd_off = build_switch_command(key, False)
+        assert cmd_on is not None
+        assert cmd_off is not None
+        assert cmd_on["params"] == {params_key: True}
+        assert cmd_off["params"] == {params_key: False}
+
+    def test_energy_backup_is_nested(self) -> None:
+        """cfgEnergyBackup is the only control with a nested payload."""
+        cmd = build_switch_command("energy_backup_switch", True)
+        assert cmd is not None
+        assert cmd["params"] == {"cfgEnergyBackup": {"energyBackupEn": True}}
+
+    def test_values_are_real_booleans(self) -> None:
+        """The contract types these as bool, not 0/1."""
+        # Deliberate: the contract types this argument bool. Passing 1 is the
+        # point of the test - it proves a truthy int still coerces to True
+        # instead of being rejected or stored verbatim. Do not "fix" this to
+        # True, that would delete the coercion check while leaving it green.
+        cmd = build_switch_command("ac_out_switch", 1)  # type: ignore[arg-type]
+        assert cmd is not None
+        assert cmd["params"]["cfgAcOutOpen"] is True
+
+    def test_unknown_key_returns_none(self) -> None:
+        assert build_switch_command("no_such_switch", True) is None
+
+
+class TestNumberCommands:
+    @pytest.mark.parametrize(
+        ("key", "params_key", "value"),
+        [
+            ("backup_reserve_soc", "cfgBackupReverseSoc", 41),
+            ("max_charge_soc", "cfgMaxChgSoc", 80),
+            ("min_discharge_soc", "cfgMinDsgSoc", 20),
+        ],
+    )
+    def test_in_range_values_pass_through(
+        self, key: str, params_key: str, value: int
+    ) -> None:
+        cmd = build_number_command(key, value)
+        assert cmd is not None
+        assert cmd["params"] == {params_key: value}
+
+    @pytest.mark.parametrize(
+        ("key", "params_key", "low", "high"),
+        [
+            ("backup_reserve_soc", "cfgBackupReverseSoc", 5, 100),
+            ("max_charge_soc", "cfgMaxChgSoc", 50, 100),
+            ("min_discharge_soc", "cfgMinDsgSoc", 0, 30),
+        ],
+    )
+    def test_values_are_clamped_to_the_vendor_range(
+        self, key: str, params_key: str, low: int, high: int
+    ) -> None:
+        below_range = build_number_command(key, low - 10)
+        above_range = build_number_command(key, high + 10)
+        at_low = build_number_command(key, low)
+        at_high = build_number_command(key, high)
+        assert below_range is not None
+        assert above_range is not None
+        assert at_low is not None
+        assert at_high is not None
+        assert below_range["params"][params_key] == low
+        assert above_range["params"][params_key] == high
+        assert at_low["params"][params_key] == low
+        assert at_high["params"][params_key] == high
+
+    def test_backup_reserve_above_fifty_is_sent_as_is(self) -> None:
+        """The reserve used to stop at 50; the battery limits bound it now."""
+        cmd = build_number_command("backup_reserve_soc", 80)
+        assert cmd is not None
+        assert cmd["params"]["cfgBackupReverseSoc"] == 80
+
+    def test_float_input_is_rounded_to_int(self) -> None:
+        cmd = build_number_command("max_charge_soc", 79.6)
+        assert cmd is not None
+        params = cmd["params"]
+        assert params["cfgMaxChgSoc"] == 80
+        assert isinstance(params["cfgMaxChgSoc"], int)
+
+    def test_unknown_key_returns_none(self) -> None:
+        assert build_number_command("no_such_number", 50) is None
+
+
+class TestBackupReserveBounds:
+    """The reserve runs from five above the discharge limit to the charge limit."""
+
+    def test_bounds_follow_the_two_battery_limits(self) -> None:
+        """Measured on a P231: with the discharge limit at 10 the device stored
+        a write of 12 as 15, and kept a reserve equal to the charge limit."""
+        assert backup_reserve_soc_bounds(90, 10) == (15, 90)
+        assert backup_reserve_soc_bounds(80, 20) == (25, 80)
+
+    def test_missing_limits_give_the_declared_range(self) -> None:
+        assert backup_reserve_soc_bounds(None, None) == (5, 100)
+        assert backup_reserve_soc_bounds(90, None) == (5, 90)
+        assert backup_reserve_soc_bounds(None, 10) == (15, 100)
+
+    def test_out_of_range_limits_stay_inside_the_declared_range(self) -> None:
+        assert backup_reserve_soc_bounds(120, -5) == (5, 100)
+
+    @pytest.mark.parametrize(
+        ("max_charge", "min_discharge"),
+        [(40, 45), (40, 38), (3, None)],
+    )
+    def test_crossed_limits_fall_back_to_the_declared_range(
+        self, max_charge: int, min_discharge: int | None
+    ) -> None:
+        """An inverted range makes Home Assistant refuse every value."""
+        assert backup_reserve_soc_bounds(max_charge, min_discharge) == (5, 100)
+
+    def test_the_entity_declares_the_range_the_builder_clamps_to(self) -> None:
+        """One range in two places: nothing else ties them together."""
+        definition = next(d for d in DELTA3_NUMBERS if d.key == "backup_reserve_soc")
+        entry = DELTA3_NUMBER_PARAMS["backup_reserve_soc"]
+        assert (definition.min_value, definition.max_value) == (
+            entry.minimum,
+            entry.maximum,
+        )
+
+
+class TestProtoCommands:
+    """The binary variant used by app logins, which have no HTTP endpoint.
+
+    The frame layout is hardware-verified (ack plus readback of the new
+    value). These tests pin the payload bytes so a refactor cannot silently
+    change which setting reaches the device.
+    """
+
+    SN = "D3M1TESTSN000000"
+
+    def _pdata(self, frame: bytes) -> str:
+        """Return the ConfigWrite payload hex out of a full SET frame."""
+        headers, _ = decode_header_message(frame)
+        assert len(headers) == 1
+        return headers[0]["pdata"]
+
+    @pytest.mark.parametrize(
+        ("key", "expected_pdata"),
+        [
+            ("beeper_switch", "4801"),  # field 9
+            ("ac_out_switch", "e00401"),  # field 76
+            ("ac2_out_switch", "c81701"),  # field 377
+            ("dc_12v_out_switch", "900101"),  # field 18
+            ("xboost_switch", "c80101"),  # field 25
+            ("bypass_out_disable_switch", "d00101"),  # field 26
+            ("energy_backup_switch", "da02020801"),  # field 43, nested
+        ],
+    )
+    def test_switch_payload_bytes(self, key: str, expected_pdata: str) -> None:
+        cmd = build_switch_command(key, True)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        assert self._pdata(frame) == expected_pdata
+
+    def test_switch_off_writes_zero(self) -> None:
+        cmd = build_switch_command("beeper_switch", False)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        assert self._pdata(frame) == "4800"
+
+    @pytest.mark.parametrize(
+        ("key", "value", "expected_pdata"),
+        [
+            ("max_charge_soc", 80, "880250"),  # field 33
+            ("min_discharge_soc", 10, "90020a"),  # field 34
+            ("backup_reserve_soc", 30, "b0061e"),  # field 102
+        ],
+    )
+    def test_number_payload_bytes(
+        self, key: str, value: int, expected_pdata: str
+    ) -> None:
+        cmd = build_number_command(key, value)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        assert self._pdata(frame) == expected_pdata
+
+    def test_number_values_stay_inside_the_vendor_range(self) -> None:
+        """The clamp is shared with the HTTP path, so it applies here too."""
+        cmd = build_number_command("max_charge_soc", 200)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        assert self._pdata(frame) == "880264"  # clamped to 100
+        cmd = build_number_command("backup_reserve_soc", 120)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        assert self._pdata(frame) == "b00664"  # clamped to 100
+
+    def test_frame_carries_the_hardware_verified_header(self) -> None:
+        cmd = build_switch_command("beeper_switch", True)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        headers, _ = decode_header_message(frame)
+        header = headers[0]
+        assert header["src"] == 32
+        assert header["dest"] == 2
+        assert header["d_src"] == 1
+        assert header["d_dest"] == 1
+        assert header["check_type"] == 3
+        assert header["cmd_func"] == 254
+        assert header["cmd_id"] == 17
+        assert header["data_len"] == 2
+        assert header["need_ack"] == 1
+        # Decoder field names: 16 -> "version", 17 -> "payload_ver".
+        assert header["version"] == 3
+        assert header["payload_ver"] == 1
+        assert header["device_sn"] == self.SN
+        # Fields 15 and 23 must stay absent - the device ignored the frame with them.
+        assert "product_id" not in header
+        assert "from" not in header
+
+    def test_every_control_has_a_binary_counterpart(self) -> None:
+        """One table drives both wires, so neither can lose a control."""
+        for key in DELTA3_SWITCH_PARAMS:
+            switch_cmd = build_switch_command(key, True)
+            assert switch_cmd is not None
+            assert build_proto_command(switch_cmd, self.SN)
+        for key in DELTA3_NUMBER_PARAMS:
+            number_cmd = build_number_command(key, 10)
+            assert number_cmd is not None
+            assert build_proto_command(number_cmd, self.SN)
+
+    def test_unknown_parameter_returns_none(self) -> None:
+        command = {"cmdId": 17, "params": {"cfgSomethingElse": 1}}
+        assert build_proto_command(command, self.SN) is None
+
+    def test_multi_parameter_command_returns_none(self) -> None:
+        """One frame carries exactly one setting."""
+        command = {"cmdId": 17, "params": {"cfgBeepEn": True, "cfgXboostEn": True}}
+        assert build_proto_command(command, self.SN) is None
+
+
+class TestAcCharging:
+    """AC charge power and charge mode are one setting on the wire.
+
+    Measured on a D3M1 on 2026-08-03: field 54 alone and field 125 alone are
+    both dropped by the device without any answer - no ack, no rejection. The
+    two together are applied and read back within a second. These tests exist
+    so a future refactor cannot quietly split the pair again, because the
+    failure mode is silence rather than an error.
+    """
+
+    SN = "TEST1234567890"
+
+    def test_power_always_carries_the_mode(self) -> None:
+        command = build_number_command("ac_charge_power_limit", 1200)
+        assert command is not None
+        assert command["params"] == {
+            "cfgPlugInInfoAcInChgPowMax": 1200,
+            "cfgAcInChgMode": 0,
+        }
+        assert DELTA3_NUMBER_PARAMS["ac_charge_power_limit"].config_field == 54
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [(0, 200), (199, 200), (200, 200), (2400, 2400), (3000, 2400)],
+    )
+    def test_power_is_clamped_to_the_app_range(
+        self, requested: int, expected: int
+    ) -> None:
+        command = build_number_command("ac_charge_power_limit", requested)
+        assert command is not None
+        assert command["params"]["cfgPlugInInfoAcInChgPowMax"] == expected
+
+    def test_mode_field_number(self) -> None:
+        assert AC_CHARGE_MODE_FIELD == 125
+
+    def test_both_fields_reach_one_binary_frame(self) -> None:
+        """The pair must survive into the frame, not just into the params."""
+        cmd = build_number_command("ac_charge_power_limit", 800)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        headers, _ = decode_header_message(frame)
+        pdata = bytes.fromhex(headers[0]["pdata"])
+        assert _varint_field(pdata, 54) == 800
+        assert _varint_field(pdata, 125) == 0
+
+    def test_fields_are_in_ascending_order(self) -> None:
+        """Matching the app's own serialisation removes one variable."""
+        cmd = build_number_command("ac_charge_power_limit", 1200)
+        assert cmd is not None
+        frame = build_proto_command(cmd, self.SN)
+        assert frame is not None
+        headers, _ = decode_header_message(frame)
+        pdata = bytes.fromhex(headers[0]["pdata"])
+        assert pdata.index(b"\xb0\x03") < pdata.index(b"\xe8\x07")
+
+    def test_an_unknown_pair_is_refused(self) -> None:
+        """Only groups the device is known to accept may share a frame."""
+        command = {"params": {"cfgBeepEn": True, "cfgXboostEn": True}}
+        assert build_proto_command(command, self.SN) is None
+
+
+class TestConfigWriteAck:
+    """The device answers every write, and a rejection must be visible."""
+
+    @staticmethod
+    def _ack_frame(action_id: int, config_ok: int, cmd_id: int = 18) -> bytes:
+        pdata = encode_field_varint(1, action_id) + encode_field_varint(2, config_ok)
+        header = bytearray()
+        header.extend(encode_field_bytes(1, pdata))
+        header.extend(encode_field_varint(8, 254))
+        header.extend(encode_field_varint(9, cmd_id))
+        header.extend(encode_field_varint(12, 1))  # is_ack
+        return encode_field_bytes(1, bytes(header))
+
+    def test_success_ack(self) -> None:
+        ack = parse_config_write_ack(self._ack_frame(9, 1))
+        assert ack is not None
+        assert ack.action_id == 9
+        assert ack.config_ok == 1
+        assert ack.applied is True
+
+    def test_rejection_ack(self) -> None:
+        ack = parse_config_write_ack(self._ack_frame(102, 0))
+        assert ack is not None
+        assert ack.action_id == 102
+        assert ack.config_ok == 0
+        assert ack.applied is False
+
+    def test_other_frames_are_ignored(self) -> None:
+        assert parse_config_write_ack(self._ack_frame(9, 1, cmd_id=21)) is None
+
+    def test_garbage_does_not_raise(self) -> None:
+        assert parse_config_write_ack(b"\xff\xff\xff") is None

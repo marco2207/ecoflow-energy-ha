@@ -1,0 +1,795 @@
+"""Proto-runtime decoder using google.protobuf.json_format.MessageToDict.
+
+Declarative (cmd_func, cmd_id) registry replaces manual per-field extraction.
+Each command tuple maps to a CmdConfig that defines message class, flags, field
+renames, and zero-fill rules. The generic decode loop handles all message types
+uniformly.
+
+Contract: the registry is namespaced by device type (ADR-024). A command
+tuple is NOT unique across device classes - the Stream AC Pro and the Delta 3
+generation both use (254, 21) as their main status frame - so every table
+lives under its own `DEVICE_TYPE_*` key and every entry point below requires
+the caller's device type as a keyword argument. There is no default and no
+union lookup: a caller that cannot name its device type cannot decode.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import DecodeError
+from google.protobuf.unknown_fields import UnknownFieldSet
+
+from ..const import DEVICE_TYPE_DELTA3, DEVICE_TYPE_POWEROCEAN
+from .decoder import decode_header_message
+
+_LOGGER = logging.getLogger(__name__)
+
+# Per message, how many undeclared field numbers are reported. A device that
+# sends more than this many fields we do not declare is telling us something
+# other than "one setting is missing", and the first few dozen carry that
+# message just as well.
+_UNKNOWN_FIELDS_MAX = 40
+
+
+@dataclass
+class ProtoRuntimeDecodeResult:
+    headers: list[dict]
+    payload: bytes | None
+    source: bytes
+    mapped: dict[str, Any]
+    parse_path: str
+    parse_reason_code: str
+
+
+@dataclass(frozen=True)
+class CmdConfig:
+    """Declarative configuration for a protobuf cmd_id."""
+
+    msg_class: type
+    parse_path: str
+    flags: dict[str, bool] = field(default_factory=dict)
+    rename: dict[str, str] = field(default_factory=dict)
+    zero_fill: frozenset[str] = field(default_factory=frozenset)
+    flatten_key: str | None = None
+    # Which item of a repeated container stands for the device. `None` keeps
+    # the first item and attaches the whole list as `all_packs`, the battery
+    # heartbeat's convention. A callable receives every item and returns the
+    # one to flatten, or `None` when no item qualifies, in which case the
+    # message decodes nothing rather than a row that means something else.
+    flatten_select: Callable[[list[dict[str, Any]]], dict[str, Any] | None] | None = (
+        None
+    )
+    # Whether a header of this command with a zero-length payload still
+    # decodes. Off everywhere else on purpose: an empty companion header is
+    # normally noise, and decoding it would let zero-fill publish readings
+    # from a message that carried none. It is on for a list report, where an
+    # empty payload is the list being empty and therefore the only signal
+    # that a task is gone.
+    decode_empty_payload: bool = False
+
+
+def _build_cmd_registry() -> dict[str, dict[tuple[int, int], CmdConfig]]:
+    """Build device_type -> (cmd_func, cmd_id) -> CmdConfig registry (ADR-024).
+
+    Lazy-loaded to avoid an import-time pb2 dependency. Each device type owns
+    a full table of its own; nothing is shared between PowerOcean and Delta 3
+    here, because cmd_id values are only unique within a command family:
+    PowerOcean uses cmd_func=96, the Delta 3 generation uses 254 (system
+    status) and 32 (battery heartbeat), and their cmd_id ranges overlap. The
+    device-type namespace is what keeps a Delta 3 frame from ever reaching a
+    PowerOcean CmdConfig, or the reverse.
+    """
+    try:
+        from . import ecocharge_pb2 as pb2
+    except ImportError:
+        _LOGGER.warning(
+            "Failed to import protobuf module - Enhanced Mode will not work"
+        )
+        return {}
+
+    return {
+        DEVICE_TYPE_POWEROCEAN: _build_powerocean_table(pb2),
+        DEVICE_TYPE_DELTA3: _build_delta3_table(pb2),
+    }
+
+
+def _parallel_system_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the system-total row of a parallel energy stream, or None.
+
+    The total row is the one without `dev_sn`. In every decoded frame of the
+    #347 download it is the first row, but the order is the device's to
+    change, so the row is chosen by what it lacks rather than by position.
+    A list with no such row yields nothing: every remaining row belongs to
+    one unit, and publishing one of those as the system would show a single
+    inverter's share under the whole system's name.
+    """
+    for row in rows:
+        if "dev_sn" not in row:
+            return row
+    return None
+
+
+def _build_powerocean_table(pb2: Any) -> dict[tuple[int, int], CmdConfig]:
+    """PowerOcean's (cmd_func, cmd_id) -> CmdConfig table."""
+    return {
+        (96, 33): CmdConfig(
+            msg_class=pb2.JTS1EnergyStreamReport,
+            parse_path="typed_runtime:energy_stream_report",
+            flags={"_is_energy_stream": True, "_is_energy_stream_report": True},
+            rename={
+                "mppt_pwr": "solar",
+                "sys_load_pwr": "home_direct",
+                "bp_pwr": "batt_pb",
+                "sys_grid_pwr": "grid_raw_f2",
+                "bp_soc": "soc",
+            },
+            zero_fill=frozenset({"solar", "home_direct", "batt_pb", "grid_raw_f2"}),
+        ),
+        # A parallel pair sends its energy stream as this list and never as
+        # cmd_id=33 (#347): one row per unit stamped with its serial, plus one
+        # row without a serial that carries the system totals. The total row
+        # is the one a single device would have sent on cmd_id=33, so it
+        # takes the same renames, the same zero-fill and the same flags and
+        # lands on the same sensor keys. The unit rows travel on beside it
+        # for the per-inverter readings (#436), mapped by
+        # `remap_parallel_unit_keys`; a unit row's grid figure is the flow
+        # between the units, not the meter, and is not read from them.
+        (96, 50): CmdConfig(
+            msg_class=pb2.JTS1ParallelEnergyStreamReport,
+            parse_path="typed_runtime:parallel_energy_stream_report",
+            flags={"_is_energy_stream": True, "_is_energy_stream_report": True},
+            rename={
+                "mppt_pwr": "solar",
+                "sys_load_pwr": "home_direct",
+                "bp_pwr": "batt_pb",
+                "sys_grid_pwr": "grid_raw_f2",
+                "bp_soc": "soc",
+            },
+            zero_fill=frozenset({"solar", "home_direct", "batt_pb", "grid_raw_f2"}),
+            flatten_key="para_energy_stream",
+            flatten_select=_parallel_system_row,
+        ),
+        (96, 39): CmdConfig(
+            msg_class=pb2.JTS1EmsPVInvEnergyStreamReport,
+            parse_path="typed_runtime:pv_inv_energy_stream",
+            flags={"_is_pv_inv_energy_stream": True},
+            rename={"pv_inv_pwr": "pv_inverter_power_w"},
+        ),
+        (96, 1): CmdConfig(
+            msg_class=pb2.JTS1EmsHeartbeat,
+            parse_path="typed_runtime:ems_heartbeat",
+            flags={"_is_ems_heartbeat": True},
+        ),
+        (96, 7): CmdConfig(
+            msg_class=pb2.JTS1BpHeartbeatReport,
+            parse_path="typed_runtime:bp_heartbeat",
+            flags={"_is_bp_heartbeat": True},
+            flatten_key="bp_heart_beat",
+        ),
+        (96, 8): CmdConfig(
+            msg_class=pb2.JTS1EmsChangeReport,
+            parse_path="typed_runtime:ems_change",
+            flags={"_is_ems_change": True},
+            rename={"ems_word_mode": "ems_work_mode"},
+        ),
+        # Same message as cmd_id=8, disjoint field set. A PowerOcean Plus
+        # Get-All bundle carries both: cmd 8 the configuration and mode,
+        # cmd 17 the run state, the fault flags and the arc-fault detector.
+        # It carries its own flag because the two ids do not share a sensor
+        # mapping - see `EMS_STATE_TO_SENSOR`.
+        (96, 17): CmdConfig(
+            msg_class=pb2.JTS1EmsChangeReport,
+            parse_path="typed_runtime:ems_state",
+            flags={"_is_ems_state": True},
+        ),
+        # Module inventory. Carries the serial of the EMS module, the PCS
+        # module and every battery pack, and no measurement at all - it is
+        # registered for the pack order it establishes, not for a sensor.
+        (96, 3): CmdConfig(
+            msg_class=pb2.JTS1ErrorChangeReport,
+            parse_path="typed_runtime:error_change",
+            flags={"_is_error_change": True},
+        ),
+        (96, 13): CmdConfig(
+            msg_class=pb2.JTS1EmsParamChangeReport,
+            parse_path="typed_runtime:ems_param_change",
+            flags={"_is_ems_param_change": True},
+            rename={"dev_soc": "ems_app_surplus_pct"},
+        ),
+        # PowerPulse wallbox, forwarded by the PowerOcean it is coupled to.
+        # The same session also travels on (209, 33) and (209, 34), and a
+        # third time inside a (241, 5) bundle. Only this one is registered:
+        # it is the only frame carrying power, energy, duration and state
+        # together, so the four cannot drift apart. See PLAN-079.
+        (209, 8): CmdConfig(
+            msg_class=pb2.EVChargingParamReport,
+            parse_path="typed_runtime:ev_charging_param",
+            flags={"_is_ev_charging_param": True},
+        ),
+        # PowerGlow heating rod, forwarded by the PowerOcean it is coupled to.
+        # The rod also travels on (212, 33) and (212, 34), which carry the
+        # power alone. Only this one is registered: it is the only frame
+        # carrying the water temperature, the drawn power and both setpoints
+        # together, so the four cannot drift apart. See PLAN-101.
+        (212, 8): CmdConfig(
+            msg_class=pb2.HRChargingParamReport,
+            parse_path="typed_runtime:heating_rod_param",
+            flags={"_is_heating_rod_param": True},
+        ),
+        # The device's scheduled charge tasks, the whole list in one
+        # message. It rides inside the get-all reply the integration already
+        # receives, twice under the same sequence number, and the two copies
+        # can disagree - see the first-copy rule in `mqtt_ingest`. Evidence is
+        # the reporter capture on #328: ten bundles carry this header, four of
+        # them with a zero-length payload before any schedule existed.
+        (96, 10): CmdConfig(
+            msg_class=pb2.EmsAllTimerTaskReport,
+            parse_path="typed_runtime:timer_task_list",
+            flags={"_is_timer_task_list": True},
+            decode_empty_payload=True,
+        ),
+        # The feed-to-grid schedule, the device's own second task list. Same
+        # get-all-reply shape as (96, 10) above, own header and own field
+        # layout - see the comment above `EmsAllTouTaskReport` in the proto.
+        # Evidence is the reporter capture on #381: nine list pushes, every
+        # one carrying the two pre-existing slots. No empty list is on record
+        # for this family; `decode_empty_payload` is inherited from the timer
+        # family, where the #328 frames show an empty list is how the last
+        # task's deletion arrives.
+        (96, 14): CmdConfig(
+            msg_class=pb2.EmsAllTouTaskReport,
+            parse_path="typed_runtime:tou_task_list",
+            flags={"_is_tou_task_list": True},
+            decode_empty_payload=True,
+        ),
+    }
+
+
+def _build_delta3_table(pb2: Any) -> dict[tuple[int, int], CmdConfig]:
+    """Delta 3 generation's (cmd_func, cmd_id) -> CmdConfig table."""
+    return {
+        # Main status frame: full every 120 s, incremental about every 2 s.
+        (254, 21): CmdConfig(
+            msg_class=pb2.Delta3DisplayProperty,
+            parse_path="typed_runtime:delta3_display_property",
+            flags={"_is_delta3_display": True},
+        ),
+        # Battery heartbeat with two nested version packs, every 10 s.
+        (32, 2): CmdConfig(
+            msg_class=pb2.Delta3CmsHeartbeat,
+            parse_path="typed_runtime:delta3_cms_heartbeat",
+            flags={"_is_delta3_cms_heartbeat": True},
+        ),
+        # BMS heartbeat, also every 10 s. Carries the battery health data
+        # (SoH, cycles, lifetime energy counters) that no other frame and no
+        # HTTP quota field reports.
+        #
+        # This tuple is NOT Delta 3 exclusive, and the entry does not make it
+        # so: the Stream family uses (32, 50) for its own battery message,
+        # where field 25 is the precise state of charge rather than a float
+        # SoC. A Stream frame cannot land in this table at all - it is looked
+        # up under DEVICE_TYPE_STREAM, which owns its own parser and never
+        # reaches this registry (ADR-024).
+        (32, 50): CmdConfig(
+            msg_class=pb2.Delta3BmsHeartbeat,
+            parse_path="typed_runtime:delta3_bms_heartbeat",
+            flags={"_is_delta3_bms_heartbeat": True},
+        ),
+    }
+
+
+_CMD_REGISTRY: dict[str, dict[tuple[int, int], CmdConfig]] | None = None
+_LOGGED_UNKNOWN_DEVICE_TYPES: set[str] = set()
+_FULL_POWER_KEYS = frozenset({"solar", "home_direct", "batt_pb", "grid_raw_f2"})
+
+
+def _registry_for(device_type: str) -> dict[tuple[int, int], CmdConfig]:
+    """Return the (cmd_func, cmd_id) table for one device type (ADR-024).
+
+    An unregistered tuple inside a known table is skipped silently, exactly
+    as before this split. A device type with no table at all is treated the
+    same way and returns an empty dict - never a union of every table, and
+    never a raise. The production callers run on the Paho thread inside a
+    broad `except Exception`, where a raise would cost the whole frame
+    instead of just the one command it could not place. A device type
+    missing its table is logged once per process, not once per frame, so a
+    steady stream of frames from an unmapped device does not spam the log.
+    """
+    global _CMD_REGISTRY
+    if _CMD_REGISTRY is None:
+        _CMD_REGISTRY = _build_cmd_registry()
+    table = _CMD_REGISTRY.get(device_type)
+    if table is None:
+        if device_type not in _LOGGED_UNKNOWN_DEVICE_TYPES:
+            _LOGGED_UNKNOWN_DEVICE_TYPES.add(device_type)
+            _LOGGER.debug(
+                "Device type %s has no protobuf command registry table; "
+                "its frames are read by its own parser or not at all",
+                device_type,
+            )
+        return {}
+    return table
+
+
+def _empty_mapped() -> dict[str, Any]:
+    """Return a stable empty mapping skeleton for non-decoded runtime frames."""
+    return {
+        "_available_keys": set(),
+        "_flat_count": 0,
+        "_is_energy_stream": False,
+        "_is_energy_stream_report": False,
+        "_is_pv_inv_energy_stream": False,
+        "_is_ems_heartbeat": False,
+        "_is_ems_change": False,
+        "_is_ems_state": False,
+        "_is_ems_param_change": False,
+        "_is_error_change": False,
+        "_is_bp_heartbeat": False,
+        "_is_full_power_frame": False,
+        "_is_delta3_display": False,
+        "_is_delta3_cms_heartbeat": False,
+        "_is_delta3_bms_heartbeat": False,
+        "_is_timer_task_list": False,
+        "_is_tou_task_list": False,
+    }
+
+
+def _header_value(headers: list[dict], key: str) -> Any:
+    for header in headers or []:
+        if not isinstance(header, dict):
+            continue
+        value = header.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _first_pdata(headers: list[dict]) -> tuple[bytes | None, bool]:
+    """Extract first valid pdata from headers. Return (pdata_bytes, had_invalid)."""
+    had_invalid = False
+    for header in headers or []:
+        if not isinstance(header, dict):
+            continue
+        pdata_hex = header.get("pdata")
+        if not isinstance(pdata_hex, str) or not pdata_hex:
+            continue
+        try:
+            candidate = bytes.fromhex(pdata_hex)
+        except ValueError:
+            had_invalid = True
+            continue
+        if candidate:
+            return candidate, False
+    return None, had_invalid
+
+
+def _header_pdata_candidates(header: dict[str, Any]) -> list[tuple[bytes, str]]:
+    """Return one header's decode candidates as (bytes, reason_code), best first.
+
+    An empty list means the header carries no usable inner payload.
+
+    A header that sets ``Enc_type=1`` is expected to carry its payload XORed
+    with the low byte of the header sequence number. Decryption is decided per
+    header: bundled Get-All replies carry plaintext pdata, so applying one
+    header's sequence to a whole bundle would corrupt every later message.
+
+    The untouched bytes are offered as a second candidate whenever the flag is
+    set. The XOR reading is confirmed on Stream hardware - every frame of the
+    tracked BK01 capture sets the flag and only decodes once unmasked - but no
+    device on this typed path has been observed setting it, so the retry stays
+    to keep a device that sets the flag without masking from losing every key
+    of the message.
+    """
+    pdata_hex = header.get("pdata")
+    if not isinstance(pdata_hex, str) or not pdata_hex:
+        return []
+    try:
+        pdata = bytes.fromhex(pdata_hex)
+    except ValueError:
+        return []
+    if not pdata:
+        return []
+
+    if header.get("enc_type") == 1:
+        seq = header.get("seq")
+        if not isinstance(seq, int):
+            return []
+        xor_key = seq & 0xFF
+        if not xor_key:
+            return [(pdata, "typed_source_header_pdata_decrypted")]
+        decrypted = bytes(value ^ xor_key for value in pdata)
+        return [
+            (decrypted, "typed_source_header_pdata_decrypted"),
+            (pdata, "typed_source_header_pdata"),
+        ]
+
+    return [(pdata, "typed_source_header_pdata")]
+
+
+def _header_carries_no_pdata(header: dict[str, Any]) -> bool:
+    """True when the header genuinely holds no inner payload.
+
+    `_header_pdata_candidates` returns an empty list for two situations that
+    look alike from the outside and mean opposite things: a header that
+    carries nothing, and a header carrying something this decoder cannot read
+    - pdata of the wrong type, hex that does not parse, or a masked payload
+    whose sequence number is missing. Only the first of them is the device
+    saying "there is nothing here". Reading the second that way would let one
+    corrupt copy of a list publish an empty list the device never sent, and on
+    a command that retracts what it does not mention, that erases every key
+    the device still holds.
+    """
+    pdata = header.get("pdata")
+    if pdata is None:
+        return True
+    if not isinstance(pdata, str):
+        return False
+    if not pdata:
+        return True
+    try:
+        return not bytes.fromhex(pdata)
+    except ValueError:
+        return False
+
+
+def _typed_map_from_candidates(
+    header: dict[str, Any], candidates: list[tuple[bytes, str]], device_type: str
+) -> tuple[dict[str, Any], str, bytes, str] | None:
+    """Pick the first candidate that yields a usable mapping.
+
+    Returns ``(mapped, parse_path, source, reason_code)`` or None. A candidate
+    that parses but produces no field at all ranks below one that produces
+    fields, because protobuf accepts arbitrary bytes as unknown fields instead
+    of raising. Without that ranking a wrongly flagged payload would decode to
+    an empty message and the plaintext retry would never be reached.
+    """
+    ranked_fallback: tuple[dict[str, Any], str, bytes, str] | None = None
+    for source, reason_code in candidates:
+        typed = _typed_runtime_map([header], source, device_type)
+        if typed is None:
+            continue
+        mapped, parse_path = typed
+        if mapped.get("_flat_count"):
+            return mapped, parse_path, source, reason_code
+        if ranked_fallback is None:
+            ranked_fallback = (mapped, parse_path, source, reason_code)
+    return ranked_fallback
+
+
+def unknown_field_summary(msg: Any) -> dict[int, Any]:
+    """Return the field numbers a message carried but the binding does not declare.
+
+    Protobuf keeps a field it cannot name in the message's unknown-field set
+    instead of discarding it, so a decoded message still knows which numbers
+    arrived. That is the only way to answer "does this device report field N?"
+    for a field nobody has mapped yet: the field map covers what we already
+    know, and everything else is invisible by construction.
+
+    What a value looks like depends on the wire type, and only the scalar
+    types are reported as values:
+
+    - varint, fixed32 and fixed64 come back as the integer on the wire. The
+      semantic type is unknowable here - a fixed32 may be a float and a varint
+      may be signed - so the raw integer is reported and interpreting it is
+      the reader's job.
+    - a length-delimited field is reported **by length only**. Its bytes may
+      be a nested message, but they may equally be a serial number or another
+      identifier, and this summary is built to be pasted into a public issue.
+      Reporting a length keeps the "this field exists" signal without
+      publishing whatever it holds.
+    - a group is reported as its kind. The wire format is deprecated and no
+      EcoFlow message on this path uses it.
+
+    Fields are taken in wire order until the cap, so a message with more
+    undeclared fields than the cap always samples the same ones. Nothing is
+    lost for the purpose this serves - a device reports the same layout on
+    every push, and its incremental pushes carry the higher numbers on their
+    own.
+
+    Nested messages are not descended into: a field undeclared inside a
+    declared sub-message stays invisible. Every field this plan needs sits at
+    the top level of its message, and walking the tree would multiply both the
+    output size and the ways a serial could leak.
+    """
+    summary: dict[int, Any] = {}
+    for entry in UnknownFieldSet(msg):
+        if len(summary) >= _UNKNOWN_FIELDS_MAX:
+            break
+        # A field number can legitimately repeat: a non-packed repeated field
+        # writes one entry per element, and two concatenated messages produce
+        # the same shape. The first occurrence is the sample; later ones only
+        # confirm what the first already reported.
+        if entry.field_number in summary:
+            continue
+        if entry.wire_type in (0, 1, 5):
+            summary[entry.field_number] = entry.data
+        elif entry.wire_type == 2:
+            length = len(entry.data) if isinstance(entry.data, bytes) else 0
+            summary[entry.field_number] = f"{length} bytes"
+        else:
+            summary[entry.field_number] = "group"
+    return summary
+
+
+def _typed_runtime_map(
+    headers: list[dict], source: bytes, device_type: str
+) -> tuple[dict[str, Any], str] | None:
+    """Declarative decode: command tuple -> MessageToDict -> rename -> flags."""
+    registry = _registry_for(device_type)
+    if not registry:
+        return None
+
+    cmd_func = _header_value(headers, "cmd_func")
+    cmd_id = _header_value(headers, "cmd_id")
+
+    if not isinstance(cmd_func, int) or not isinstance(cmd_id, int):
+        return None
+
+    config = registry.get((cmd_func, cmd_id))
+    if config is None:
+        return None
+
+    # 1. Parse protobuf message. A registry hit only means the command tuple
+    # is known - the payload may still belong to another device class and be
+    # wire-incompatible. Returning None lets the caller fall back to its own
+    # parser instead of losing the message.
+    msg = config.msg_class()
+    try:
+        msg.ParseFromString(source)
+    except DecodeError:
+        _LOGGER.debug(
+            "Proto decode failed for %s, falling back to generic parsing",
+            config.parse_path,
+        )
+        return None
+
+    # 2. Convert to dict (only present fields, proto field names preserved)
+    fields = MessageToDict(msg, preserving_proto_field_name=True)
+
+    # 3. For repeated messages, pick the item that stands for the device:
+    # the one the command's selector names, or else the first (keeping the
+    # whole list as `all_packs` for the multi-pack extraction). The items a
+    # selector passes over travel on under the private key `_unit_rows`,
+    # outside `_available_keys` and every public key, because each carries a
+    # serial; the caller maps the readings it wants from them (#436).
+    unit_rows: list[dict[str, Any]] | None = None
+    if config.flatten_key and config.flatten_select is not None:
+        items = [
+            item
+            for item in fields.get(config.flatten_key, [])
+            if isinstance(item, dict)
+        ]
+        chosen = config.flatten_select(items)
+        if chosen is None:
+            return None
+        unit_rows = [item for item in items if item is not chosen]
+        fields = chosen
+    elif config.flatten_key:
+        items = fields.get(config.flatten_key, [])
+        if items:
+            # Keep first item as before (backward compatible for existing bp_* sensors)
+            first = items[0] if isinstance(items[0], dict) else {}
+            # Store all items for multi-pack extraction
+            first["all_packs"] = items
+            fields = first
+        else:
+            fields = {}
+
+    # 4. Build mapped dict with renames and available_keys tracking
+    mapped: dict[str, Any] = _empty_mapped()
+    mapped.update(config.flags)
+
+    for proto_name, value in fields.items():
+        key = config.rename.get(proto_name, proto_name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            mapped[key] = float(value) if key == "soc" else value
+        else:
+            mapped[key] = value
+        mapped["_available_keys"].add(key)
+
+    # 5. How much of the power set this frame actually carried, judged before
+    # the zero-fill below puts the rest in. Judged after it, the answer was
+    # "all of it" on every frame, because zero-filling adds the four keys it
+    # is asking about - so the flag was constant and said nothing. Nothing
+    # reads it yet; it is the one signal that separates a device sending full
+    # snapshots from one sending only what changed, and that question is open
+    # on the PowerOcean Plus (#219).
+    if config.flags.get("_is_energy_stream"):
+        mapped["_is_full_power_frame"] = (
+            len(_FULL_POWER_KEYS & mapped["_available_keys"]) >= 3
+        )
+
+    # 6. Zero-fill: proto3 omits 0.0 values, but power fields need explicit 0.0
+    for key in config.zero_fill:
+        if key not in mapped["_available_keys"]:
+            mapped[key] = 0.0
+            mapped["_available_keys"].add(key)
+
+    mapped["_flat_count"] = len(fields)
+    if unit_rows is not None:
+        mapped["_unit_rows"] = unit_rows
+
+    # 7. Undeclared field numbers, for diagnostics only. Recorded solely when
+    # the message also produced declared fields: protobuf accepts arbitrary
+    # bytes as unknown fields rather than raising, so a payload decoded with
+    # the wrong key (see `_header_pdata_candidates`) yields a message that is
+    # *only* unknown fields. Reporting those would fill the summary with
+    # noise from a candidate the caller is about to discard anyway.
+    if fields:
+        unknown = unknown_field_summary(msg)
+        if unknown:
+            mapped["_unknown_fields"] = unknown
+            mapped["_cmd_key"] = f"{cmd_func}/{cmd_id}"
+
+    return mapped, config.parse_path
+
+
+def decode_proto_runtime_headers(
+    payload_bytes: bytes,
+    decoded_frame: tuple[list[dict], bytes | None] | None = None,
+    *,
+    device_type: str,
+) -> list[ProtoRuntimeDecodeResult]:
+    """Decode every typed header in one EcoFlow protobuf envelope.
+
+    A bundled PowerOcean Get-All reply contains many independent headers, while
+    incremental pushes usually contain one or two. Returning one result per
+    recognized header keeps both forms additive and leaves existing single-
+    header devices on the same code path.
+
+    `decoded_frame` lets a caller that already ran ``decode_header_message``
+    hand the result over, so the envelope is not decoded twice per message.
+
+    `device_type` is required and keyword-only (ADR-024): it selects which
+    device type's table is consulted, and there is no default that would fall
+    back to searching every table.
+    """
+    if decoded_frame is not None:
+        headers, payload = decoded_frame
+    else:
+        headers, payload = decode_header_message(payload_bytes)
+
+    registry = _registry_for(device_type)
+
+    decoded: list[ProtoRuntimeDecodeResult] = []
+    for header in headers or []:
+        if not isinstance(header, dict):
+            continue
+        cmd_func = header.get("cmd_func")
+        cmd_id = header.get("cmd_id")
+        if not isinstance(cmd_func, int) or not isinstance(cmd_id, int):
+            # decoder.py always stores cmd_func/cmd_id as int when the header
+            # carries them at all; a non-int here only means one of them is
+            # missing, which fails the registry lookup below identically -
+            # this just makes that fact visible to the type checker too.
+            continue
+        if (cmd_func, cmd_id) not in registry:
+            continue
+
+        # The legacy single-header envelope may use the outer payload field.
+        # Bundled replies need each header's own pdata instead.
+        if len(headers) == 1 and payload is not None:
+            candidates = [(payload, "typed_source_payload_field")]
+        else:
+            candidates = _header_pdata_candidates(header)
+
+        # A header carrying nothing is skipped, unless its command declares
+        # that an empty payload is itself the message. Without this the one
+        # frame that says "the list is empty" would look exactly like a frame
+        # that never mentioned the list at all.
+        #
+        # The condition is that the header carries no payload, not that no
+        # candidate could be built from it: those differ whenever a payload is
+        # present but unreadable, and only the first of them is the device
+        # reporting an empty message.
+        if (
+            not candidates
+            and registry[(cmd_func, cmd_id)].decode_empty_payload
+            and _header_carries_no_pdata(header)
+        ):
+            candidates = [(b"", "typed_source_header_pdata_empty")]
+
+        best = _typed_map_from_candidates(header, candidates, device_type)
+        if best is None:
+            continue
+        mapped, parse_path, source, reason_code = best
+        decoded.append(
+            ProtoRuntimeDecodeResult(
+                headers=[header],
+                payload=payload,
+                source=source,
+                mapped=mapped,
+                parse_path=parse_path,
+                parse_reason_code=reason_code,
+            )
+        )
+
+    return decoded
+
+
+def decode_proto_runtime_frame(
+    payload_bytes: bytes, *, device_type: str
+) -> ProtoRuntimeDecodeResult:
+    """Decode one EcoFlow protobuf frame, preserving the legacy first result API.
+
+    `device_type` is required and keyword-only (ADR-024), same contract as
+    `decode_proto_runtime_headers`.
+    """
+    headers, payload = decode_header_message(payload_bytes)
+    decoded = decode_proto_runtime_headers(
+        payload_bytes, (headers, payload), device_type=device_type
+    )
+    if decoded:
+        first = decoded[0]
+        # Keep the complete header list for callers that reuse it for generic
+        # fallbacks. Single-header callers observe exactly the old shape.
+        first.headers = headers
+        return first
+
+    # Legacy last resort, reached only when no header decoded on its own.
+    # cmd_func and cmd_id are looked up across the whole header list, so a
+    # bundle can combine them from two different headers. That is tolerated
+    # only because the frames still rescued here are single-header envelopes
+    # whose data sits in the outer payload field. Per-header decoding belongs
+    # in decode_proto_runtime_headers(); do not route a bundle through this
+    # path, where a mixed command tuple could select the wrong message class.
+    cmd_func = _header_value(headers, "cmd_func")
+    cmd_id = _header_value(headers, "cmd_id")
+
+    registry = _registry_for(device_type)
+    typed_eligible = (cmd_func, cmd_id) in registry
+
+    if payload is not None:
+        source = payload
+        reason_code = "typed_source_payload_field"
+    elif typed_eligible:
+        pdata, had_invalid = _first_pdata(headers)
+        if pdata is not None:
+            source = pdata
+            reason_code = "typed_source_header_pdata"
+        elif had_invalid:
+            # Every candidate pdata was malformed hex. Trying the whole frame
+            # is better than dropping a command the registry knows.
+            source = payload_bytes
+            reason_code = "typed_source_full_frame_invalid_pdata"
+        else:
+            # Known command, no usable inner payload anywhere: an empty
+            # companion header in a bundle is skipped by the per-header pass
+            # above, so this is a genuine single-header frame with no data.
+            return ProtoRuntimeDecodeResult(
+                headers=headers,
+                payload=payload,
+                source=b"",
+                mapped=_empty_mapped(),
+                parse_path="typed_runtime:guarded_no_inner_payload",
+                parse_reason_code="typed_inner_payload_missing",
+            )
+    else:
+        source = payload_bytes
+        reason_code = "typed_source_full_frame"
+
+    typed = _typed_runtime_map(headers, source, device_type)
+    if typed is not None:
+        mapped, parse_path = typed
+        return ProtoRuntimeDecodeResult(
+            headers=headers,
+            payload=payload,
+            source=source,
+            mapped=mapped,
+            parse_path=parse_path,
+            parse_reason_code=reason_code,
+        )
+
+    return ProtoRuntimeDecodeResult(
+        headers=headers,
+        payload=payload,
+        source=source,
+        mapped=_empty_mapped(),
+        parse_path="typed_runtime:no_match",
+        parse_reason_code="typed_no_match",
+    )

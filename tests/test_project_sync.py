@@ -1,0 +1,404 @@
+"""Tests for the project board sync script and its workflow."""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / ".github" / "tools" / "project_sync.py"
+WORKFLOW = ROOT / ".github" / "workflows" / "project-sync.yml"
+
+spec = importlib.util.spec_from_file_location("project_sync", SCRIPT)
+assert spec is not None
+assert spec.loader is not None
+project_sync = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(project_sync)
+
+EVENT_OPTIONS = ["Neu", "Bearbeitet", "Geschlossen", "Wieder geöffnet", "Kommentiert"]
+
+FIELD_NODES: list[dict[str, Any]] = [
+    {
+        "id": "F_EVENT",
+        "name": "Letztes Ereignis",
+        "options": [
+            {"id": f"O_{i}", "name": name} for i, name in enumerate(EVENT_OPTIONS)
+        ],
+    },
+    {"id": "F_DATE", "name": "Letzte Änderung", "dataType": "DATE"},
+    {"id": "F_TYPE", "name": "Typ", "options": [{"id": "O_ISSUE", "name": "Issue"}]},
+    {
+        "id": "F_CTRL",
+        "name": "Steuerung",
+        "options": [{"id": "O_WATCH", "name": "Nur beobachten"}],
+    },
+    {
+        "id": "F_STATUS",
+        "name": "Status",
+        "options": [
+            {"id": f"S_{name}", "name": name}
+            for name in (
+                "Eingang",
+                "Bereit",
+                "In Arbeit",
+                "Review",
+                "Auslieferung",
+                "Wartet",
+            )
+        ],
+    },
+    {
+        "id": "F_WAIT",
+        "name": "Wartet auf",
+        "options": [
+            {"id": f"W_{name}", "name": name}
+            for name in ("Keine", "Hardwaredaten", "Reporter", "Freigabe")
+        ],
+    },
+    {},
+]
+
+
+def project_with(nodes: list[dict]) -> dict:
+    return {"id": "PROJECT", "fields": {"nodes": nodes}}
+
+
+class FakeGraphQL:
+    """Records calls and answers the four queries the script makes."""
+
+    def __init__(
+        self,
+        nodes: list[dict] | None = None,
+        labels: list[str] | None = None,
+        state: str = "OPEN",
+        waiting_on: str | None = None,
+    ) -> None:
+        self.project = project_with(FIELD_NODES if nodes is None else nodes)
+        self.issue = {
+            "state": state,
+            "labels": {"nodes": [{"name": n} for n in labels or []]},
+            "projectItems": {
+                "nodes": [
+                    {
+                        "project": {"id": "OTHER"},
+                        "fieldValueByName": {"name": "Hardwaredaten"},
+                    },
+                    {
+                        "project": {"id": "PROJECT"},
+                        "fieldValueByName": (
+                            {"name": waiting_on} if waiting_on else None
+                        ),
+                    },
+                ]
+            },
+        }
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, query: str, **variables: object) -> dict:
+        self.calls.append((query, variables))
+        if "projectV2(number" in query:
+            return {"user": {"projectV2": self.project}}
+        if "node(id" in query:
+            return {"node": self.issue}
+        if "addProjectV2ItemById" in query:
+            return {"addProjectV2ItemById": {"item": {"id": "ITEM"}}}
+        return {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "ITEM"}}}
+
+    def kinds(self) -> list[str]:
+        out = []
+        for query, _ in self.calls:
+            if "projectV2(number" in query:
+                out.append("read")
+            elif "node(id" in query:
+                out.append("issue")
+            elif "addProjectV2ItemById" in query:
+                out.append("add")
+            else:
+                out.append("set")
+        return out
+
+    def writes(self) -> list[dict]:
+        return [v for q, v in self.calls if "updateProjectV2ItemFieldValue" in q]
+
+
+@pytest.fixture
+def fake(monkeypatch: pytest.MonkeyPatch) -> FakeGraphQL:
+    fake = FakeGraphQL()
+    monkeypatch.setattr(project_sync, "run_graphql", fake)
+    return fake
+
+
+@pytest.mark.parametrize(
+    ("event", "action", "label"),
+    [
+        ("issues", "opened", "Neu"),
+        ("issues", "edited", "Bearbeitet"),
+        ("issues", "closed", "Geschlossen"),
+        ("issues", "reopened", "Wieder geöffnet"),
+        ("issue_comment", "created", "Kommentiert"),
+    ],
+)
+def test_each_tracked_event_stamps_its_label_and_date(event, action, label):
+    updates = project_sync.plan_updates(event, action, "2026-10-07")
+    assert updates[:2] == [
+        ("Letztes Ereignis", label),
+        ("Letzte Änderung", "2026-10-07"),
+    ]
+
+
+def test_untracked_event_plans_nothing():
+    assert project_sync.plan_updates("issues", "assigned", "2026-10-07") == []
+
+
+@pytest.mark.parametrize("action", ["labeled", "unlabeled"])
+def test_label_change_stamps_the_date_only(action):
+    assert project_sync.plan_updates("issues", action, "2026-10-08") == [
+        ("Letzte Änderung", "2026-10-08")
+    ]
+
+
+def test_only_opened_sets_type_and_control_defaults():
+    opened = dict(project_sync.plan_updates("issues", "opened", "2026-10-07"))
+    edited = dict(project_sync.plan_updates("issues", "edited", "2026-10-07"))
+    assert opened["Typ"] == "Issue"
+    assert "Steuerung" not in opened  # the first value is the maintainer's
+    assert "Typ" not in edited
+    assert "Steuerung" not in edited
+
+
+def test_edited_issue_writes_option_and_date_to_the_board(fake):
+    assert project_sync.sync("issues", "edited", "ISSUE_NODE", "2026-10-07") == 2
+    values = {w["field"]: w["value"] for w in fake.writes()}
+    assert values == {
+        "F_EVENT": {"singleSelectOptionId": "O_1"},
+        "F_DATE": {"date": "2026-10-07"},
+    }
+    assert all(w["item"] == "ITEM" and w["project"] == "PROJECT" for w in fake.writes())
+
+
+def test_issue_is_added_before_any_field_is_written(fake):
+    project_sync.sync("issues", "opened", "ISSUE_NODE", "2026-10-07")
+    kinds = fake.kinds()
+    assert kinds[:3] == ["read", "issue", "add"]
+    assert set(kinds[3:]) == {"set"}
+    assert fake.calls[2][1]["content"] == "ISSUE_NODE"
+
+
+def test_opened_issue_gets_three_fields(fake):
+    assert project_sync.sync("issues", "opened", "ISSUE_NODE", "2026-10-07") == 3
+
+
+def test_untracked_event_touches_nothing(fake):
+    assert project_sync.sync("issues", "assigned", "ISSUE_NODE", "2026-10-07") == 0
+    assert fake.calls == []
+
+
+def test_missing_stamp_field_fails_instead_of_passing_quietly(monkeypatch):
+    nodes = [n for n in FIELD_NODES if n.get("name") != "Letzte Änderung"]
+    broken = FakeGraphQL(nodes)
+    monkeypatch.setattr(project_sync, "run_graphql", broken)
+    with pytest.raises(RuntimeError, match="Letzte Änderung"):
+        project_sync.sync("issues", "edited", "ISSUE_NODE", "2026-10-07")
+    assert "add" not in broken.kinds()
+
+
+def test_missing_default_field_is_skipped_but_stamps_still_land(monkeypatch, capsys):
+    nodes = [n for n in FIELD_NODES if n.get("name") != "Typ"]
+    monkeypatch.setattr(project_sync, "run_graphql", FakeGraphQL(nodes))
+    assert project_sync.sync("issues", "opened", "ISSUE_NODE", "2026-10-07") == 2
+    assert "Typ" in capsys.readouterr().out
+
+
+def test_unknown_option_name_is_an_error():
+    field = {"id": "F", "type": "SINGLE_SELECT", "options": {"Neu": "O"}}
+    with pytest.raises(RuntimeError, match="no option 'Bearbeitet'"):
+        project_sync.to_field_value("Letztes Ereignis", field, "Bearbeitet")
+
+
+def test_main_reports_failure_through_the_exit_code(monkeypatch, capsys):
+    monkeypatch.setenv("EVENT_NAME", "issues")
+    monkeypatch.setenv("EVENT_ACTION", "edited")
+    monkeypatch.setenv("ISSUE_NODE_ID", "ISSUE_NODE")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("token rejected")
+
+    monkeypatch.setattr(project_sync, "run_graphql", boom)
+    assert project_sync.main() == 1
+    assert "::error::token rejected" in capsys.readouterr().out
+
+
+def test_main_fails_when_the_event_environment_is_missing(monkeypatch):
+    monkeypatch.delenv("EVENT_NAME", raising=False)
+    assert project_sync.main() == 1
+
+
+def test_workflow_never_interpolates_event_text_into_the_shell():
+    text = WORKFLOW.read_text()
+    run_blocks = re.findall(r"^\s+run:\s*(.+)$", text, flags=re.MULTILINE)
+    assert run_blocks, "workflow has no run step"
+    assert not any("${{" in block for block in run_blocks)
+    assert "github.event.issue.title" not in text
+    assert "github.event.issue.body" not in text
+    assert "github.event.comment" not in text
+
+
+def test_workflow_skips_pull_requests_and_other_repositories():
+    text = WORKFLOW.read_text()
+    assert "!github.event.issue.pull_request" in text
+    assert "github.repository ==" in text
+
+
+def test_workflow_requests_read_only_repository_permissions():
+    text = WORKFLOW.read_text()
+    assert re.search(r"^permissions:\n  contents: read$", text, flags=re.MULTILINE)
+
+
+# --- Status derived from labels -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        (["in-progress", "action:bugfix", "needs-info"], ("In Arbeit", "Keine")),
+        (["in-progress", "ship-ready"], ("In Arbeit", "Keine")),
+        (["ship-ready", "action:respond", "needs-info"], ("Auslieferung", "Freigabe")),
+        (["ship-ready", "analysis-ready"], ("Auslieferung", "Freigabe")),
+        (["action:respond", "needs-info"], ("Bereit", "Keine")),
+        (["action:followup"], ("Bereit", "Keine")),
+        (["action:respond", "analysis-ready"], ("Bereit", "Keine")),
+        (["analysis-ready", "needs-info"], ("Review", "Freigabe")),
+        (["needs-info", "priority:p2"], ("Wartet", "Reporter")),
+    ],
+)
+def test_labels_decide_status_first_rule_wins(labels, expected):
+    planned = project_sync.plan_status(labels, None, "labeled", "x")
+    assert planned == [("Status", expected[0]), ("Wartet auf", expected[1])]
+
+
+def test_a_staged_change_and_an_analysis_wait_on_different_statuses():
+    # Both wait for the maintainer, but the board must tell a delivery click
+    # apart from an analysis decision.
+    ship = dict(project_sync.plan_status(["ship-ready"], None, "labeled", "ship-ready"))
+    analysis = dict(
+        project_sync.plan_status(["analysis-ready"], None, "labeled", "analysis-ready")
+    )
+    assert ship == {"Status": "Auslieferung", "Wartet auf": "Freigabe"}
+    assert analysis == {"Status": "Review", "Wartet auf": "Freigabe"}
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("ship-ready", True),
+        ("analysis-ready", True),
+        ("in-progress", True),
+        ("action:respond", True),
+        ("needs-info", False),
+        ("enhancement", False),
+    ],
+)
+def test_claim_labels_include_ship_ready(label, expected):
+    assert project_sync.is_claim_label(label) is expected
+
+
+def test_removing_ship_ready_hands_the_issue_to_the_reporter():
+    planned = project_sync.plan_status(["bug"], None, "unlabeled", "ship-ready")
+    assert planned == [("Status", "Wartet"), ("Wartet auf", "Reporter")]
+
+
+def test_ship_ready_label_writes_auslieferung_to_the_board(monkeypatch):
+    fake = FakeGraphQL(labels=["bug", "ship-ready"], waiting_on="Reporter")
+    monkeypatch.setattr(project_sync, "run_graphql", fake)
+    assert (
+        project_sync.sync("issues", "labeled", "ISSUE_NODE", "2026-10-08", "ship-ready")
+        == 3
+    )
+    values = {w["field"]: w["value"] for w in fake.writes()}
+    assert values == {
+        "F_DATE": {"date": "2026-10-08"},
+        "F_STATUS": {"singleSelectOptionId": "S_Auslieferung"},
+        "F_WAIT": {"singleSelectOptionId": "W_Freigabe"},
+    }
+
+
+def test_ship_ready_on_a_board_without_the_status_option_fails_loudly(monkeypatch):
+    # The option has to exist before the label is used; a missing one must stop
+    # the run with a named error instead of leaving the card on its old Status.
+    nodes = [
+        {
+            **n,
+            "options": [o for o in n["options"] if o["name"] != "Auslieferung"],
+        }
+        if n.get("name") == "Status"
+        else n
+        for n in FIELD_NODES
+    ]
+    fake = FakeGraphQL(nodes, labels=["ship-ready"])
+    monkeypatch.setattr(project_sync, "run_graphql", fake)
+    with pytest.raises(RuntimeError, match="no option 'Auslieferung'"):
+        project_sync.sync("issues", "labeled", "ISSUE_NODE", "2026-10-08", "ship-ready")
+
+
+def test_needs_info_keeps_a_wait_reason_set_by_hand():
+    planned = dict(project_sync.plan_status(["needs-info"], "Hardwaredaten", "labeled"))
+    assert planned["Wartet auf"] == "Hardwaredaten"
+    planned = dict(project_sync.plan_status(["needs-info"], "Keine", "labeled"))
+    assert planned["Wartet auf"] == "Reporter"
+
+
+def test_removing_the_last_claim_hands_the_issue_to_the_reporter():
+    planned = project_sync.plan_status(
+        ["bug", "priority:p2"], None, "unlabeled", "action:respond"
+    )
+    assert planned == [("Status", "Wartet"), ("Wartet auf", "Reporter")]
+
+
+@pytest.mark.parametrize(
+    ("action", "label"),
+    [("unlabeled", "priority:p2"), ("labeled", "enhancement"), ("created", "")],
+)
+def test_labels_without_a_claim_leave_the_board_alone(action, label):
+    assert project_sync.plan_status(["bug", "priority:p2"], None, action, label) == []
+
+
+def test_labeled_event_writes_derived_status_to_the_board(monkeypatch):
+    fake = FakeGraphQL(labels=["bug", "action:respond"], waiting_on="Reporter")
+    monkeypatch.setattr(project_sync, "run_graphql", fake)
+    assert (
+        project_sync.sync(
+            "issues", "labeled", "ISSUE_NODE", "2026-10-08", "action:respond"
+        )
+        == 3
+    )
+    values = {w["field"]: w["value"] for w in fake.writes()}
+    assert values == {
+        "F_DATE": {"date": "2026-10-08"},
+        "F_STATUS": {"singleSelectOptionId": "S_Bereit"},
+        "F_WAIT": {"singleSelectOptionId": "W_Keine"},
+    }
+
+
+def test_wait_reason_is_read_from_this_board_not_another(monkeypatch):
+    fake = FakeGraphQL(labels=["needs-info"])
+    monkeypatch.setattr(project_sync, "run_graphql", fake)
+    project_sync.sync("issue_comment", "created", "ISSUE_NODE", "2026-10-08")
+    values = {w["field"]: w["value"] for w in fake.writes()}
+    assert values["F_WAIT"] == {"singleSelectOptionId": "W_Reporter"}
+
+
+def test_closed_issue_keeps_the_status_the_builtin_workflow_set(monkeypatch):
+    fake = FakeGraphQL(labels=["action:respond"], state="CLOSED")
+    monkeypatch.setattr(project_sync, "run_graphql", fake)
+    project_sync.sync("issues", "closed", "ISSUE_NODE", "2026-10-08")
+    assert "F_STATUS" not in {w["field"] for w in fake.writes()}
+
+
+def test_workflow_listens_to_label_changes():
+    text = WORKFLOW.read_text()
+    assert "labeled, unlabeled" in text
+    assert "LABEL_NAME: ${{ github.event.label.name }}" in text

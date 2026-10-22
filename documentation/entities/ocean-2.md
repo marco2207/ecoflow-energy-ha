@@ -1,0 +1,183 @@
+# Ocean 2 - Entity Reference
+
+Full list of all entities created for the EcoFlow Ocean 2.
+
+**Totals:** 51 system sensors, plus 12 per battery module. 1 number and 1 switch on the `RE11` and `RE41`, 1 number on the `RE43`
+
+The Ocean 2 reports through the account connection only, so it needs **Enhanced Mode**. The Developer API answers error 1006 for this device, the same position the `J32D`/`J32E` PowerOcean variants are in, so Standard Mode creates no usable entities.
+
+Five serial prefixes, one device: `RE11` for the 10 kW unit, `RE17` for the 12 kW one, `RE41` for the 8 kW single-phase Ocean 2 Plus, `RE43` for the 12 kW single-phase Ocean 2 Plus and `RE42`, a single-phase unit whose power rating is not established here. They differ in power rating and phase count. The inverter and grid phase sensors below read whatever phases a unit actually reports, so a single-phase `RE41`, `RE42` or `RE43` simply leaves Phase B and C empty rather than needing a separate entity set.
+
+`RE11` is confirmed on two installations, `RE41`, `RE42` and `RE43` on one each through owners' diagnostics downloads on #145. `RE17` is routed on EcoFlow's own device list, which separates it from the `RE11` by power rating alone; no frame from an `RE17` exists yet, so if you own one, a note either way is welcome.
+
+Read-only apart from the controls described below: the Backup Reserve number on the `RE11`, `RE41` and `RE43`, and the Storm Guard switch on the `RE11` and `RE41`. No write frame for any other Ocean 2 setting has been observed, so there are no other controls, and the `RE17` and `RE42` have none at all.
+
+Battery modules are read as well: 12 readings each, created once a module actually reports. The count is an installation choice - two on the unit this was mapped on - so nothing is declared for modules you do not have. Captures from other systems show bundles of up to fourteen per-module headers in one frame, a heartbeat backlog rather than fourteen distinct modules.
+
+**Despite the name, this is not a PowerOcean.** It carries its own telemetry frame on `cmd_func` 254 and shares no field layout with the `HJ31`/`J32x` line, which is why it has its own parser and its own entity set.
+
+Work Mode, System State and Control Mode come mostly with the unit's full status report rather than the frequent change reports, so they appear a little after the other readings. So far only Self-use, Running and None have been seen on a unit; the other states are named after the app's own definitions.
+
+---
+
+## Sensors
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| Battery SOC | % | - | enabled | Charge of the house battery |
+| Battery Power | W | - | enabled | Signed: positive charges the battery, negative discharges it |
+| Battery Remaining Energy | Wh | - | enabled | Energy left in the pack. Not its capacity |
+| Solar Power | W | - | enabled | Total across all strings |
+| Grid Power | W | - | enabled | Signed: positive draws from the grid, negative feeds into it |
+| Home Power | W | - | enabled | As the device reports it, not derived from the other three |
+| PV 1 Power | W | - | enabled | Per-string solar |
+| PV 2 Power | W | - | enabled | Per-string solar |
+| PV 3 Power | W | - | disabled | Only wired on some installations, see the note below |
+| PV 4 Power | W | - | disabled | Only wired on some installations, see the note below |
+| Grid Import Power | W | - | enabled | The positive half of Grid Power |
+| Grid Export Power | W | - | enabled | The negative half of Grid Power, as a positive number |
+| Battery Charge Power | W | - | enabled | The positive half of Battery Power |
+| Battery Discharge Power | W | - | enabled | The negative half of Battery Power, as a positive number |
+| AC Power | W | - | enabled | Total AC output of the inverter. Positive while the unit supplies the house on `RE11` and `RE41`; the `RE42` and `RE43` read it the other way round, see the note below |
+| Grid Frequency | Hz | - | enabled | AC frequency the inverter is synced to |
+| Inverter Phase A Voltage | V | diagnostic | disabled | Per-phase AC voltage at the inverter |
+| Inverter Phase B Voltage | V | diagnostic | disabled | Per-phase AC voltage at the inverter |
+| Inverter Phase C Voltage | V | diagnostic | disabled | Per-phase AC voltage at the inverter |
+| Inverter Phase A Current | A | diagnostic | disabled | Per-phase AC current at the inverter |
+| Inverter Phase B Current | A | diagnostic | disabled | Per-phase AC current at the inverter |
+| Inverter Phase C Current | A | diagnostic | disabled | Per-phase AC current at the inverter |
+| Inverter Phase A Active Power | W | diagnostic | disabled | Per-phase real power at the inverter, see the `RE42` and `RE43` note below |
+| Inverter Phase B Active Power | W | diagnostic | disabled | Per-phase real power at the inverter |
+| Inverter Phase C Active Power | W | diagnostic | disabled | Per-phase real power at the inverter |
+| Inverter Phase A Reactive Power | var | diagnostic | disabled | Per-phase reactive power at the inverter |
+| Inverter Phase B Reactive Power | var | diagnostic | disabled | Per-phase reactive power at the inverter |
+| Inverter Phase C Reactive Power | var | diagnostic | disabled | Per-phase reactive power at the inverter |
+| Inverter Phase A Apparent Power | VA | diagnostic | disabled | Per-phase apparent power at the inverter |
+| Inverter Phase B Apparent Power | VA | diagnostic | disabled | Per-phase apparent power at the inverter |
+| Inverter Phase C Apparent Power | VA | diagnostic | disabled | Per-phase apparent power at the inverter |
+| Grid Phase A Voltage | V | diagnostic | enabled | Per-phase grid voltage |
+| Grid Phase B Voltage | V | diagnostic | enabled | Per-phase grid voltage |
+| Grid Phase C Voltage | V | diagnostic | enabled | Per-phase grid voltage |
+| PV 1 Voltage | V | diagnostic | disabled | Per-string solar voltage, off by default unlike PV 1 Power |
+| PV 1 Current | A | diagnostic | disabled | Per-string solar current, off by default unlike PV 1 Power |
+| PV 2 Voltage | V | diagnostic | disabled | Per-string solar voltage, off by default unlike PV 2 Power |
+| PV 2 Current | A | diagnostic | disabled | Per-string solar current, off by default unlike PV 2 Power |
+| PV 3 Voltage | V | diagnostic | disabled | Only wired on some installations, see the note below |
+| PV 3 Current | A | diagnostic | disabled | Only wired on some installations, see the note below |
+| PV 4 Voltage | V | diagnostic | disabled | Only wired on some installations, see the note below |
+| PV 4 Current | A | diagnostic | disabled | Only wired on some installations, see the note below |
+| Solar Energy | kWh | - | enabled | Riemann sum over Solar Power |
+| Home Energy | kWh | - | enabled | Riemann sum over Home Power |
+| Grid Import Energy | kWh | - | enabled | For the Energy Dashboard's grid consumption slot |
+| Grid Export Energy | kWh | - | enabled | For the Energy Dashboard's return-to-grid slot |
+| Battery Charge Energy | kWh | - | enabled | For the Energy Dashboard's battery slot |
+| Battery Discharge Energy | kWh | - | enabled | For the Energy Dashboard's battery slot |
+| Work Mode | - | diagnostic | enabled | Self-use or AI Schedule, as set in the app. Appears with the first full status report |
+| System State | - | diagnostic | enabled | Running, Idle, Stopped, Maintenance, Initializing, one of four Starting states or None, the same states the PowerOcean reports |
+| Control Mode | - | diagnostic | enabled | What currently overrides normal operation: None, Schedule, Task, Storm Guard, AC Backup, Eco and others. None means the work mode is in charge |
+
+---
+
+## Sensors - Battery Modules (up to 16)
+
+Each module creates 12 sensors (5 enabled by default, 7 disabled). They are created once a module actually reports, so a system with two modules gets two sets and nothing else - the count is an installation choice, not a model difference.
+
+**Enabled by default:**
+
+| Entity | Unit | Description |
+|:---|:---:|:---|
+| Module N SoC | % | Charge of this module |
+| Module N Power | W | Signed: positive charges, negative discharges |
+| Module N Remaining Energy | Wh | Energy left in this module, not its capacity |
+| Module N State of Health | % | Ageing state, separate from the charge above |
+| Module N Charge Cycles | - | Full cycles the module counts |
+
+**Disabled by default:**
+
+| Entity | Unit |
+|:---|:---:|
+| Module N Cell Temperature | °C |
+| Module N Min Cell Temperature | °C |
+| Module N Max Cell Temperature | °C |
+| Module N Power Electronics Temperature | °C |
+| Module N Voltage | V |
+| Module N Current | A |
+| Module N Max Cell Voltage | mV |
+
+> **The module SoC carries no battery device class.** Home Assistant shows one battery figure per device, and that is the system state of charge at the top of this page. A per-module class would put up to sixteen competing battery icons on one device.
+
+---
+
+## Numbers
+
+`RE11`, `RE41` and `RE43` only. The number appears once the unit has reported its Backup Reserve, so a unit that never sends it gets no control.
+
+| Entity | Unit | Range | Description |
+|:---|:---:|:---:|:---|
+| Backup Reserve | % | 1 (`RE11`, `RE43`) or 0 (`RE41`) up to the unit's own charge reading, at most 100 | The charge level the battery keeps back instead of discharging into the house. A slider, in steps of 1 |
+
+The upper end of the slider is not a fixed 100. It follows a charge reading the unit sends itself: on a unit that reports 80 the slider stops at 80, and a request above that is refused before anything is sent. Until the unit has sent that reading the slider shows its full range, 1 to 100 on the `RE11` and `RE43` and 0 to 100 on the `RE41`, and a write is refused with a "cannot be set yet" message. The lowest value on the `RE11` is 1: it is the lowest that unit was seen acknowledging, and 0 was never sent. The `RE41` accepted 0 when its app wrote it and kept it on the next report, so its slider starts at 0. The `RE43` takes its floor of 1 from the `RE11`. The lowest value seen on an `RE43` is 10, so its own floor is not established. A value the unit refuses goes back to the previous one. On the `RE43` only the app's own write was recorded (10 % to 30 %): the unit acknowledged it and showed 30 % on its next report. No write from Home Assistant has been tried on an `RE43` yet. The app's frame differs slightly from the one sent from here, so the first write settles whether the unit accepts it. If the number goes back to its previous value on your `RE43`, please leave a note on #145.
+
+Each write first asks the unit for its current state, waiting up to 5 seconds, and sends the new reserve together with the unit's own current reading of that charge value. If the unit does not answer in time, the write is refused with a "cannot be set yet" message and nothing is sent. After a write the integration asks the unit again to confirm the value. If the unit refuses the write, or nothing confirms it within about 35 seconds, the control goes back to the value it had before. If the unit reports a different value, that value is shown.
+
+---
+
+## Switches
+
+`RE11` and `RE41` only. The switch appears once the unit has reported its storm guard setting, which it does in its full status report. The `RE43` has none: no recording of its Storm Guard exists.
+
+| Entity | Category | Description |
+|:---|:---:|:---|
+| Storm Guard | config | The app's storm guard (Sturmwächter) on or off. The integration sends the app's storm guard setting and keeps the new state only once the unit's next full status report shows it; if none does within about 35 seconds, the switch goes back to its previous state |
+
+The two models take the command in slightly different forms. Each gets the form its own app sent: the `RE11` the short one, the `RE41` one that spells out all three fields of the storm guard setting. On the `RE41` the app's own switching was recorded. The unit acknowledged the off command and reported the on state. Storm Guard has not yet been switched from Home Assistant on an `RE41`. If the switch goes back to its previous state there, a note on #554 settles it. A command the unit silently ignores is undone within about 35 seconds.
+
+---
+
+## Notes
+
+### Why grid and battery power exist twice
+
+The device reports one signed value per path. The Energy Dashboard needs two one-directional counters instead, because a Riemann sum over a signed value cancels itself out: an hour of charging followed by an hour of discharging would integrate to nothing. Both halves are written on every update, including the zero, so neither sensor freezes at its last non-zero reading when the flow stops.
+
+### PV 3 and PV 4 are disabled by default
+
+A unit populates as many strings as its MPPT inputs are wired. An entity that never fills reads as a broken sensor rather than an unused input, so the two higher strings ship disabled. Enable them under **Settings > Devices & services > Entities** if your installation uses them.
+
+### Per-string energy counters are deliberately absent
+
+**Solar Energy** already covers the total. A dashboard that summed per-string counters would under-report on a unit whose higher strings are disabled, which is the default.
+
+### The field that looks like a grid meter is not one
+
+The device carries a value that reads like grid power and is the configured feed-in limit: constant `10000` on a unit capped at 10 kW, constant `0` on a zero-export unit. On the latter it is indistinguishable from a real meter reading at rest, which is how it survives casual checking. In the app the same value is resolved per serial and used to bound a slider, so it is the owner's own setting rather than a measurement, and no sensor is built on it. Grid Power comes from the inverter block instead.
+
+### The RE42 and RE43 report AC power with the opposite sign
+
+On the one `RE42` and the one `RE43` measured, total AC power and the inverter phase active power read negative while the unit supplies the house (down to -4,267 W against a 4,570 W house load on the `RE42`, -7,340 W against 7,800 W on the `RE43`), where an `RE11` and an `RE41` read positive in the same state. Battery, grid, home load and apparent power have the same sign on all four units. So does solar on the three that produced any (the `RE43` download was taken at night). AC Power and Inverter Phase A/B/C Active Power are therefore corrected per serial prefix for the `RE42` and `RE43` and read positive there too. Each rests on a single unit: if your `RE42` or `RE43` shows AC Power negative, please say so on #145.
+
+### Home Power is reported, not calculated
+
+The device sends its own house-load figure, and this integration publishes that rather than deriving it from solar minus battery minus grid. The two disagree during load changes, because the readings arrive in separate submessages with their own measurement instants: in a quiet moment the difference is a few watts, during a 500 W load step it runs into the hundreds. The reported figure is the one the EcoFlow app shows.
+
+### Where the field mapping comes from
+
+The assignments were worked out from observed traffic on live hardware and cross-checked against the EcoFlow app, then confirmed against a seven hour recording from a second, unrelated installation. The standalone integration they come from, [jensfr1/ha-ecoflow-ocean2](https://github.com/jensfr1/ha-ecoflow-ocean2), decodes the full frame set including the per-module battery data; either integration can be used on its own.
+
+### Three module readings were originally the wrong quantity
+
+Not the wrong scale - the wrong thing entirely, which is worth naming because each one looks plausible until it is checked against a moving system.
+
+The field read as **capacity is the energy remaining**: measured 4114 Wh at 81.5 % and 4137 Wh at 82.0 %, putting the full module near 5046 Wh. Read as a capacity it falls while the module discharges, which is harmless on a desk and permanently misleading in service. The field read as **state of charge is the state of health**: constant 100.0 across a whole measurement while the neighbouring field moved. And the **cell voltage is a cell voltage, not the pack** - it follows the load, and the divide-by-ten it used to carry was the warning sign, since a float needs no scaling.
+
+### Why the module voltage reads about 16.5 V
+
+That is low for a home battery, which is why the field was overlooked at first. The modules are wired 5S: 16.46 V over 3.311 V per cell is exactly five cells in series. Confirmed through the power balance - pack voltage times current hits the reported module power within 1 %, on two modules independently.
+
+### The temperatures were separated by a load test, not by their averages
+
+45 minutes of wallbox charging at up to 3.6 kW per module. What tells the readings apart is how they move. Three of them hold the order min ≤ average ≤ max in every frame and rise together and slowly - those are the cells. Four others follow the load within a minute, swinging 11 to 17 K at up to 7 K per minute, which is power electronics rather than cells. Those four sit on different parts of the same board; the integration publishes the hottest as one reading, because four near-identical entities per module would be noise at sixteen modules.
+
+### Grid phase current and power are deliberately not read
+
+The same block that carries the three grid phase voltages also carries a current and a power reading per phase. Neither is read here. In the verified capture they do not track the actual grid flow, so no sensor is built on them. Grid Power above comes from the inverter block instead.

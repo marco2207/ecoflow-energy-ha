@@ -1,0 +1,659 @@
+"""Entities of the writable Local Modbus mode (PowerOcean).
+
+One switch (Modbus Control), two numbers (Backup Reserve, Indicator Brightness)
+and one diagnostic binary sensor (Modbus Control Active), created only for a
+Local entry. The register client is the stub of the coordinator tests, so what
+is covered is what the entities do with the coordinator: which entities exist,
+what they render, and what a service call reaches the device as.
+"""
+
+from __future__ import annotations
+
+import struct
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, State
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    mock_restore_cache,
+)
+
+from custom_components.ecoflow_energy.binary_sensor import (
+    async_setup_entry as binary_sensor_setup,
+)
+from custom_components.ecoflow_energy.const import (
+    DOMAIN,
+    LOCAL_MODBUS_FAILURES_UNAVAILABLE,
+    POWEROCEAN_LOCAL_KEYS,
+    EcoFlowNumberDef,
+)
+from custom_components.ecoflow_energy.coordinator import EcoFlowDeviceCoordinator
+from custom_components.ecoflow_energy.coordinator.local_modbus import (
+    EcoFlowLocalModbusCoordinator,
+)
+from custom_components.ecoflow_energy.ecoflow.modbus_local import (
+    BACKUP_RATIO_OFFSET,
+    BRIGHTNESS_OFFSET,
+    HEARTBEAT_OFFSET,
+    ModbusTimeoutError,
+)
+from custom_components.ecoflow_energy.number import EcoFlowLocalNumber, EcoFlowNumber
+from custom_components.ecoflow_energy.number import async_setup_entry as number_setup
+from custom_components.ecoflow_energy.switch import async_setup_entry as switch_setup
+
+from .conftest import add_entities_collector
+from .test_local_modbus_coordinator import (
+    DAY,
+    NEW_KEYS,
+    SERIAL,
+    StubClient,
+    _encode,
+    _frame,
+    _local_entry,
+)
+from .test_powerglow_gating import POWEROCEAN_DEVICE, _entry
+
+CONTROL_KEYS = (
+    "modbus_control",
+    "local_backup_reserve",
+    "local_indicator_brightness",
+    "modbus_control_active",
+)
+# The three binary sensors decoded from bits 0, 1 and 12 of the same status word.
+STATUS_KEYS = ("local_off_grid", "local_system_abnormal", "local_bms_connected")
+# Everything a local entry creates beyond the sensors, and a cloud entry never.
+LOCAL_ONLY_KEYS = CONTROL_KEYS + STATUS_KEYS
+# Bit 11 of the system status word.
+CONTROL_ACTIVE_STATUS = 1 << 11
+# Bits 4-6 set (the device shows 7 there while Backup Reserve is above 0). Not a
+# control flag, and not read as one.
+MODE_BITS_STATUS = 0x7 << 4
+POLLED_BRIGHTNESS = 60
+
+POWEROCEAN_DOC = (
+    Path(__file__).resolve().parents[2] / "documentation" / "entities" / "powerocean.md"
+)
+
+
+def _poll_frame(
+    *,
+    brightness: int = POLLED_BRIGHTNESS,
+    status: int | None = 0,
+    state2: int | None = 0,
+    **overrides: float,
+) -> dict[int, bytes]:
+    """One full answer with the brightness and the system words set.
+
+    ``status=None`` leaves the block that carries the status word out, so the
+    poll does not deliver the key at all. ``state2=None`` cuts the same block
+    back to the thirteen registers it had before System State 2 (0x0213) was
+    polled: the status word stays, the alert word is gone. ``overrides`` are
+    fixture fields of the shared frame builder (``battery_voltage`` and so on).
+    """
+    frame = _frame(DAY, **overrides)
+    block = bytearray(frame[0x0217])
+    low = (0x021C - 0x0217) * 2
+    block[low : low + 2] = struct.pack(">H", brightness)
+    frame[0x0217] = bytes(block)
+    if status is None:
+        del frame[0x0206]
+    else:
+        block = bytearray(frame[0x0206])
+        low = (0x0211 - 0x0206) * 2
+        block[low : low + 4] = _encode("u32", status)
+        if state2 is None:
+            block = block[: 2 * 13]
+        else:
+            low = (0x0213 - 0x0206) * 2
+            block[low : low + 4] = _encode("u32", state2)
+        frame[0x0206] = bytes(block)
+    return frame
+
+
+async def _setup_local(
+    hass: HomeAssistant,
+    frame: dict[int, bytes] | None = None,
+    entry: MockConfigEntry | None = None,
+) -> tuple[MockConfigEntry, StubClient, EcoFlowLocalModbusCoordinator]:
+    """Set a local entry up on a stub client whose first poll is ``frame``."""
+    stub = StubClient([frame if frame is not None else _poll_frame()])
+    entry = entry if entry is not None else _local_entry()
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.ecoflow_energy.coordinator.local_modbus.create_link",
+        return_value=stub,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    coordinator = hass.data[DOMAIN][entry.entry_id][SERIAL]
+    return entry, stub, coordinator
+
+
+def _entity_id(hass: HomeAssistant, domain: str, key: str) -> str:
+    entity_id = er.async_get(hass).async_get_entity_id(
+        domain, DOMAIN, f"{SERIAL}_{key}"
+    )
+    assert entity_id is not None, f"no {domain} entity for {key}"
+    return entity_id
+
+
+def _state(hass: HomeAssistant, domain: str, key: str) -> str:
+    state = hass.states.get(_entity_id(hass, domain, key))
+    assert state is not None
+    return state.state
+
+
+async def _unload(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def _call(
+    hass: HomeAssistant, domain: str, service: str, key: str, **data: Any
+) -> None:
+    await hass.services.async_call(
+        domain,
+        service,
+        {"entity_id": _entity_id(hass, domain, key), **data},
+        blocking=True,
+    )
+
+
+async def test_a_cloud_entry_gets_none_of_the_seven_and_a_local_entry_gets_them(
+    hass: HomeAssistant,
+) -> None:
+    """The seven entities exist for a Local coordinator and for no cloud one.
+
+    Three of the seven are the Off-Grid, System Abnormal and Battery Connection
+    binary sensors: the cloud PowerOcean builds its own binary sensors from the
+    same platform setup, and none of these three is among them.
+    """
+    cloud_entry = _entry()
+    cloud_entry.add_to_hass(hass)
+    cloud = EcoFlowDeviceCoordinator(hass, cloud_entry, POWEROCEAN_DEVICE)
+    hass.data.setdefault(DOMAIN, {})[cloud_entry.entry_id] = {
+        POWEROCEAN_DEVICE["sn"]: cloud
+    }
+
+    created: list[Any] = []
+    for platform_setup in (switch_setup, number_setup, binary_sensor_setup):
+        await platform_setup(hass, cloud_entry, add_entities_collector(created))
+    cloud_ids = {entity.unique_id for entity in created}
+    cloud_sn = POWEROCEAN_DEVICE["sn"]
+    # The cloud platforms did run: their own controls are there.
+    assert f"{cloud_sn}_backup_reserve" in cloud_ids
+    assert not {f"{cloud_sn}_{key}" for key in LOCAL_ONLY_KEYS} & cloud_ids
+
+    # Control: the same three platform setups hand a Local coordinator all seven.
+    entry, _stub, _coordinator = await _setup_local(hass)
+    local: list[Any] = []
+    for platform_setup in (switch_setup, number_setup, binary_sensor_setup):
+        await platform_setup(hass, entry, add_entities_collector(local))
+    assert {entity.unique_id for entity in local} == {
+        f"{SERIAL}_{key}" for key in LOCAL_ONLY_KEYS
+    }
+    await _unload(hass, entry)
+
+
+async def test_a_cloud_number_definition_with_a_category_gets_it(
+    hass: HomeAssistant,
+) -> None:
+    """The cloud number platform applies `entity_category` as the local one does."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+    coordinator = EcoFlowDeviceCoordinator(hass, entry, POWEROCEAN_DEVICE)
+
+    def category_of(category: str | None) -> EntityCategory | None:
+        definition = EcoFlowNumberDef(
+            key="category_probe",
+            name="Category Probe",
+            state_key="ems_backup_ratio_pct",
+            unit="%",
+            entity_category=category,
+        )
+        return EcoFlowNumber(coordinator, definition).entity_category
+
+    assert category_of("config") is EntityCategory.CONFIG
+    assert category_of("diagnostic") is EntityCategory.DIAGNOSTIC
+    assert category_of(None) is None
+
+
+async def test_a_local_entry_creates_its_own_plus_the_shared_sensors(
+    hass: HomeAssistant,
+) -> None:
+    """Exactly the sensors of the read-only mode plus the four, in the right place."""
+    entry, _stub, _coordinator = await _setup_local(hass)
+    registry = er.async_get(hass)
+    registered = er.async_entries_for_config_entry(registry, entry.entry_id)
+
+    assert {item.unique_id for item in registered} == {
+        f"{SERIAL}_{key}"
+        for key in POWEROCEAN_LOCAL_KEYS | NEW_KEYS | set(LOCAL_ONLY_KEYS)
+    } | {f"{SERIAL}_connection_mode"}
+    assert {item.domain for item in registered} == {
+        "sensor",
+        "switch",
+        "number",
+        "binary_sensor",
+    }
+
+    by_key = {item.unique_id.removeprefix(f"{SERIAL}_"): item for item in registered}
+    assert by_key["modbus_control"].domain == "switch"
+    assert by_key["local_backup_reserve"].domain == "number"
+    assert by_key["local_indicator_brightness"].domain == "number"
+    assert by_key["modbus_control_active"].domain == "binary_sensor"
+    assert by_key["modbus_control_active"].entity_category == "diagnostic"
+    # Off-Grid is not a diagnostic and carries no device class (outage
+    # automations trigger on it); System Abnormal is a diagnostic problem.
+    assert by_key["local_off_grid"].domain == "binary_sensor"
+    assert by_key["local_off_grid"].entity_category is None
+    assert by_key["local_off_grid"].original_device_class is None
+    assert by_key["local_system_abnormal"].domain == "binary_sensor"
+    assert by_key["local_system_abnormal"].entity_category == "diagnostic"
+    assert by_key["local_system_abnormal"].original_device_class == "problem"
+    # Battery Connection is a diagnostic connectivity sensor (bit 12).
+    assert by_key["local_bms_connected"].domain == "binary_sensor"
+    assert by_key["local_bms_connected"].entity_category == "diagnostic"
+    assert by_key["local_bms_connected"].original_device_class == "connectivity"
+    # System Alerts is a plain text diagnostic: no unit, no device class.
+    assert by_key["local_system_alerts"].domain == "sensor"
+    assert by_key["local_system_alerts"].entity_category == "diagnostic"
+    assert by_key["local_system_alerts"].original_device_class is None
+    assert by_key["local_system_alerts"].unit_of_measurement is None
+    assert by_key["batt_voltage_v"].domain == "sensor"
+    assert by_key["batt_current_a"].domain == "sensor"
+    assert by_key["batt_temp_c"].domain == "sensor"
+    assert by_key["ems_feed_power_limit_w"].domain == "sensor"
+    assert by_key["local_indicator_brightness"].entity_category == "config"
+    assert by_key["local_backup_reserve"].entity_category is None
+    # The cloud number "Backup Reserve" slugs to `..._backup_reserve`; the two
+    # local numbers register apart from it, so a cloud entry reconfigured to
+    # Local does not get its new number as `..._backup_reserve_2`.
+    assert by_key["local_backup_reserve"].entity_id.endswith("_local_backup_reserve")
+    assert by_key["local_indicator_brightness"].entity_id.endswith(
+        "_local_indicator_brightness"
+    )
+    # The sensor that shows the same register keeps its own entity.
+    assert by_key["ems_backup_ratio_pct"].domain == "sensor"
+    assert by_key["ems_backup_ratio_pct"].unique_id != (
+        by_key["local_backup_reserve"].unique_id
+    )
+    await _unload(hass, entry)
+
+
+async def test_the_switch_calls_the_coordinator_and_surfaces_its_error(
+    hass: HomeAssistant,
+) -> None:
+    """On writes one beat and shows on; a refused beat raises and stays off."""
+    entry, stub, coordinator = await _setup_local(hass)
+    assert _state(hass, "switch", "modbus_control") == "off"
+
+    stub.write_errors = [ModbusTimeoutError("no answer")]
+    with pytest.raises(HomeAssistantError):
+        await _call(hass, "switch", "turn_on", "modbus_control")
+    assert coordinator.control_enabled is False
+    assert _state(hass, "switch", "modbus_control") == "off"
+    assert stub.writes == [(HEARTBEAT_OFFSET, 1)]
+
+    # Control: the same call without the error takes control.
+    await _call(hass, "switch", "turn_on", "modbus_control")
+    assert coordinator.control_enabled is True
+    assert _state(hass, "switch", "modbus_control") == "on"
+    assert stub.writes == [(HEARTBEAT_OFFSET, 1)] * 2
+
+    await _call(hass, "switch", "turn_off", "modbus_control")
+    assert coordinator.control_enabled is False
+    assert _state(hass, "switch", "modbus_control") == "off"
+    # Switching off writes nothing: the unit hands control back by itself.
+    assert stub.writes == [(HEARTBEAT_OFFSET, 1)] * 2
+    await _unload(hass, entry)
+
+
+async def test_a_switch_that_is_on_stays_available_so_that_off_stays_reachable(
+    hass: HomeAssistant,
+) -> None:
+    """Home Assistant skips an unavailable entity in a service call: not this one."""
+    entry, stub, coordinator = await _setup_local(hass)
+    stub.queue(*[ModbusTimeoutError("no answer")] * LOCAL_MODBUS_FAILURES_UNAVAILABLE)
+    await _call(hass, "switch", "turn_on", "modbus_control")
+    for _ in range(LOCAL_MODBUS_FAILURES_UNAVAILABLE):
+        await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.device_available is False
+    assert _state(hass, "switch", "modbus_control") == "on"
+
+    await _call(hass, "switch", "turn_off", "modbus_control")
+
+    assert coordinator.control_enabled is False
+    # With control off the switch follows the device again.
+    assert _state(hass, "switch", "modbus_control") == "unavailable"
+    await _unload(hass, entry)
+
+
+async def test_the_switch_is_off_after_a_restart_even_if_it_was_on(
+    hass: HomeAssistant,
+) -> None:
+    """No restore: control is off on every entry start."""
+    entry, _stub, coordinator = await _setup_local(hass)
+    await _call(hass, "switch", "turn_on", "modbus_control")
+    assert _state(hass, "switch", "modbus_control") == "on"
+    entity_id = _entity_id(hass, "switch", "modbus_control")
+    await _unload(hass, entry)
+
+    # The restore cache says "on", as it would after a restart during control.
+    mock_restore_cache(hass, [State(entity_id, "on")])
+    stub = StubClient([_poll_frame()])
+    with patch(
+        "custom_components.ecoflow_energy.coordinator.local_modbus.create_link",
+        return_value=stub,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    fresh = hass.data[DOMAIN][entry.entry_id][SERIAL]
+    assert fresh is not coordinator
+    assert fresh.control_enabled is False
+    assert _state(hass, "switch", "modbus_control") == "off"
+    assert stub.writes == []
+    await _unload(hass, entry)
+
+
+async def test_the_numbers_show_the_polled_value(hass: HomeAssistant) -> None:
+    """Both numbers render what the poll delivered, under their own units."""
+    entry, _stub, _coordinator = await _setup_local(hass)
+    assert float(_state(hass, "number", "local_backup_reserve")) == DAY["backup_ratio"]
+    assert float(_state(hass, "number", "local_indicator_brightness")) == (
+        POLLED_BRIGHTNESS
+    )
+    for key in ("local_backup_reserve", "local_indicator_brightness"):
+        attributes = hass.states.get(_entity_id(hass, "number", key)).attributes  # type: ignore[union-attr]
+        assert attributes["unit_of_measurement"] == "%"
+        assert (attributes["min"], attributes["max"], attributes["step"]) == (
+            0,
+            100,
+            1,
+        )
+    await _unload(hass, entry)
+
+
+async def test_the_numbers_are_unavailable_while_the_device_is_and_return_with_it(
+    hass: HomeAssistant,
+) -> None:
+    """The numbers follow the device flag, not the coordinator's last update.
+
+    The coordinator hands the last frame back at the failure threshold, so the
+    update itself still counts as a success. Only the device flag makes the two
+    numbers unavailable, as it does the sensors: a stale value must not look
+    live, and a write must not go to a device that does not answer.
+    """
+    entry, stub, coordinator = await _setup_local(hass)
+    keys = ("local_backup_reserve", "local_indicator_brightness")
+    # Control: they show the polled values while the device answers.
+    assert float(_state(hass, "number", keys[0])) == DAY["backup_ratio"]
+    assert float(_state(hass, "number", keys[1])) == POLLED_BRIGHTNESS
+
+    stub.queue(*[ModbusTimeoutError("no answer")] * LOCAL_MODBUS_FAILURES_UNAVAILABLE)
+    for _ in range(LOCAL_MODBUS_FAILURES_UNAVAILABLE):
+        await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.device_available is False
+    for key in keys:
+        assert _state(hass, "number", key) == "unavailable"
+
+    # One good frame brings both back, with the values that frame carries.
+    stub.queue(_poll_frame(brightness=33))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.device_available is True
+    assert float(_state(hass, "number", "local_backup_reserve")) == DAY["backup_ratio"]
+    assert float(_state(hass, "number", "local_indicator_brightness")) == 33
+    await _unload(hass, entry)
+
+
+async def test_the_numbers_write_through_the_coordinator_without_the_switch(
+    hass: HomeAssistant,
+) -> None:
+    """A write reaches its own register and shows the confirmed value, control off."""
+    entry, stub, coordinator = await _setup_local(hass)
+    assert coordinator.control_enabled is False
+
+    await _call(hass, "number", "set_value", "local_backup_reserve", value=40)
+    assert stub.writes == [(BACKUP_RATIO_OFFSET, 40)]
+    assert float(_state(hass, "number", "local_backup_reserve")) == 40
+
+    await _call(hass, "number", "set_value", "local_indicator_brightness", value=25)
+    assert stub.writes == [(BACKUP_RATIO_OFFSET, 40), (BRIGHTNESS_OFFSET, 25)]
+    assert float(_state(hass, "number", "local_indicator_brightness")) == 25
+
+    # No heartbeat was involved and none was started.
+    assert HEARTBEAT_OFFSET not in {offset for offset, _value in stub.writes}
+    assert coordinator.control_enabled is False
+    await _unload(hass, entry)
+
+
+async def test_a_write_the_device_does_not_hold_shows_an_error_and_what_it_holds(
+    hass: HomeAssistant,
+) -> None:
+    """A mismatching read-back raises and puts the value the device holds on display."""
+    entry, stub, _coordinator = await _setup_local(hass)
+    assert DAY["backup_ratio"] != 99
+    stub.read_back_override = 99
+    with pytest.raises(HomeAssistantError):
+        await _call(hass, "number", "set_value", "local_backup_reserve", value=40)
+    assert float(_state(hass, "number", "local_backup_reserve")) == 99
+
+    # Control: once the device holds what was written, the same call shows it.
+    stub.read_back_override = None
+    await _call(hass, "number", "set_value", "local_backup_reserve", value=40)
+    assert float(_state(hass, "number", "local_backup_reserve")) == 40
+    await _unload(hass, entry)
+
+
+@pytest.mark.parametrize("bad", [101, -1, 50.5])
+async def test_a_number_refuses_a_value_outside_zero_to_one_hundred_or_fractional(
+    hass: HomeAssistant, bad: float
+) -> None:
+    """Nothing reaches the device for 101, -1 or 50.5; the edges 0 and 100 pass."""
+    entry, stub, _coordinator = await _setup_local(hass)
+    with pytest.raises(HomeAssistantError):
+        await _call(hass, "number", "set_value", "local_backup_reserve", value=bad)
+    assert stub.writes == []
+
+    for edge in (0, 100):
+        await _call(hass, "number", "set_value", "local_backup_reserve", value=edge)
+    assert stub.writes == [(BACKUP_RATIO_OFFSET, 0), (BACKUP_RATIO_OFFSET, 100)]
+    await _unload(hass, entry)
+
+
+async def test_a_range_error_from_the_coordinator_is_the_translated_rejection(
+    hass: HomeAssistant,
+) -> None:
+    """Called directly, past the service's own range check, 150 is a rejection.
+
+    Home Assistant checks min and max before the entity is called, so the
+    coordinator's `ValueError` is reachable only if the entity definition and
+    the coordinator's range drift apart. The user must still get the translated
+    error, not a raw `ValueError`, and nothing reaches the device.
+    """
+    entry, stub, _coordinator = await _setup_local(hass)
+    created: list[Any] = []
+    await number_setup(hass, entry, add_entities_collector(created))
+    [number] = [
+        entity
+        for entity in created
+        if entity.unique_id == f"{SERIAL}_local_backup_reserve"
+    ]
+    assert isinstance(number, EcoFlowLocalNumber)
+    # Not added to a platform here, so it has no entity id of its own yet.
+    number.entity_id = "number.local_backup_reserve"
+
+    with pytest.raises(HomeAssistantError) as rejected:
+        await number.async_set_native_value(150.0)
+
+    assert rejected.value.translation_key == "set_value_rejected"
+    placeholders = rejected.value.translation_placeholders
+    assert placeholders is not None
+    assert placeholders["entity"] == "number.local_backup_reserve"
+    assert "between 0 and 100" in placeholders["reason"]
+    assert stub.writes == []
+
+    # Control: the same direct call with a value in range reaches the device.
+    await number.async_set_native_value(100.0)
+    assert stub.writes == [(BACKUP_RATIO_OFFSET, 100)]
+    await _unload(hass, entry)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (CONTROL_ACTIVE_STATUS, "on"),
+        (0, "off"),
+        # Other bits of the word are not a control flag.
+        (MODE_BITS_STATUS, "off"),
+        (CONTROL_ACTIVE_STATUS | MODE_BITS_STATUS, "on"),
+        # Never off for a word the poll did not deliver.
+        (None, "unknown"),
+    ],
+)
+async def test_the_binary_sensor_follows_bit_11_and_is_unknown_without_it(
+    hass: HomeAssistant, status: int | None, expected: str
+) -> None:
+    """True or False from the data key, unknown while the key is absent."""
+    entry, _stub, coordinator = await _setup_local(hass, _poll_frame(status=status))
+    assert ("modbus_control_active" in coordinator.data) is (status is not None)
+    assert _state(hass, "binary_sensor", "modbus_control_active") == expected
+    await _unload(hass, entry)
+
+
+@pytest.mark.parametrize(
+    ("status", "off_grid", "abnormal"),
+    [
+        (0x1014, "off", "off"),
+        (0x1015, "on", "off"),
+        (0x1016, "off", "on"),
+        (0x1017, "on", "on"),
+        (None, "unknown", "unknown"),
+    ],
+)
+async def test_off_grid_and_abnormal_follow_bits_0_and_1_and_are_unknown_without_them(
+    hass: HomeAssistant, status: int | None, off_grid: str, abnormal: str
+) -> None:
+    """Each binary sensor reads its own bit; no status word, no invented state."""
+    entry, _stub, coordinator = await _setup_local(hass, _poll_frame(status=status))
+    assert ("local_off_grid" in coordinator.data) is (status is not None)
+    assert _state(hass, "binary_sensor", "local_off_grid") == off_grid
+    assert _state(hass, "binary_sensor", "local_system_abnormal") == abnormal
+    await _unload(hass, entry)
+
+
+@pytest.mark.parametrize(
+    ("status", "connected"),
+    [(0x1014, "on"), (0x0014, "off"), (None, "unknown")],
+)
+async def test_battery_connection_follows_bit_12_and_is_unknown_without_it(
+    hass: HomeAssistant, status: int | None, connected: str
+) -> None:
+    """Bit 12 of the status word decides; no status word, no invented state."""
+    entry, _stub, coordinator = await _setup_local(hass, _poll_frame(status=status))
+    assert ("local_bms_connected" in coordinator.data) is (status is not None)
+    assert _state(hass, "binary_sensor", "local_bms_connected") == connected
+    await _unload(hass, entry)
+
+
+@pytest.mark.parametrize(
+    ("state2", "alerts"),
+    [
+        (0, "none"),
+        ((1 << 4) | (1 << 13), "fan_failure,battery_overheating"),
+        (1 << 25, "bit_25"),
+        (None, "unknown"),
+        # All 23 known alerts at once: shortened with a count, not unknown.
+        ((1 << 23) - 1, "+10"),
+    ],
+)
+async def test_system_alerts_list_the_active_codes_and_are_unknown_without_the_word(
+    hass: HomeAssistant, state2: int | None, alerts: str
+) -> None:
+    """The sensor shows the codes of System State 2; a frame without it shows none."""
+    frame = _poll_frame(status=0x1014, state2=state2)
+    entry, _stub, coordinator = await _setup_local(hass, frame)
+    assert ("local_system_alerts" in coordinator.data) is (state2 is not None)
+    if alerts.startswith("+"):
+        assert _state(hass, "sensor", "local_system_alerts").endswith("," + alerts)
+    else:
+        assert _state(hass, "sensor", "local_system_alerts") == alerts
+    # The old-size frame still carries the status word (negative control: the
+    # alert state is unknown for the right reason only).
+    assert _state(hass, "binary_sensor", "local_bms_connected") == "on"
+    await _unload(hass, entry)
+
+
+async def test_the_battery_readings_and_the_feed_limit_show_the_polled_values(
+    hass: HomeAssistant,
+) -> None:
+    """The device's values of 2026-10-02 reach the five new sensors."""
+    frame = _poll_frame(
+        status=0x1014,
+        battery_voltage=52.305,
+        battery_current=-16.247,
+        battery_temp=33.0,
+        max_feed_power=7000,
+    )
+    entry, _stub, coordinator = await _setup_local(hass, frame)
+    # Home Assistant rounds the state to the display precision of the
+    # definition (one decimal for the voltage, two for the current).
+    assert float(_state(hass, "sensor", "batt_voltage_v")) == pytest.approx(
+        52.305, abs=0.01
+    )
+    assert float(_state(hass, "sensor", "batt_current_a")) == pytest.approx(
+        -16.247, abs=0.01
+    )
+    assert float(_state(hass, "sensor", "batt_temp_c")) == pytest.approx(33.0)
+    # The feed limit is the shared cloud entity, disabled by default there and
+    # here: it is registered without a state, and the coordinator carries the value.
+    feed_limit = er.async_get(hass).async_get(
+        _entity_id(hass, "sensor", "ems_feed_power_limit_w")
+    )
+    assert feed_limit is not None
+    assert feed_limit.disabled_by is er.RegistryEntryDisabler.INTEGRATION
+    assert coordinator.data["ems_feed_power_limit_w"] == 7000
+    await _unload(hass, entry)
+
+
+def test_the_documentation_lists_the_four_entities_under_the_local_controls() -> None:
+    """Each of the four has its own row in the Local controls section.
+
+    "Backup Reserve" shares its name with the Enhanced Mode number, so the
+    generic documentation gate cannot tell a missing local row from the existing
+    one; this reads the section itself.
+    """
+    text = POWEROCEAN_DOC.read_text(encoding="utf-8")
+    heading = "## Controls - Local Modbus Only"
+    assert heading in text
+    section = text.split(heading, 1)[1].split("\n---", 1)[0]
+    rows = {
+        cells[0]: cells[1]
+        for cells in (
+            [cell.strip() for cell in line.strip().strip("|").split("|")]
+            for line in section.splitlines()
+            if line.startswith("|")
+        )
+        if len(cells) > 1
+    }
+    assert rows["Modbus Control"] == "Switch"
+    assert rows["Backup Reserve"] == "Number"
+    assert rows["Indicator Brightness"] == "Number"
+    assert rows["Modbus Control Active"] == "Binary sensor"
+    assert "locked" in section
+    assert "about a minute" in section
+    # The sensor and the number read one register; the text says so in the
+    # user's words, not with the register address.
+    assert "EMS Backup Ratio" in section
+    assert "same device value" in section

@@ -1,0 +1,210 @@
+"""Type-check-only declarations of the state the coordinator mixins borrow.
+
+Never imported at runtime: every mixin imports `CoordinatorState` inside an
+`if TYPE_CHECKING:` block and binds `object` in its place. Nothing here has a
+body and nothing here declares `__init__`, so the runtime MRO of
+`EcoFlowDeviceCoordinator` is exactly what it was before this file existed.
+
+A name belongs here when a mixin reads it and does not assign it. State a
+mixin owns is annotated in that mixin's own class body.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from typing import TYPE_CHECKING, Any, Literal
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+if TYPE_CHECKING:
+    from ..ecoflow.cloud_http import EcoFlowHTTPQuota
+    from ..ecoflow.cloud_mqtt import EcoFlowMQTTClient
+    from ..ecoflow.energy_integrator import EnergyIntegrator
+    from ..ecoflow.frame_capture import TypedFrameBuffer
+    from ..ecoflow.iot_api import IoTApiClient
+    from .core import DeviceSnapshot, EcoFlowDeviceCoordinator, PendingDeviceWrite
+    from .set_commands import _Ocean2Write
+    from .state_apply import SurplusSyncRecord
+
+
+class CoordinatorState(DataUpdateCoordinator[dict[str, Any]]):
+    """Declaration-only view of `EcoFlowDeviceCoordinator`.
+
+    Group (A) - `hass`, `data`, `config_entry`, `update_interval`,
+    `async_request_refresh`, `async_set_updated_data`,
+    `async_update_listeners` - is inherited from the base above and is
+    deliberately absent below.
+    """
+
+    # -- group (B): assigned in EcoFlowDeviceCoordinator.__init__ --
+    device_sn: str
+    device_type: str
+    device_name: str
+    _entry: ConfigEntry
+    _auth_method: str
+    _enhanced_mode: bool
+    _shutdown: bool
+    _device_data: dict[str, Any]
+    _mqtt_client: EcoFlowMQTTClient | None
+    _http_client: EcoFlowHTTPQuota | None
+    _iot_api: IoTApiClient | None
+    _config_writes_sent: dict[int, float]
+    _device_config_lock: asyncio.Lock
+    _pending_write_lock: asyncio.Lock
+    _pending_write: PendingDeviceWrite | None
+    _settings_report: tuple[float, dict[str, Any]] | None
+    _settings_wake: asyncio.Event
+    _settings_write_seq: int
+    _settings_calls: dict[int, str]
+    _settings_report_seq: int
+    _settings_published_seq: int
+    _powerocean_soc_pending: tuple[int, int] | None
+    _powerocean_soc_pending_revision: int
+    _powerocean_soc_debounce_unsub: asyncio.TimerHandle | None
+    _powerocean_soc_flush_tasks: set[asyncio.Task[None]]
+    _ocean2_snapshot_event: asyncio.Event
+    _ocean2_writes: dict[str, _Ocean2Write]
+    _powerocean_soc_write_tasks: set[asyncio.Future[Any]]
+    _powerocean_soc_before: dict[str, Any]
+    _powerocean_soc_generation: int
+    _powerocean_soc_request_revision: int
+    _powerocean_soc_confirmed_revision: int
+    _powerocean_soc_active_revisions: set[int]
+    _powerocean_soc_latest_outcome: bool | None
+    _powerocean_soc_cycle_open: bool
+    _write_rollback_generation: int
+    _last_mqtt_ts: float
+    _energy_integrator: EnergyIntegrator
+    _bp_sn_to_index: dict[str, int]
+    _unit_sn_to_index: dict[str, int]
+    _raw_frames: TypedFrameBuffer
+    _raw_frames_lock: threading.Lock
+    _schedule_indices: set[int]
+    _feed_schedule_indices: set[int]
+    _schedule_divergent_bundles: int
+    _energy_from_api: list[tuple[str, str]]
+    _power_to_energy: dict[str, str]
+    _firmware: dict[str, dict[str, Any]]
+    _schedule_armed_latch: dict[str, tuple[bool, float]]
+    _shutdown_complete: asyncio.Event
+    _shutdown_task: asyncio.Task[None] | None
+    _keepalive_unsub: asyncio.TimerHandle | None
+    _stale_check_unsub: asyncio.TimerHandle | None
+    _quotas_unsub: asyncio.TimerHandle | None
+    _ping_unsub: asyncio.TimerHandle | None
+    _credential_refresh_unsub: asyncio.TimerHandle | None
+    _last_smartplug_get_all_ts: float
+    _unit_batt_unsigned: bool
+    _last_unit_batt_get_all_ts: float
+    _last_mqtt_event_ts: float
+    _last_flush_ts: float
+    _surplus_sync_record: SurplusSyncRecord | None
+    _last_app_surplus_sync_ts: float
+    _batt_w_samples: list[tuple[float, float]]
+    _batt_state_changed_at: float
+    _consecutive_http_failures: int
+    _consecutive_http_refusals: int
+    _snapshot: DeviceSnapshot
+    _device_available: bool
+    _last_stale_reconnect_ts: float
+    _stale_reactivate_tried: bool
+    _unit_power_stats: dict[str, Any] | None
+    _unit_pv_unmatched_logged: bool
+    _own_unit_entry_ts: dict[str, float]
+    _own_settings_report_seen: bool
+    _relayed_settings_stats: dict[str, float]
+    _relayed_settings_last_ts: float | None
+
+    # -- group (C): implemented by core.py or by a sibling mixin --
+    @property
+    def device_tag(self) -> str: ...
+
+    @property
+    def device_data(self) -> dict[str, Any]: ...
+
+    @property
+    def _energy_integrator_keys(self) -> set[str]: ...
+
+    def set_device_value(self, key: str, value: Any) -> None: ...
+
+    def _powerocean_coordinators(self) -> list[EcoFlowDeviceCoordinator] | None: ...
+
+    def _linked_unit_coordinator(
+        self, serial: str
+    ) -> EcoFlowDeviceCoordinator | None: ...
+
+    def apply_linked_unit_entry(self, parsed: dict[str, Any]) -> None: ...
+
+    def apply_relayed_wallbox_settings(self, parsed: dict[str, Any]) -> bool: ...
+
+    def powerocean_sibling(self) -> EcoFlowDeviceCoordinator | None: ...
+
+    def charge_action_route(self) -> Literal["sibling", "own"] | None: ...
+
+    def _log_event(self, event_type: str, detail: str) -> None: ...
+
+    def _note_ocean2_snapshot(self, parsed: dict[str, Any]) -> None: ...
+
+    def _cancel_ocean2_readback(self) -> None: ...
+
+    def _ocean2_restore_write(self, write: _Ocean2Write) -> None: ...
+
+    def _ocean2_reject_write(self, write: _Ocean2Write) -> None: ...
+
+    def latch_schedule_armed(self, state_key: str, armed: bool) -> None: ...
+
+    def clear_schedule_armed_latch(self, state_key: str) -> None: ...
+
+    def record_unknown_proto_fields(
+        self, cmd_key: str, fields: dict[int, Any]
+    ) -> None: ...
+
+    def _note_value_change(self, parsed: dict[str, Any]) -> None: ...
+
+    def _enforce_monotonic(self, parsed: dict[str, Any]) -> dict[str, Any]: ...
+
+    def _apply_data(
+        self,
+        parsed: dict[str, Any],
+        *,
+        own_connection: bool = True,
+        relayed_settings: bool = False,
+    ) -> None: ...
+
+    def _resolve_soc(self, parsed: dict[str, Any]) -> None: ...
+
+    def _resolve_wallbox_charge_mode(
+        self, parsed: dict[str, Any], now: float
+    ) -> None: ...
+
+    def _resolve_pending_write(self, parsed: dict[str, Any]) -> None: ...
+
+    def _notify_settings_waiters(self) -> None: ...
+
+    def _integrate_energy(self, parsed: dict[str, Any]) -> None: ...
+
+    def _derive_battery_state(self) -> None: ...
+
+    def _on_mqtt_message(self, topic: str, payload: bytes) -> None: ...
+
+    def _on_mqtt_auth_error(self) -> None: ...
+
+    def _schedule_keepalive(self) -> None: ...
+
+    def _schedule_ping(self) -> None: ...
+
+    def _schedule_quotas_poll(self) -> None: ...
+
+    def _schedule_stale_check(self) -> None: ...
+
+    def _schedule_credential_refresh(self) -> None: ...
+
+    def _schedule_powerocean_soc_write(
+        self,
+        backup_reserve_pct: int,
+        solar_surplus_pct: int,
+        *,
+        name: str,
+    ) -> asyncio.Task[object] | None: ...

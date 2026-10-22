@@ -1,0 +1,713 @@
+"""Entity-set tests for the STREAM AC 5000 (ES22).
+
+Whether this device has PV or a per-phase smart meter is a wiring choice,
+not a model difference, so those entities are accessory-gated rather than
+listed per serial prefix: they appear once the device actually reports the
+reading. Home Assistant keeps an entity in the registry after a later
+release stops creating it, so an entity created on a unit that will never
+fill it is permanent for that owner.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.ecoflow_energy.binary_sensor import (
+    async_setup_entry as binary_sensor_setup,
+)
+from custom_components.ecoflow_energy.const import (
+    AUTH_METHOD_APP,
+    CONF_AUTH_METHOD,
+    CONF_DEVICES,
+    CONF_EMAIL,
+    CONF_MODE,
+    CONF_PASSWORD,
+    CONF_USER_ID,
+    DEVICE_TYPE_STREAM,
+    DEVICE_TYPE_STREAM_AC5000,
+    DOMAIN,
+    MODE_ENHANCED,
+    STREAM_MICRO_EXCLUDED_KEYS,
+    STREAMAC5000_NUMBERS,
+    STREAMAC5000_POWER_TO_ENERGY,
+    STREAMAC5000_SELECTS,
+    STREAMAC5000_SENSORS,
+    STREAMAC5000_SWITCHES,
+    filter_defs_for_serial,
+)
+from custom_components.ecoflow_energy.coordinator import EcoFlowDeviceCoordinator
+from custom_components.ecoflow_energy.ecoflow.const import (
+    get_device_name,
+    get_device_type,
+)
+from custom_components.ecoflow_energy.entity import reading_reported
+from custom_components.ecoflow_energy.number import async_setup_entry as number_setup
+from custom_components.ecoflow_energy.select import async_setup_entry as select_setup
+from custom_components.ecoflow_energy.sensor import (
+    _get_sensor_defs,
+)
+from custom_components.ecoflow_energy.sensor import (
+    async_setup_entry as sensor_setup,
+)
+from custom_components.ecoflow_energy.switch import async_setup_entry as switch_setup
+
+from .conftest import add_entities_collector
+
+ES22_DEVICE: dict[str, Any] = {
+    "sn": "ES22TEST00000001",
+    "name": "",
+    "product_name": "",
+    "device_type": DEVICE_TYPE_STREAM_AC5000,
+    "online": 1,
+}
+
+# Only reported by a unit with PV wired to the EcoFlow itself, or with an
+# EcoFlow P1 meter instead of a single-total meter such as a Tibber Pulse.
+ACCESSORY_KEYS = {
+    "solar_w",
+    "pv_total_w",
+    "pv1_w",
+    "pv2_w",
+    "pv3_w",
+    "pv4_w",
+    "ac_frequency_hz",
+    "grid_phase_a_active_power_w",
+    "grid_phase_b_active_power_w",
+    "grid_phase_c_active_power_w",
+    "grid_phase_a_voltage_v",
+    "grid_phase_b_voltage_v",
+    "grid_phase_c_voltage_v",
+    "grid_phase_a_current_a",
+    "grid_phase_b_current_a",
+    "grid_phase_c_current_a",
+}
+
+
+def _entry(device: dict[str, Any]) -> MockConfigEntry:
+    """Build an Enhanced-mode entry for one ES22."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="EcoFlow Energy",
+        data={
+            CONF_AUTH_METHOD: AUTH_METHOD_APP,
+            CONF_MODE: MODE_ENHANCED,
+            CONF_EMAIL: "test@example.com",
+            CONF_PASSWORD: "test_password",
+            CONF_USER_ID: "user123",
+            CONF_DEVICES: [device],
+        },
+        unique_id="test@example.com",
+    )
+
+
+async def _setup_keys(
+    hass: HomeAssistant,
+    platform_setup,
+    reported: dict[str, Any] | None = None,
+) -> set[str]:
+    """Run one platform's setup and return the entity keys it created."""
+    entry = _entry(ES22_DEVICE)
+    entry.add_to_hass(hass)
+    coordinator = EcoFlowDeviceCoordinator(hass, entry, ES22_DEVICE)
+    if reported:
+        coordinator.async_set_updated_data(dict(reported))
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {ES22_DEVICE["sn"]: coordinator}
+
+    created: list[Any] = []
+    await platform_setup(hass, entry, add_entities_collector(created))
+    return {
+        entity._definition.key for entity in created if hasattr(entity, "_definition")
+    }
+
+
+async def _setup_with_coordinator(
+    hass: HomeAssistant,
+    reported: dict[str, Any] | None = None,
+) -> tuple[EcoFlowDeviceCoordinator, list[Any]]:
+    """Run the sensor platform setup and return coordinator plus entities.
+
+    `_setup_keys` throws the coordinator away; PLAN-142's tests need to push
+    further updates through it after setup, so they use this instead.
+    """
+    entry = _entry(ES22_DEVICE)
+    entry.add_to_hass(hass)
+    coordinator = EcoFlowDeviceCoordinator(hass, entry, ES22_DEVICE)
+    if reported:
+        coordinator.async_set_updated_data(dict(reported))
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {ES22_DEVICE["sn"]: coordinator}
+
+    created: list[Any] = []
+    await sensor_setup(hass, entry, add_entities_collector(created))
+    return coordinator, created
+
+
+class TestStreamAC5000Routing:
+    def test_es22_is_its_own_device_type(self) -> None:
+        assert get_device_type("", "ES22TEST00000001") == DEVICE_TYPE_STREAM_AC5000
+
+    def test_es22_display_name(self) -> None:
+        assert get_device_name("", "ES22TEST00001234") == "STREAM AC 5000 (1234)"
+
+
+class TestStreamAC5000EntitySet:
+    async def test_core_sensors_exist(self, hass: HomeAssistant) -> None:
+        keys = await _setup_keys(hass, sensor_setup)
+
+        assert {
+            "soc_pct",
+            "batt_w",
+            "batt_charge_power_w",
+            "batt_discharge_power_w",
+            "home_w",
+            "grid_w",
+            "grid_import_power_w",
+            "grid_export_power_w",
+            "work_mode",
+            "max_grid_output_power_w",
+        } <= keys
+
+    async def test_accessory_sensors_are_absent_until_reported(
+        self, hass: HomeAssistant
+    ) -> None:
+        keys = await _setup_keys(hass, sensor_setup)
+
+        assert not keys & ACCESSORY_KEYS
+
+    async def test_accessory_sensor_appears_once_the_device_reports_it(
+        self, hass: HomeAssistant
+    ) -> None:
+        keys = await _setup_keys(hass, sensor_setup, reported={"solar_w": 1556.0})
+
+        assert "solar_w" in keys
+        # Still nothing for the meter variant this unit does not have.
+        assert "grid_phase_a_active_power_w" not in keys
+
+    async def test_solar_is_labelled_as_the_third_party_figure(
+        self, hass: HomeAssistant
+    ) -> None:
+        """`solar_w` keeps its identity and is named for what it carries.
+
+        The reading is the app's "Other" row, its own inference from the house
+        flows, not the unit's strings - those are the `pvN_w` sensors beside
+        it. The label has to say so while the key stays put, or every owner
+        loses the entity's history to a rename.
+        """
+        entry = _entry(ES22_DEVICE)
+        entry.add_to_hass(hass)
+        coordinator = EcoFlowDeviceCoordinator(hass, entry, ES22_DEVICE)
+        coordinator.async_set_updated_data({"solar_w": 81.0})
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+            ES22_DEVICE["sn"]: coordinator
+        }
+
+        created: list[Any] = []
+        await sensor_setup(hass, entry, add_entities_collector(created))
+        solar = next(
+            entity
+            for entity in created
+            if getattr(entity, "_definition", None) is not None
+            and entity._definition.key == "solar_w"
+        )
+
+        assert solar.unique_id == f"{ES22_DEVICE['sn']}_solar_w"
+        assert solar.translation_key == "third_party_solar_w"
+
+        label = json.loads(
+            Path("custom_components/ecoflow_energy/translations/en.json").read_text()
+        )["entity"]["sensor"][solar.translation_key]["name"]
+        assert label == "Third-Party Solar Power"
+
+    async def test_powerocean_solar_keeps_the_plain_label(self) -> None:
+        """The split is local to the ES2x, where the reading is inferred.
+
+        On a PowerOcean the same key carries the unit's own MPPT power, so it
+        must keep the plain name. Without this, a translation_key added to the
+        shared definition list would rename it there too and nothing would
+        catch it.
+        """
+        from custom_components.ecoflow_energy.const import POWEROCEAN_SENSORS
+
+        solar = next(d for d in POWEROCEAN_SENSORS if d.key == "solar_w")
+        assert solar.translation_key is None
+
+    async def test_binary_sensor(self, hass: HomeAssistant) -> None:
+        keys = await _setup_keys(hass, binary_sensor_setup)
+
+        assert keys == {"backup_reserve_enabled", "backup_socket_enabled"}
+
+    async def test_controls(self, hass: HomeAssistant) -> None:
+        assert await _setup_keys(hass, number_setup) == {
+            "scheduled_discharge_power_w",
+            "scheduled_charge_power_w",
+            "max_charge_soc_pct",
+            "min_discharge_soc_pct",
+            "backup_reserve",
+            "max_grid_output_power_w",
+            "max_grid_input_power_w",
+        }
+        assert await _setup_keys(hass, select_setup) == {"work_mode"}
+
+    async def test_switches(self, hass: HomeAssistant) -> None:
+        """Both were captured from the app, so both are writable.
+
+        Enhanced Mode only, like every other control here, which is what this
+        entry is.
+        """
+        assert await _setup_keys(hass, switch_setup) == {
+            "backup_reserve_switch",
+            "backup_socket_switch",
+        }
+
+
+class TestStreamAC5000TaskReadback:
+    """A setpoint number must not outlive the task it reports."""
+
+    async def test_a_deleted_task_clears_its_setpoint(
+        self, hass: HomeAssistant
+    ) -> None:
+        entry = _entry(ES22_DEVICE)
+        entry.add_to_hass(hass)
+        coordinator = EcoFlowDeviceCoordinator(hass, entry, ES22_DEVICE)
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+            ES22_DEVICE["sn"]: coordinator
+        }
+        created: list[Any] = []
+        await number_setup(hass, entry, add_entities_collector(created))
+        number = next(
+            entity
+            for entity in created
+            if entity._definition.key == "scheduled_discharge_power_w"
+        )
+        # A value the entity would otherwise fall back to, which is what the
+        # restore path leaves behind after a reload.
+        number._restored_value = 1200.0
+
+        coordinator.async_set_updated_data({"scheduled_discharge_power_w": 1200})
+        assert number.native_value == 1200
+
+        coordinator.async_set_updated_data({"scheduled_discharge_power_w": None})
+        assert number.native_value is None
+
+
+class TestStreamAC5000Definitions:
+    def test_documented_totals(self) -> None:
+        """The counts the README and the entity reference publish."""
+        # 58 since Battery Cycles (`32/50` field 14) joined the list, 59
+        # since Home From Solar (`f12.1`), 63 since Unit Battery Power got its
+        # charge/discharge split and the two kWh counters integrating it, 64
+        # since AC Grid Connection Power (`f50.1.7`).
+        assert len(STREAMAC5000_SENSORS) == 64
+        assert len(STREAMAC5000_POWER_TO_ENERGY) == 7
+
+    def test_the_pv_strings_wait_for_a_non_zero_reading(self) -> None:
+        """The `f50.1` group arrives on every unit of the family, PV or not.
+
+        The parser fills all five to 0 W whenever it does, which is what
+        stops them latching overnight. Gating on the key alone would then
+        create five entities on every ES22.
+        """
+        pv_keys = {"pv_total_w", "pv1_w", "pv2_w", "pv3_w", "pv4_w"}
+        found = {d.key for d in STREAMAC5000_SENSORS if d.key in pv_keys}
+        assert found == pv_keys
+        for definition in STREAMAC5000_SENSORS:
+            if definition.key in pv_keys:
+                assert definition.accessory, definition.key
+                assert definition.accessory_needs_nonzero, definition.key
+
+    def test_the_ac_output_waits_for_a_non_zero_reading(self) -> None:
+        """The parser fills `f11.7` to 0 W on every frame that carries `f11`.
+
+        That stops an unplugged load from latching, and it would create the
+        entity on every ES22 and ES21 if the key alone were enough (#458).
+        """
+        by_key = {s.key: s for s in STREAMAC5000_SENSORS}
+        definition = by_key["ac_output_power_w"]
+        assert definition.accessory
+        assert definition.accessory_needs_nonzero
+        assert (definition.unit, definition.device_class) == ("W", "power")
+        assert definition.state_class == "measurement"
+
+    def test_exactly_one_battery_device_class(self) -> None:
+        battery = [s for s in STREAMAC5000_SENSORS if s.device_class == "battery"]
+        assert [s.key for s in battery] == ["soc_pct"]
+
+    def test_energy_counters_have_a_source_and_a_sensor(self) -> None:
+        keys = {s.key for s in STREAMAC5000_SENSORS}
+        for power_key, energy_key in STREAMAC5000_POWER_TO_ENERGY.items():
+            assert power_key in keys, power_key
+            assert energy_key in keys, energy_key
+
+    def test_energy_counters_are_total_increasing(self) -> None:
+        for definition in STREAMAC5000_SENSORS:
+            if definition.unit == "kWh":
+                assert definition.state_class == "total_increasing", definition.key
+
+    def test_an_accessory_energy_counter_follows_its_power_source(self) -> None:
+        """An energy counter is integrated from its power reading, so gating
+        one without the other would create a counter that can never move."""
+        by_key = {s.key: s for s in STREAMAC5000_SENSORS}
+        for power_key, energy_key in STREAMAC5000_POWER_TO_ENERGY.items():
+            assert by_key[energy_key].accessory == by_key[power_key].accessory, (
+                energy_key
+            )
+
+    def test_a_zero_does_not_announce_an_accessory(self) -> None:
+        """The gate itself, not just the flag that switches it on."""
+
+        class _Stub(MagicMock):
+            device_data = {"solar_w": 0.0, "grid_phase_a_active_power_w": 0.0}
+            data: dict[str, Any] = {}
+
+        stub = _Stub()
+        assert reading_reported(stub, "solar_w") is True
+        assert reading_reported(stub, "solar_w", needs_nonzero=True) is False
+        stub.device_data["solar_w"] = 1556.0
+        assert reading_reported(stub, "solar_w", needs_nonzero=True) is True
+        # A key without the flag is unaffected by its own zero.
+        assert reading_reported(stub, "grid_phase_a_active_power_w") is True
+        assert reading_reported(stub, "missing_key", needs_nonzero=True) is False
+
+    def test_the_solar_reading_waits_for_a_non_zero_value(self) -> None:
+        """It is published as a zero, so presence alone cannot gate it.
+
+        The node total is zero-filled to stop the reading latching at its
+        last daylight value overnight. That fill would otherwise announce
+        solar on the first frame of every unit, so the entity waits for a
+        reading that is actually solar.
+        """
+        by_key = {d.key: d for d in STREAMAC5000_SENSORS}
+        solar = by_key["solar_w"]
+        assert solar.accessory is True
+        assert solar.accessory_needs_nonzero is True
+
+    def test_only_the_zero_filled_readings_wait_for_a_non_zero_value(self) -> None:
+        """A meter phase may legitimately sit at zero and must not wait.
+
+        The solar, PV and AC output keys are the ones the parser zero-fills,
+        so their presence says nothing about whether the hardware is there.
+        Every other accessory key is created as soon as it is reported.
+        """
+        zero_filled = {
+            "solar_w",
+            "pv_total_w",
+            "pv1_w",
+            "pv2_w",
+            "pv3_w",
+            "pv4_w",
+            "ac_output_power_w",
+            "home_from_solar_w",
+        }
+        for definition in STREAMAC5000_SENSORS:
+            if definition.key in zero_filled:
+                assert definition.accessory and definition.accessory_needs_nonzero, (
+                    definition.key
+                )
+                continue
+            assert definition.accessory_needs_nonzero is False, definition.key
+
+    def test_the_solar_reading_has_no_lifetime_counter(self) -> None:
+        """The reading stays, the counter does not.
+
+        This device works its solar figure out from the house flows and
+        reports one on a unit with no PV wired to it at all, as frames 25 and
+        26 of the push capture show. A total_increasing counter only ever
+        counts up and cannot be corrected afterwards, so integrating an
+        inferred figure would credit the Energy Dashboard with production
+        that never happened. `solar_w` carries the same information and can
+        simply be ignored.
+        """
+        keys = {s.key for s in STREAMAC5000_SENSORS}
+        assert "solar_w" in keys
+        assert "solar_energy_kwh" not in keys
+        assert "solar_w" not in STREAMAC5000_POWER_TO_ENERGY
+
+    def test_every_control_is_enhanced_only(self) -> None:
+        """This device has no Developer API at all, so with developer keys a
+        control would be created that can neither write nor read back."""
+        for number_def in STREAMAC5000_NUMBERS:
+            assert number_def.enhanced_only is True, number_def.key
+        for switch_def in STREAMAC5000_SWITCHES:
+            assert switch_def.enhanced_only is True, switch_def.key
+        for select_def in STREAMAC5000_SELECTS:
+            assert select_def.enhanced_only is True, select_def.key
+
+    def test_a_control_is_named_after_the_reading_it_writes(self) -> None:
+        """One value, one wording.
+
+        Home Assistant gives a number no description field, so its name is the
+        only text an owner reads while dragging the slider. A control and the
+        sensor reporting the same value under a different name reads as two
+        settings.
+        """
+        translations = json.loads(
+            (
+                Path(__file__).parents[2]
+                / "custom_components/ecoflow_energy/translations/en.json"
+            ).read_text(encoding="utf-8")
+        )["entity"]
+        sensor_keys = {s.key for s in STREAMAC5000_SENSORS}
+        for definition in STREAMAC5000_NUMBERS:
+            if definition.state_key not in sensor_keys:
+                continue
+            assert (
+                translations["number"][definition.key]["name"]
+                == translations["sensor"][definition.state_key]["name"]
+            ), definition.key
+
+
+class TestBKSeriesSetIsUntouched:
+    """The BK-series entity set must not move because of this device.
+
+    An ES22 gets its own list precisely so the BK series keeps the set it
+    was released with. The failure this guards against is subtractive: an
+    ES22-only key added to `STREAM_SENSORS` instead, then excluded again per
+    prefix, would create entities on every Stream in the field that can never
+    fill, and Home Assistant keeps an entity once it exists. The Stream Micro
+    (BK01) is the one prefix that legitimately gets less, and it gets it
+    through `filter_defs_for_serial`, not through a shorter list.
+    """
+
+    def test_the_stream_list_keeps_its_size(self) -> None:
+        # 55 since Unit Battery SOC joined the BK list (#323): a key the
+        # BK series itself reports, not an ES22 one. 59 since the voltage and
+        # current of strings 3 and 4 joined it (#522), keys of the same BK
+        # series. 60 since Battery Cycles, the BK series' own BMS heartbeat.
+        assert len(_get_sensor_defs(DEVICE_TYPE_STREAM)) == 60
+
+    def test_bk01_still_gets_the_micro_reduced_set(self) -> None:
+        defs = _get_sensor_defs(DEVICE_TYPE_STREAM)
+        micro = filter_defs_for_serial(defs, "BK01TEST00000001")
+
+        assert len(micro) == 25
+        assert not {d.key for d in micro} & STREAM_MICRO_EXCLUDED_KEYS
+
+    def test_every_other_stream_prefix_gets_the_whole_set(self) -> None:
+        defs = _get_sensor_defs(DEVICE_TYPE_STREAM)
+
+        assert filter_defs_for_serial(defs, "BK31TEST00000001") == list(defs)
+
+
+class TestTaskListShrinkRouting:
+    """The topic decides which readback may retract a task, so drive the topic.
+
+    The parser tests cover the rule itself. These cover what only the ingest
+    can get wrong: a clear that fires on one topic and not the other, or an
+    acknowledgement read as a task list. ADR-015 decision 2 is what they pin,
+    and nothing else on this branch does.
+
+    Frames are @slaapyhoofd's, from the two downloads on #234.
+    """
+
+    FIXTURE = (
+        Path(__file__).parent.parent
+        / "fixtures"
+        / "stream_ac5000"
+        / "es22_task_delete_masked.json"
+    )
+    PROPERTY_TOPIC = "/app/1/ES22TEST00000001/thing/property/post"
+    GET_REPLY_TOPIC = "/app/1/ES22TEST00000001/thing/property/get_reply"
+    SET_REPLY_TOPIC = "/open/cert_account/ES22TEST00000001/set_reply"
+
+    def _frame(self, role: str) -> bytes:
+        frames = json.loads(self.FIXTURE.read_text())["frames"]
+        return bytes.fromhex(next(f["hex"] for f in frames if f["role"] == role))
+
+    def _coordinator(self, hass: HomeAssistant):
+        entry = _entry(ES22_DEVICE)
+        entry.add_to_hass(hass)
+        return EcoFlowDeviceCoordinator(hass, entry, ES22_DEVICE)
+
+    async def test_the_capture_sequence_ends_without_the_deleted_task(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Both tasks, a stale readback, then the list after the deletion.
+
+        Step two is decision 1 written down: the stale `get_reply` carries both
+        tasks and is applied as such, because a whole list is a whole list
+        whatever its age. Step three is the defect, and it is the step a clear
+        restricted to the property topic would fail.
+        """
+        coordinator = self._coordinator(hass)
+
+        both = coordinator._parse_message(
+            self.PROPERTY_TOPIC, self._frame("both_tasks_push")
+        )
+        assert both is not None
+        assert both["scheduled_discharge_power_w"] == 0
+        assert both["scheduled_charge_power_w"] == 2500
+
+        stale = coordinator._parse_message(
+            self.GET_REPLY_TOPIC, self._frame("stale_get_reply_after_delete")
+        )
+        assert stale is not None
+        assert stale["scheduled_discharge_power_w"] == 0
+
+        after = coordinator._parse_message(
+            self.GET_REPLY_TOPIC, self._frame("after_delete_get_reply")
+        )
+        assert after is not None
+        assert after["scheduled_charge_power_w"] == 2500
+        assert after["scheduled_discharge_power_w"] is None
+
+    async def test_a_property_push_alone_clears_the_deleted_kind(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The mirror: a clear restricted to `get_reply` would fail here."""
+        coordinator = self._coordinator(hass)
+
+        coordinator._parse_message(self.PROPERTY_TOPIC, self._frame("both_tasks_push"))
+        after = coordinator._parse_message(
+            self.PROPERTY_TOPIC, self._frame("after_delete_push")
+        )
+        assert after is not None
+        assert after["scheduled_charge_power_w"] == 2500
+        assert after["scheduled_discharge_power_w"] is None
+
+    async def test_the_delete_acknowledgement_is_not_a_readback(
+        self, hass: HomeAssistant
+    ) -> None:
+        """A `/set_reply` never becomes a task list, and must not.
+
+        It echoes the entries of the write, one kind at a time. Read as a task
+        list it would clear the kind it does not mention and, by the write
+        path's rule, swallow the next removal.
+
+        What this pins is the outcome, and the outcome has two independent
+        guards: the ingest returns on every `/set_reply` topic before parsing,
+        and `(254, 38)` has no entry in the field map. Measured 2026-09-04:
+        removing either one alone leaves this test green, because the other
+        still holds. So it does not tell you which guard is doing the work,
+        and a test that claimed to would be claiming more than it can see.
+        Both would have to go for a `set_reply` to reach the task path, and
+        that is the state this refuses.
+        """
+        coordinator = self._coordinator(hass)
+
+        result = coordinator._parse_message(
+            self.SET_REPLY_TOPIC, self._frame("delete_ack")
+        )
+        assert result is None
+
+
+class TestAccessoryAfterRestart:
+    """PLAN-142: a registry entry from an earlier run is not silenced by a
+    restart that lands before the reading's next non-zero frame.
+
+    `solar_w` and the meter fields carry `accessory_needs_nonzero`: the
+    parser zero-fills them on every `254/39` frame, so a running instance
+    shows 0 W rather than a stale value, but the old setup-time gate could
+    not tell a device that has never reported from one whose earlier run
+    already discovered the reading.
+    """
+
+    async def test_a_reading_the_owner_has_is_created_at_setup(
+        self, hass: HomeAssistant
+    ) -> None:
+        registry = er.async_get(hass)
+        registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            f"{ES22_DEVICE['sn']}_solar_w",
+        )
+
+        coordinator, created = await _setup_with_coordinator(hass)
+
+        keys = {
+            entity._definition.key
+            for entity in created
+            if hasattr(entity, "_definition")
+        }
+        assert "solar_w" in keys
+
+        solar = next(
+            entity
+            for entity in created
+            if getattr(entity, "_definition", None) is not None
+            and entity._definition.key == "solar_w"
+        )
+        coordinator.set_device_value("solar_w", 0.0)
+        coordinator.async_set_updated_data({"solar_w": 0.0})
+        await hass.async_block_till_done()
+
+        assert solar.native_value == 0
+
+    async def test_an_entry_the_integration_disabled_stays_pending_and_is_dropped(
+        self, hass: HomeAssistant
+    ) -> None:
+        """The integration's own stale-entry cleanup still owns this case;
+        the setup-time bypass only fires for an entry nobody disabled.
+
+        Both halves of that sentence are asserted: the entry does not become
+        an entity at setup, and once the device's first frame arrives - here
+        the zero fill `accessory_needs_nonzero` reads on every `254/39` -
+        `_watch_for_accessory`'s cleanup still removes it, exactly as it did
+        before this change.
+        """
+        registry = er.async_get(hass)
+        entry = registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            f"{ES22_DEVICE['sn']}_solar_w",
+            disabled_by=er.RegistryEntryDisabler.INTEGRATION,
+        )
+
+        coordinator, created = await _setup_with_coordinator(hass)
+
+        keys = {
+            entity._definition.key
+            for entity in created
+            if hasattr(entity, "_definition")
+        }
+        assert "solar_w" not in keys
+
+        coordinator.set_device_value("solar_w", 0.0)
+        coordinator.async_set_updated_data({"solar_w": 0.0})
+        await hass.async_block_till_done()
+
+        assert registry.async_get(entry.entity_id) is None
+
+    async def test_no_duplicate_when_the_reading_later_turns_nonzero(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Guards two failure shapes at once: a dead `_watch_for_accessory`
+        listener (nothing shows up for a sibling reading that starts
+        pending) and a dropped `continue` after the setup-time bypass
+        (`solar_w` would be appended twice - once by the bypass, once more
+        whenever it later crosses zero through the normal path)."""
+        registry = er.async_get(hass)
+        registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            f"{ES22_DEVICE['sn']}_solar_w",
+        )
+
+        coordinator, created = await _setup_with_coordinator(hass)
+
+        def _by_key(key: str) -> list[Any]:
+            return [
+                entity
+                for entity in created
+                if getattr(entity, "_definition", None) is not None
+                and entity._definition.key == key
+            ]
+
+        # solar_w bypassed the gate and was created at setup already.
+        assert len(_by_key("solar_w")) == 1
+
+        # pv1_w has no registry entry, so it starts pending and can only
+        # appear through _watch_for_accessory's listener.
+        for watts in (0.0, 81.0, 90.0):
+            coordinator.set_device_value("solar_w", watts)
+            coordinator.set_device_value("pv1_w", watts)
+            coordinator.async_set_updated_data(dict(coordinator.device_data))
+            await hass.async_block_till_done()
+
+        assert len(_by_key("solar_w")) == 1
+        assert len(_by_key("pv1_w")) == 1

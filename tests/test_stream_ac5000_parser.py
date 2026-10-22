@@ -1,0 +1,2179 @@
+"""Tests for the STREAM AC 5000 (ES22) protobuf telemetry parser."""
+
+from __future__ import annotations
+
+import json
+import logging
+import struct
+from pathlib import Path
+
+import pytest
+from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+    _TASK_KEYS,
+    UNIT_PV_BY_SN_KEY,
+    UNIT_PV_ENTRY_SOC_KEY,
+    parse_stream_ac5000_message,
+)
+from ecoflow_energy.ecoflow.proto.decoder import _read_varint, decode_header_message
+from ecoflow_energy.ecoflow.proto_encoding import (
+    encode_field_bytes,
+    encode_field_varint,
+    encode_varint,
+)
+
+FIXTURES = Path(__file__).parent / "fixtures" / "stream_ac5000"
+GET_REPLY = FIXTURES / "es22_get_reply_masked.json"
+PUSHES = FIXTURES / "es22_push_capture_masked.json"
+ES21_PV = FIXTURES / "es21_pv_masked.json"
+ES21_PAIR = FIXTURES / "es21_pair_pv_masked.json"
+ES21_PAIR_BOTH = FIXTURES / "es21_pair_pv_both_connections_masked.json"
+SOCKET_458 = FIXTURES / "es22_socket_458_masked.json"
+PV_KEYS = ("pv_total_w", "pv1_w", "pv2_w", "pv3_w", "pv4_w")
+AC_KEY = "ac_grid_connection_power_w"
+
+
+def _own_strings(parsed: dict) -> dict:
+    """The one unit's PV entry of a single-unit frame, keyed by serial upstream.
+
+    A parsed frame never carries the five PV keys flat any more: they sit
+    under the serial of the unit they belong to, and the coordinator lifts
+    its own. The single-unit fixtures carry exactly one entry, so this is it.
+    """
+    entries = parsed[UNIT_PV_BY_SN_KEY]
+    assert len(entries) == 1, list(entries)
+    return next(iter(entries.values()))
+
+
+TASK_FRAMES = FIXTURES / "es22_task_frames_masked.json"
+
+
+def _encode_fixed32_field(field_number: int, value: float) -> bytes:
+    """Encode one protobuf fixed32 field."""
+    tag = (field_number << 3) | 5
+    return encode_varint(tag) + struct.pack("<f", value)
+
+
+def _sub(field_number: int, inner: bytes) -> bytes:
+    """Wrap ``inner`` as a length-delimited submessage."""
+    return encode_field_bytes(field_number, inner)
+
+
+def _edges(
+    *,
+    to_home: float = 0.0,
+    to_grid: float = 0.0,
+    from_grid: float = 0.0,
+    from_solar: float | None = None,
+) -> bytes:
+    """Build an `f12` flow-matrix group. Battery power is derived from these."""
+    inner = (
+        _encode_fixed32_field(4, to_home)
+        + _encode_fixed32_field(5, to_grid)
+        + _encode_fixed32_field(6, 0.0)
+        + _encode_fixed32_field(7, from_grid)
+    )
+    if from_solar is not None:
+        inner += _encode_fixed32_field(9, from_solar)
+    return _sub(12, inner)
+
+
+def _build_frame(cmd_func: int, cmd_id: int, inner: bytes) -> bytes:
+    """Build a minimal EcoFlow header frame for tests."""
+    header = bytearray()
+    header.extend(encode_field_bytes(1, inner))
+    header.extend(encode_field_varint(8, cmd_func))
+    header.extend(encode_field_varint(9, cmd_id))
+    return encode_field_bytes(1, bytes(header))
+
+
+def _build_masked_frame(cmd_func: int, cmd_id: int, inner: bytes, seq: int) -> bytes:
+    """Build a frame whose payload is XOR-masked with its own sequence byte."""
+    masked = bytes(value ^ (seq & 0xFF) for value in inner)
+    header = bytearray()
+    header.extend(encode_field_bytes(1, masked))
+    header.extend(encode_field_varint(6, 1))  # enc_type
+    header.extend(encode_field_varint(8, cmd_func))
+    header.extend(encode_field_varint(9, cmd_id))
+    header.extend(encode_field_varint(14, seq))
+    return encode_field_bytes(1, bytes(header))
+
+
+def _load(path: Path) -> list[dict]:
+    return json.loads(path.read_text(encoding="utf-8"))["frames"]
+
+
+class TestNestedWalker:
+    """The map addresses nested paths, which the Stream walker cannot do."""
+
+    def test_reads_a_value_two_levels_down(self) -> None:
+        inner = _sub(33, _encode_fixed32_field(6, 12.5))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["soc_precise_pct"] == pytest.approx(12.5, rel=1e-5)
+
+    def test_half_watt_node_totals_are_halved(self) -> None:
+        inner = _sub(11, encode_field_varint(1, 4042))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["home_w"] == pytest.approx(2021.0, rel=1e-6)
+
+    def test_solar_node_total_is_already_watts(self) -> None:
+        """f11.9 is the one field in this block that is not half-watts."""
+        inner = _sub(11, encode_field_varint(9, 1556))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["solar_w"] == pytest.approx(1556.0, rel=1e-6)
+
+    def test_undeclared_string_field_is_not_entered(self) -> None:
+        """A length-delimited field the map does not declare is skipped.
+
+        `f23.3` holds a timezone name. Walking into it as if it were a
+        submessage is how a parser invents fields that do not exist.
+        """
+        timezone_block = _sub(23, _sub(3, b"Europe/Amsterdam"))
+        frame = _build_frame(254, 39, bytes(timezone_block + _edges(from_grid=100.0)))
+        result = parse_stream_ac5000_message(frame)
+        assert result is not None
+        assert result["batt_w"] == pytest.approx(100.0, rel=1e-5)
+        assert not any(key.startswith("23") for key in result)
+
+    def test_group_arriving_as_a_scalar_is_ignored(self) -> None:
+        """A declared group sent as a varint is a layout difference."""
+        inner = encode_field_varint(11, 5) + _edges(from_grid=42.0)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert "home_w" not in result
+        assert result["batt_w"] == pytest.approx(42.0, rel=1e-5)
+
+    def test_masked_payload_is_unmasked(self) -> None:
+        """No ES22 frame has set enc_type, so this path is synthetic only."""
+        inner = _sub(11, encode_field_varint(5, 18))
+        frame = _build_masked_frame(254, 39, bytes(inner), seq=77)
+        result = parse_stream_ac5000_message(frame)
+        assert result is not None
+        assert result["soc_pct"] == 18
+
+
+class TestFlowEdges:
+    def test_present_edge_group_zero_fills_its_missing_edges(self) -> None:
+        """proto3 omits a zero, so an absent edge in a present group is 0.
+
+        Without this an idle battery would keep reporting the last power it
+        delivered, forever.
+        """
+        inner = _sub(12, encode_field_varint(6, 800))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["home_from_grid_w"] == 800
+        assert result["home_from_batt_w"] == 0.0
+        assert result["grid_export_power_w"] == 0.0
+        assert result["grid_import_power_w"] == 800.0
+
+    def test_absent_edge_group_reports_nothing(self) -> None:
+        """An `f11`-only push means unchanged, not zero.
+
+        116 of 355 observed pushes have this shape. Zero-filling them would
+        blank an edge that is still delivering power.
+        """
+        inner = _sub(11, encode_field_varint(1, 2000))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["home_w"] == pytest.approx(1000.0)
+        assert "home_from_batt_w" not in result
+        assert "home_from_grid_w" not in result
+        assert "grid_import_power_w" not in result
+        assert "grid_export_power_w" not in result
+
+    def test_field_8_does_not_reach_solar_to_home(self) -> None:
+        """Field 8 appears in no captured frame, so its position is a guess.
+
+        An inferred position reaching an accessory entity is a wrong reading
+        Home Assistant keeps forever.
+        """
+        inner = _sub(12, encode_field_varint(4, 500) + encode_field_varint(8, 700))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        # Solar to home is `.1`, zero-filled here; field 8 must not reach it.
+        assert result["home_from_solar_w"] == 0.0
+
+    def test_solar_falls_to_zero_instead_of_latching(self) -> None:
+        """The node total is filled, so sunset reports 0 rather than nothing.
+
+        Nothing deletes a key that stops arriving, so a solar reading left
+        out of the fill held its last daylight value until sunrise. The
+        entity is still kept off units without PV, by requiring a non-zero
+        reading before it is created rather than by withholding the zero.
+        """
+        daylight = _sub(11, encode_field_varint(1, 2000) + encode_field_varint(9, 1556))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(daylight)))
+        assert result is not None
+        assert result["solar_w"] == pytest.approx(1556.0)
+
+        night = _sub(11, encode_field_varint(1, 2000))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(night)))
+        assert result is not None
+        assert result["solar_w"] == 0.0
+
+    def test_an_absent_node_group_still_reports_no_solar(self) -> None:
+        """The fill needs its container: no `f11`, no statement about solar."""
+        inner = _sub(12, encode_field_varint(4, 500))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert "solar_w" not in result
+
+    def test_export_sums_the_two_outbound_edges(self) -> None:
+        inner = _sub(
+            12,
+            encode_field_varint(5, 356) + encode_field_varint(10, 62),
+        )
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["grid_export_power_w"] == pytest.approx(418.0)
+        assert result["grid_import_power_w"] == pytest.approx(0.0)
+
+
+class TestDerivedValues:
+    @pytest.mark.parametrize(
+        ("edges", "batt_w"),
+        [
+            ({"from_grid": 599.6}, 599.6),
+            ({"to_home": 593.0}, -593.0),
+            ({"to_grid": 200.0, "to_home": 393.0}, -593.0),
+            ({}, 0.0),
+        ],
+    )
+    def test_battery_power_comes_from_the_edges(
+        self, edges: dict[str, float], batt_w: float
+    ) -> None:
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_edges(**edges)))
+        )
+        assert result is not None
+        assert result["batt_w"] == pytest.approx(batt_w, rel=1e-5)
+
+    @pytest.mark.parametrize(
+        ("edges", "batt_w"),
+        [
+            ({"from_solar": 400.0, "from_grid": 100.0}, 500.0),
+            ({"from_solar": 400.0, "to_home": 150.0}, 250.0),
+            ({"from_solar": 46.0}, 46.0),
+        ],
+    )
+    def test_the_solar_to_battery_edge_counts_towards_battery_power(
+        self, edges: dict[str, float], batt_w: float
+    ) -> None:
+        """`f12.9` is solar charging the pack and belongs in the sum.
+
+        It is absent from both fixtures only because the unit they came from
+        has no PV wired to the EcoFlow. Issue #177 confirms it three times on
+        a unit that has, the clearest being a frame where the battery took
+        47 W out of 2.86 kW of solar and field 9 read 46. Dropping it would
+        report zero battery power to a PV owner while the pack fills, and the
+        charge counter would miss the whole solar contribution.
+        """
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_edges(**edges)))
+        )
+        assert result is not None
+        assert result["batt_w"] == pytest.approx(batt_w, rel=1e-5)
+
+    def test_battery_power_ignores_f50(self) -> None:
+        """`f50.1.4` latches at its last active value once the unit idles."""
+        inner = _edges(to_home=0.0) + _sub(50, _sub(1, _encode_fixed32_field(4, 444.0)))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["batt_w"] == pytest.approx(0.0)
+
+    def test_absent_flow_matrix_leaves_battery_power_unset(self) -> None:
+        """An absent `f12` means unchanged, so the coordinator keeps the last."""
+        inner = _sub(38, _sub(1, encode_field_varint(1, 9)))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner))) or {}
+        assert "batt_w" not in result
+        assert "batt_charge_power_w" not in result
+
+    def test_zero_fill_clears_the_battery_edges(self) -> None:
+        """A present `f12` that omits an edge decodes it as zero, not stale."""
+        inner = _sub(12, _encode_fixed32_field(6, 200.0))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["batt_w"] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize(
+        ("edges", "charge", "discharge"),
+        [
+            ({"from_grid": 599.6}, 599.6, 0.0),
+            ({"to_home": 593.0}, 0.0, 593.0),
+            ({}, 0.0, 0.0),
+        ],
+    )
+    def test_signed_battery_power_splits_one_way_only(
+        self, edges: dict[str, float], charge: float, discharge: float
+    ) -> None:
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_edges(**edges)))
+        )
+        assert result is not None
+        assert result["batt_charge_power_w"] == pytest.approx(charge, rel=1e-5)
+        assert result["batt_discharge_power_w"] == pytest.approx(discharge, rel=1e-5)
+
+    def test_charge_discharge_state_is_left_to_the_coordinator(self) -> None:
+        """The coordinator derives it with hysteresis over a rolling window."""
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_edges(to_home=593.0)))
+        )
+        assert result is not None
+        assert "batt_charge_discharge_state" not in result
+
+    def test_meter_block_carries_the_grid_sign(self) -> None:
+        """A Tibber Pulse reports one signed total; negative is export."""
+        inner = _sub(15, _encode_fixed32_field(3, -419.0))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["grid_w"] == pytest.approx(-419.0, rel=1e-5)
+
+    def test_p1_meter_net_feeds_the_same_key(self) -> None:
+        """An EcoFlow P1 reports per-phase values and its net in f16.16."""
+        inner = _sub(
+            16,
+            _encode_fixed32_field(4, 1111.0)
+            + _encode_fixed32_field(5, -506.0)
+            + _encode_fixed32_field(6, -607.0)
+            + _encode_fixed32_field(7, 231.4)
+            + _encode_fixed32_field(15, 50.02)
+            + _encode_fixed32_field(16, -2.0),
+        )
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["grid_phase_a_active_power_w"] == pytest.approx(1111.0, rel=1e-5)
+        assert result["grid_phase_b_active_power_w"] == pytest.approx(-506.0, rel=1e-5)
+        assert result["grid_phase_c_active_power_w"] == pytest.approx(-607.0, rel=1e-5)
+        assert result["grid_phase_a_voltage_v"] == pytest.approx(231.4, rel=1e-5)
+        assert result["ac_frequency_hz"] == pytest.approx(50.02, rel=1e-5)
+        assert result["grid_w"] == pytest.approx(-2.0, rel=1e-5)
+
+    def test_account_power_limits(self) -> None:
+        """f10.1 and f10.2 are the limits the app calls max grid-tied output
+        and max grid input. Each was moved in the app on its own and read back
+        at the value set, in both directions."""
+        inner = _sub(10, encode_field_varint(1, 2400) + encode_field_varint(2, 1200))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["max_grid_output_power_w"] == 2400
+        assert result["max_grid_input_power_w"] == 1200
+
+    def test_the_ceiling_fields_are_not_offered_as_user_limits(self) -> None:
+        """Neither f10.5 nor f10.6 is a user setting, for different reasons.
+
+        `.6` sat at the same 2500 as the input limit for as long as nobody
+        touched the setting, which is what made it look like the source. It
+        did not follow that limit to 1200 and back, and it has moved only
+        once ever, when the ceiling was raised from 600, so it behaves like
+        that ceiling. `.5` is unexplained: 600 at the old ceiling and 800
+        after, matching no setting visible in the app.
+
+        Both are read now, because a write to this field carries `.5` and the
+        control bounds itself by `.6`. Neither reaches an owner: they are
+        keyed under a leading underscore, which is what keeps a number nobody
+        can explain out of the entity list.
+        """
+        inner = _sub(
+            10,
+            encode_field_varint(4, 21)
+            + encode_field_varint(5, 800)
+            + encode_field_varint(6, 2500),
+        )
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+
+        # Distinct values on purpose. `.4` was unpinned until 2026-08-21, and
+        # two mutations proved it: reading `10.3` instead, and dropping the
+        # mapping entirely, both left the full suite green. The first would put
+        # another field's value on the wire of real hardware, the second would
+        # make the control raise not-ready forever.
+        assert result == {
+            "_grid_output_field_4": 21,
+            "_grid_output_field_5": 800,
+            "_grid_output_ceiling_w": 2500,
+        }
+        assert all(key.startswith("_") for key in result)
+
+    def test_the_milliwatt_pair_is_not_mapped(self) -> None:
+        """254/40 f22 reads 600000/1200000 and stayed there while the account
+        limit went to 2500 W, the output limit to 2400 W and the discharge task
+        to 1400 W. It is neither, so it is left alone."""
+        inner = _sub(
+            22, encode_field_varint(1, 600000) + encode_field_varint(3, 1200000)
+        )
+        assert parse_stream_ac5000_message(_build_frame(254, 40, bytes(inner))) is None
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [(0, "self_powered"), (1, "intelligent_plus"), (2, "custom"), (9, None)],
+    )
+    def test_work_mode_enum(self, raw: int, expected: str | None) -> None:
+        inner = encode_field_varint(25, raw)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["work_mode"] == expected
+
+    def test_bms_current_and_voltage_convert_from_milli_units(self) -> None:
+        inner = encode_field_varint(7, 16063) + encode_field_varint(
+            8, (1 << 64) - 40735
+        )
+        result = parse_stream_ac5000_message(_build_frame(32, 50, bytes(inner)))
+        assert result is not None
+        assert result["batt_voltage_v"] == pytest.approx(16.063)
+        assert result["bms_current_a"] == pytest.approx(-40.735)
+
+    def test_bms_soc_does_not_overwrite_the_system_soc(self) -> None:
+        """The pack reads about two points above what the app shows."""
+        system = _sub(33, _encode_fixed32_field(6, 18.63))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(system)))
+        assert result is not None
+        assert result["soc_precise_pct"] == pytest.approx(18.63, rel=1e-4)
+
+        bms = parse_stream_ac5000_message(
+            _build_frame(32, 50, bytes(_encode_fixed32_field(25, 20.93)))
+        )
+        assert bms is not None
+        assert bms["bms_soc_precise_pct"] == pytest.approx(20.93, rel=1e-4)
+        assert "soc_precise_pct" not in bms
+
+
+class TestSocLimits:
+    def test_limits_from_the_battery_heartbeat(self) -> None:
+        inner = _sub(1, encode_field_varint(7, 90) + encode_field_varint(21, 15))
+        result = parse_stream_ac5000_message(_build_frame(32, 2, bytes(inner)))
+        assert result is not None
+        assert result["max_charge_soc_pct"] == 90
+        assert result["min_discharge_soc_pct"] == 15
+
+    def test_the_config_block_is_not_a_second_source(self) -> None:
+        """`254/39 f29` holds the same limits and stays unmapped.
+
+        Both frames reach the same entity on the same channel, so mapping
+        both would be two sources writing one value, the shape that made the
+        Stream LED readback flap. `f29` is the one left out because it rides
+        only in the full-state frame, so a limit changed in the app would
+        take minutes to arrive rather than seconds.
+        """
+        inner = _sub(29, encode_field_varint(1, 90) + encode_field_varint(2, 15))
+        assert parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner))) is None
+
+    def test_scheduled_discharge_setpoint_is_read_back(self) -> None:
+        """f40.1.9.1 followed every setpoint written during a control test."""
+        task = (
+            encode_field_varint(2, 2)  # discharge
+            + encode_field_varint(3, 1)  # enabled
+            + _sub(7, encode_varint((1380 << 16) | 0))
+            + _sub(9, encode_field_varint(1, 500))
+        )
+        inner = _sub(40, _sub(1, task))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] == 500
+        assert result["scheduled_discharge_enabled"] is True
+        assert result["scheduled_discharge_start_min"] == 0
+        assert result["scheduled_discharge_end_min"] == 1380
+        # An `f40` is the whole list (ADR-015), so a frame carrying only a
+        # discharge task states that no charge task exists. Before that rule
+        # the key was simply absent and a deleted charge task kept its old
+        # setpoint for as long as the integration ran.
+        assert result["scheduled_charge_power_w"] is None
+
+
+class TestScheduledTasks:
+    def test_charge_task_keys_are_separate_from_discharge(self) -> None:
+        per_device = (
+            encode_field_bytes(1, b"ES22TEST00000001")
+            + encode_field_varint(2, 100)
+            + encode_field_varint(3, 600)
+        )
+        task = (
+            encode_field_varint(2, 1)  # charge
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((960 << 16) | 780))
+            + _sub(8, encode_field_varint(1, 1) + _sub(3, per_device))
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 600
+        assert result["scheduled_charge_start_min"] == 780
+        assert result["scheduled_charge_end_min"] == 960
+        assert result["scheduled_charge_task_slot"] == 1
+        # The kinds stay separate, and the absent one now says so explicitly
+        # rather than by omission (ADR-015).
+        assert result["scheduled_discharge_power_w"] is None
+
+    def test_a_frame_carrying_two_tasks_reports_both(self) -> None:
+        """`f40` is the whole list and `40.1` repeats, one block per task.
+
+        Decoded into one flat result the second block overwrites the first, so
+        the frame of 2026-08-03 22:21:59 reported its 1400 W discharge task and
+        lost the 1800 W charge task standing beside it. A task the parser
+        cannot see is a task the write path never removes.
+        """
+        per_device = (
+            encode_field_bytes(1, b"ES22TEST00000001")
+            + encode_field_varint(2, 100)
+            + encode_field_varint(3, 1800)
+        )
+        charge = (
+            encode_field_varint(2, 1)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((1020 << 16) | 180))
+            + _sub(8, encode_field_varint(1, 1) + _sub(3, per_device))
+        )
+        discharge = (
+            encode_field_varint(2, 2)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((120 << 16) | 1080))
+            + _sub(9, encode_field_varint(1, 1400))
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, charge) + _sub(1, discharge))))
+        )
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 1800
+        assert result["scheduled_charge_soc_target"] == 100
+        assert result["scheduled_charge_start_min"] == 180
+        assert result["scheduled_charge_end_min"] == 1020
+        assert result["scheduled_charge_task_slot"] == 1
+        assert result["scheduled_discharge_power_w"] == 1400
+        assert result["scheduled_discharge_start_min"] == 1080
+        assert result["scheduled_discharge_end_min"] == 120
+        assert result["scheduled_discharge_task_slot"] == 2
+
+    def test_a_zero_watt_charge_task_reads_as_zero_not_as_nothing(self) -> None:
+        """A task at 0 W sends its container and omits the watts.
+
+        Observed between 19:52 and 19:55 on 2026-08-08, with the device idle
+        under exactly that task: `.8.3` carried the serial and the target SoC
+        and no `.3.3` at all. Read as "no power reported" the parked charge
+        task was invisible, so the write path never removed it and every later
+        discharge write landed on top of it.
+        """
+        per_device = encode_field_bytes(1, b"ES22TEST00000001") + encode_field_varint(
+            2, 100
+        )
+        charge = (
+            encode_field_varint(2, 1)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((1439 << 16) | 0))
+            + _sub(8, encode_field_varint(1, 1) + _sub(3, per_device))
+        )
+        discharge = (
+            encode_field_varint(2, 2)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((1439 << 16) | 0))
+            + _sub(9, encode_field_varint(1, 297))
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, charge) + _sub(1, discharge))))
+        )
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 0
+        assert result["scheduled_charge_soc_target"] == 100
+        assert result["scheduled_discharge_power_w"] == 297
+
+    def test_a_zero_watt_discharge_task_reads_as_zero(self) -> None:
+        """The same fill on the discharge side.
+
+        This one has been seen sending its zero explicitly, so the fill is a
+        no-op there. It is a `setdefault`, so an explicit value always wins.
+        """
+        task = encode_field_varint(2, 2) + encode_field_varint(3, 1) + _sub(9, b"")
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] == 0
+
+    def test_a_discharge_task_numbered_one_is_read_as_discharge(self) -> None:
+        """`40.1.2` is the task's number in the app's list, not what it does.
+
+        On 2026-08-08 at 16:01 one app frame removed the charge task numbered 1
+        and added a discharge task numbered 1 in the same breath. Read as a
+        kind, that filed an 800 W discharge task under charge, found no charge
+        power in it and published no power at all.
+        """
+        task = (
+            encode_field_varint(2, 1)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((360 << 16) | 120))
+            + _sub(9, encode_field_varint(1, 800))
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] == 800
+        assert result["scheduled_discharge_task_slot"] == 1
+        assert result["scheduled_discharge_start_min"] == 120
+        assert result["scheduled_discharge_end_min"] == 360
+        # Every charge key is present and None: the list carried one task and
+        # it was a discharge one, so the frame states there is no charge task
+        # (ADR-015). Absence would mean "this frame says nothing", which is
+        # what a frame without `f40` means and this one is not.
+        expected = {k for k in _TASK_KEYS if k.startswith("scheduled_charge_")}
+        assert {k for k in result if k.startswith("scheduled_charge_")} == expected
+        assert all(result[k] is None for k in expected)
+
+    def test_a_charge_task_numbered_two_is_read_as_charge(self) -> None:
+        """The mirror, so the rule is not re-derived in one direction only."""
+        per_device = (
+            encode_field_bytes(1, b"ES22TEST00000001")
+            + encode_field_varint(2, 80)
+            + encode_field_varint(3, 900)
+        )
+        task = (
+            encode_field_varint(2, 2)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((1439 << 16) | 0))
+            + _sub(8, encode_field_varint(1, 1) + _sub(3, per_device))
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 900
+        assert result["scheduled_charge_soc_target"] == 80
+        assert result["scheduled_charge_task_slot"] == 2
+        # Mirror of the discharge case: the list held one charge task, so the
+        # frame states there is no discharge task rather than staying silent
+        # about it (ADR-015).
+        expected = {k for k in _TASK_KEYS if k.startswith("scheduled_discharge_")}
+        assert {k for k in result if k.startswith("scheduled_discharge_")} == expected
+        assert all(result[k] is None for k in expected)
+
+    def test_two_tasks_of_one_kind_report_the_last(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The keys hold one task per kind and the write path removes one.
+
+        A second task of the same kind therefore survives a setpoint write.
+        Pinned and logged rather than left undefined.
+        """
+        first = encode_field_varint(2, 1) + _sub(9, encode_field_varint(1, 300))
+        second = encode_field_varint(2, 2) + _sub(9, encode_field_varint(1, 700))
+        with caplog.at_level(logging.DEBUG):
+            result = parse_stream_ac5000_message(
+                _build_frame(254, 39, bytes(_sub(40, _sub(1, first) + _sub(1, second))))
+            )
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] == 700
+        assert result["scheduled_discharge_task_slot"] == 2
+        assert "more than one discharge task" in caplog.text
+
+    def test_disabled_task_reports_disabled(self) -> None:
+        """Disabling a task in the app dropped f40.1.3 rather than sending 0."""
+        task = encode_field_varint(2, 2) + _sub(9, encode_field_varint(1, 600))
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is not None
+        assert result["scheduled_discharge_enabled"] is False
+
+    def test_a_task_with_no_number_is_still_read_from_its_block(self) -> None:
+        """Which task a power belongs to is what the container says.
+
+        This used to assert the whole task was dropped, on the reading that
+        `40.1.2` was the only thing that could name a kind. A task carrying a
+        discharge power is a discharge task whether or not it is numbered, and
+        treating it as unreadable is how a live task went unseen. The number is
+        simply absent, because none was observed.
+        """
+        task = _sub(9, encode_field_varint(1, 500))
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] == 500
+        assert "scheduled_discharge_task_slot" not in result
+
+    def test_a_task_with_neither_power_block_is_dropped(self) -> None:
+        """Nothing says what a task with no power container does."""
+        task = (
+            encode_field_varint(2, 1)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((360 << 16) | 120))
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, task))))
+        )
+        assert result is None
+
+    def test_empty_task_block_clears_every_readback_key(self) -> None:
+        """Deleting the last task in the app sends `f40` with no bytes.
+
+        Without this the setpoint entities keep reporting a task the device
+        no longer has, since the coordinator merge only ever adds keys.
+        """
+        inner = _sub(11, encode_field_varint(5, 42)) + _sub(40, b"")
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["soc_pct"] == 42
+        for kind in ("charge", "discharge"):
+            assert result[f"scheduled_{kind}_power_w"] is None
+            assert result[f"scheduled_{kind}_enabled"] is None
+            assert result[f"scheduled_{kind}_start_min"] is None
+            assert result[f"scheduled_{kind}_end_min"] is None
+            assert result[f"scheduled_{kind}_task_slot"] is None
+        assert result["scheduled_charge_soc_target"] is None
+
+    def test_absent_task_block_clears_nothing(self) -> None:
+        """Most 254/39 frames are deltas carrying no `f40`, meaning unchanged.
+
+        Clearing on absence rather than on an empty block would flap the
+        setpoint entities on nearly every frame.
+        """
+        inner = _sub(11, encode_field_varint(5, 42))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert not [key for key in result if key.startswith("scheduled_")]
+
+    def test_a_reported_task_beats_an_empty_block(self) -> None:
+        """A task in the same frame is the more specific statement."""
+        task = encode_field_varint(2, 2) + _sub(9, encode_field_varint(1, 700))
+        inner = _sub(40, b"") + _sub(40, _sub(1, task))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(inner)))
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] == 700
+
+
+class TestRejectsGarbage:
+    def test_empty_payload(self) -> None:
+        assert parse_stream_ac5000_message(b"") is None
+
+    def test_random_bytes(self) -> None:
+        assert parse_stream_ac5000_message(b"\xff\xfe\xfd\xfc") is None
+
+    def test_unmapped_command_yields_nothing(self) -> None:
+        frame = _build_frame(53, 77, bytes.fromhex("08021003"))
+        assert parse_stream_ac5000_message(frame) is None
+
+
+class TestCaptureReplay:
+    """Replay of the real masked captures through the production entry point."""
+
+    def test_a_real_two_task_frame_reports_both_tasks(self) -> None:
+        """The 2026-08-03 22:21:59 get_reply, two app-created tasks in one f40.
+
+        Read flat this frame reported its discharge task alone and lost the
+        1800 W charge task standing beside it.
+        """
+        frame = _load(TASK_FRAMES)[0]
+        result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 1800
+        assert result["scheduled_charge_start_min"] == 180
+        assert result["scheduled_charge_end_min"] == 1020
+        assert result["scheduled_charge_task_slot"] == 1
+        assert result["scheduled_discharge_power_w"] == 1400
+        assert result["scheduled_discharge_start_min"] == 1080
+        assert result["scheduled_discharge_end_min"] == 120
+        assert result["scheduled_discharge_task_slot"] == 2
+
+    def test_a_real_parked_charge_task_reports_zero_watts(self) -> None:
+        """The 2026-08-08 19:52:31 get_reply, the frame from the incident.
+
+        The charge task sat at 0 W and sent no `.8.3.3` at all, so it read as
+        a task with no power, and the write path removes the opposite task only
+        when its power is a known number. The device held both tasks and
+        delivered neither.
+        """
+        frame = _load(TASK_FRAMES)[1]
+        result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 0
+        assert result["scheduled_charge_soc_target"] == 100
+        assert result["scheduled_charge_end_min"] == 1439
+        assert result["scheduled_discharge_power_w"] == 297
+        assert result["scheduled_discharge_end_min"] == 1439
+
+    def test_the_captured_single_task_reads_as_a_charge_task(self) -> None:
+        """Both older fixtures hold one charge task, and neither asserted it."""
+        for path in (GET_REPLY, PUSHES):
+            reported = [
+                parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+                for frame in _load(path)
+            ]
+            charge = [r for r in reported if "scheduled_charge_power_w" in r]
+            assert charge, path.name
+            assert all(r["scheduled_charge_power_w"] == 600 for r in charge)
+            # `.get(...) is None` would pass on a missing key too, so it
+            # would not discriminate the change at all. Split out the frames
+            # that carry a list and demand the key be there and be None.
+            with_list = [r for r in reported if "scheduled_charge_power_w" in r]
+            assert with_list
+            assert all(r["scheduled_discharge_power_w"] is None for r in with_list)
+
+    def test_get_reply_bundle_decodes_every_command(self) -> None:
+        frame = _load(GET_REPLY)[0]
+        result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert result is not None
+        # One bundle carries the whole picture: battery, flow, meter, limits.
+        for key in (
+            "soc_pct",
+            "batt_w",
+            "home_w",
+            "grid_w",
+            "max_charge_soc_pct",
+            "min_discharge_soc_pct",
+            "bms_soh_pct",
+            "batt_voltage_v",
+            "work_mode",
+        ):
+            assert key in result, key
+
+    def test_push_frames_parse_or_carry_nothing_we_map(self) -> None:
+        """A push yields nothing when every block in it is unmapped.
+
+        254/40 always qualifies. A 254/39 does when it carries only the pack
+        blocks `f38`/`f44` (duplicates of 32/50) or `f50`, which is what an
+        idle unit sends once it drops the flow matrix.
+        """
+        frames = _load(PUSHES)
+        assert len(frames) >= 20
+        empty_cmds = []
+        for frame in frames:
+            if parse_stream_ac5000_message(bytes.fromhex(frame["hex"])):
+                continue
+            empty_cmds.append(
+                tuple(sorted((c["cmd_func"], c["cmd_id"]) for c in frame["cmds"]))
+            )
+        assert len(empty_cmds) < len(frames) / 2
+        for cmds in empty_cmds:
+            assert cmds in (((254, 40),), ((254, 39),)), cmds
+
+    def test_every_battery_heartbeat_frame_yields_the_soc_limits(self) -> None:
+        """A 32/2 frame is the fast source, so none of them may parse empty.
+
+        The allowance above used to cover 32/2 because nothing in it was
+        mapped. Now that both SoC limits ride there, a frame carrying it has
+        to produce them, and this fails if the mapping is ever dropped again.
+        """
+        seen = 0
+        for frame in _load(PUSHES):
+            if [(c["cmd_func"], c["cmd_id"]) for c in frame["cmds"]] != [(32, 2)]:
+                continue
+            seen += 1
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            assert "max_charge_soc_pct" in parsed
+            assert "min_discharge_soc_pct" in parsed
+        assert seen >= 1
+
+    def test_no_solar_entity_data_on_a_unit_without_pv(self) -> None:
+        """Most frames must not carry solar, or the gating never holds off."""
+        parsed = [
+            parse_stream_ac5000_message(bytes.fromhex(f["hex"])) or {}
+            for f in _load(PUSHES)
+        ]
+        with_solar = [p for p in parsed if "solar_w" in p]
+        assert len(with_solar) < len(parsed) / 2
+
+    def test_a_unit_without_pv_still_reports_a_solar_figure(self) -> None:
+        """Two frames of the capture read 62 W of solar on a PV-less unit.
+
+        The device works that figure out from the house flows and the app
+        shows the same number, so the reading is parsed as reported. This
+        pins what the parser does with it and nothing more: it is the
+        device's inference, which is why the live reading exists and the
+        lifetime counter that would integrate it does not.
+        """
+        frames = _load(PUSHES)
+        for index in (25, 26):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frames[index]["hex"]))
+            assert parsed is not None, index
+            assert parsed["solar_w"] == pytest.approx(62.0), index
+
+    def test_home_equals_the_edges_into_home(self) -> None:
+        """The identity the flow matrix has to preserve, on real frames."""
+        checked = 0
+        for frame in _load(PUSHES):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            home = parsed.get("home_w")
+            from_batt = parsed.get("home_from_batt_w")
+            from_grid = parsed.get("home_from_grid_w")
+            if not (
+                isinstance(home, (int, float))
+                and isinstance(from_batt, (int, float))
+                and isinstance(from_grid, (int, float))
+            ):
+                continue
+            total = from_batt + from_grid + (parsed.get("home_from_solar_w") or 0.0)
+            assert abs(home - total) <= 2, frame["ts_iso"]
+            checked += 1
+        assert checked >= 5
+
+    def test_import_and_export_are_never_negative(self) -> None:
+        for frame in _load(PUSHES) + _load(GET_REPLY):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            for key in ("grid_import_power_w", "grid_export_power_w"):
+                value = parsed.get(key)
+                if isinstance(value, (int, float)):
+                    assert value >= 0, f"{key} = {value}"
+
+
+# The identifier guard lives in `test_fixture_identifiers.py`, one check over
+# the whole fixture tree. It used to sit here with a `[A-Z0-9]{15,}` pattern
+# that could not match a lowercase dashed UUID, and it only covered the three
+# fixtures somebody remembered to list.
+
+
+TWO_UNITS = FIXTURES / "es22_two_units_masked.json"
+
+
+def _node_half_watts(pdata: bytes) -> int | None:
+    """Read `f11.4`, the battery node total in half-watts, straight off a payload.
+
+    The parser deliberately leaves this field unmapped, so the test reads it
+    itself rather than comparing against a value derived from other fields.
+    """
+    from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import _iter_fields
+
+    for number, wire_type, raw in _iter_fields(pdata):
+        if number != 11 or wire_type != 2:
+            continue
+        for num, wire, value in _iter_fields(raw):
+            if num == 4 and wire == 0:
+                total = shift = 0
+                for byte in value:
+                    total |= (byte & 0x7F) << shift
+                    shift += 7
+                return total
+    return None
+
+
+def _unit_entry(serial: bytes, *, soc: int, half_watts: int) -> bytes:
+    """Build one `f54.1` entry: serial, state of charge, power in half-watts."""
+    return _sub(
+        1,
+        encode_field_bytes(1, serial)
+        + encode_field_varint(2, soc)
+        + encode_field_varint(4, half_watts),
+    )
+
+
+class TestLinkedUnitBlock:
+    """`f54` carries one entry per linked unit, each stamped with its serial."""
+
+    def test_two_entries_survive_each_other(self) -> None:
+        """The block repeats, so a walker that keys by path would keep one."""
+        block = _sub(
+            54,
+            _unit_entry(b"ES22TESTUNITAAAA", soc=87, half_watts=0)
+            + _unit_entry(b"ES22TESTUNITBBBB", soc=65, half_watts=1378),
+        )
+        payload = bytes(_edges(from_grid=689.0)) + bytes(block)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {
+            "ES22TESTUNITAAAA": 0.0,
+            "ES22TESTUNITBBBB": 689.0,
+        }
+
+    def test_single_unit_installation_reports_one_entry(self) -> None:
+        """Charging from the grid: the only moving unit takes the system sign."""
+        block = _sub(54, _unit_entry(b"ES22TESTUNITAAAA", soc=76, half_watts=1356))
+        payload = bytes(_edges(from_grid=678.0)) + bytes(block)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {"ES22TESTUNITAAAA": 678.0}
+
+    def test_discharge_takes_the_sign_of_the_system_flow(self) -> None:
+        """`f54.1.4` is a magnitude; 14 half-watts out of the pack is -7 W."""
+        block = _sub(54, _unit_entry(b"ES22TESTUNITAAAA", soc=22, half_watts=14))
+        payload = bytes(_edges(to_home=7.0)) + bytes(block)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {"ES22TESTUNITAAAA": -7.0}
+
+    def test_the_only_moving_unit_need_not_own_the_connection(self) -> None:
+        """The neighbour moves alone, so the system flow signs its entry.
+
+        The frame comes from AAAA's connection and AAAA sits at 0 W: the
+        system is then BBBB alone, discharging 15 W into the house.
+        """
+        block = _sub(
+            54,
+            _unit_entry(b"ES22TESTUNITAAAA", soc=87, half_watts=0)
+            + _unit_entry(b"ES22TESTUNITBBBB", soc=65, half_watts=30),
+        )
+        payload = bytes(_edges(to_home=15.0)) + bytes(block)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {
+            "ES22TESTUNITAAAA": 0.0,
+            "ES22TESTUNITBBBB": -15.0,
+        }
+
+    def test_without_a_system_flow_in_the_message_the_entry_is_unproven(self) -> None:
+        """The sign comes from the same message or not at all."""
+        block = _sub(54, _unit_entry(b"ES22TESTUNITAAAA", soc=76, half_watts=1356))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(block)))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {"ES22TESTUNITAAAA": None}
+
+    def test_the_units_own_f50_sign_wins_over_the_system(self) -> None:
+        """Two units can flow opposite ways; `f50.1.4` is the per-unit sign.
+
+        The unit without one is unproven by this message.
+        """
+        f50 = _sub(
+            50,
+            _sub(
+                1,
+                encode_field_bytes(1, b"ES22TESTUNITBBBB")
+                + _encode_fixed32_field(4, -12.0),
+            ),
+        )
+        block = _sub(
+            54,
+            _unit_entry(b"ES22TESTUNITAAAA", soc=50, half_watts=200)
+            + _unit_entry(b"ES22TESTUNITBBBB", soc=40, half_watts=24),
+        )
+        payload = bytes(_edges(from_grid=88.0)) + bytes(f50) + bytes(block)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {
+            "ES22TESTUNITAAAA": None,
+            "ES22TESTUNITBBBB": -12.0,
+        }
+
+    def test_two_active_units_without_f50_are_unproven(self) -> None:
+        """A push while 300 W move from the AC 5000 into the Ultra.
+
+        The system reads -12 W; no sign of either unit follows from it. Both
+        the system sign and a fit to the system sum flipped them.
+        """
+        block = _sub(
+            54,
+            _unit_entry(b"ES22TESTUNITAAAA", soc=50, half_watts=600)
+            + _unit_entry(b"BK11TESTUNITBBBB", soc=40, half_watts=580),
+        )
+        payload = bytes(_edges(to_home=12.0)) + bytes(block)
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert result["_unit_batt_w_by_sn"] == {
+            "ES22TESTUNITAAAA": None,
+            "BK11TESTUNITBBBB": None,
+        }
+
+    def test_entry_without_a_power_value_is_not_reported(self) -> None:
+        """An absent field means unchanged here, so it must not read as zero."""
+        entry = _sub(
+            1, encode_field_bytes(1, b"ES22TESTUNITAAAA") + encode_field_varint(2, 87)
+        )
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(54, entry)))
+        )
+        assert result is None or "_unit_batt_w_by_sn" not in result
+
+    def test_entry_without_a_serial_is_not_reported(self) -> None:
+        entry = _sub(1, encode_field_varint(2, 87) + encode_field_varint(4, 1378))
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(54, entry)))
+        )
+        assert result is None or "_unit_batt_w_by_sn" not in result
+
+    def test_absent_block_produces_no_key(self) -> None:
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_edges(from_grid=100.0)))
+        )
+        assert result is not None
+        assert "_unit_batt_w_by_sn" not in result
+
+    def test_malformed_block_does_not_discard_the_decoded_telemetry(self) -> None:
+        """A broken per-unit block costs its own reading and nothing else."""
+        entry = _sub(1, b"\x2b")  # field 5, wire type 3 - not decodable
+        payload = bytes(_edges(from_grid=100.0)) + bytes(_sub(54, entry))
+        result = parse_stream_ac5000_message(_build_frame(254, 39, payload))
+        assert result is not None
+        assert "_unit_batt_w_by_sn" not in result
+
+    def test_real_two_unit_payloads_split_into_two_units(self) -> None:
+        """The reporter's own frames, with the two masked serials made distinct.
+
+        The last frame is the one his app screenshot pins down: 0 W on the unit
+        reading 87 percent and 689 W on the one reading 65 percent.
+        """
+        from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+            _read_unit_entries,
+        )
+
+        fixture = json.loads(TWO_UNITS.read_text(encoding="utf-8"))
+        unit_a, unit_b = fixture["unit_a"], fixture["unit_b"]
+        seen = []
+        for frame in fixture["frames"]:
+            entries = _read_unit_entries(bytes.fromhex(frame["pdata_hex"]))
+            assert set(entries) == {unit_a, unit_b}, frame["ts"]
+            seen.append(entries)
+        assert len(seen) == 6
+        assert seen[-1] == {unit_a: 0.0, unit_b: 689.0}
+
+    def test_real_payload_entries_sum_to_the_system_reading(self) -> None:
+        """Per-unit and system battery power come from different fields.
+
+        They are only the same quantity if they agree, so this checks the sum
+        on every frame of the capture rather than trusting the one moment the
+        app screenshot covers.
+
+        The target is the node field `f11.4`, which shares both the scale and
+        the derivation with the entries. The parser's own `batt_w` is not
+        comparable at this precision: it is derived from the `f12` flow edges
+        instead, and on this capture the two disagree by up to 54 W within a
+        single frame.
+        """
+        from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+            _read_unit_entries,
+        )
+
+        checked = 0
+        fixture = json.loads(TWO_UNITS.read_text(encoding="utf-8"))
+        for frame in fixture["frames"]:
+            pdata = bytes.fromhex(frame["pdata_hex"])
+            system = _node_half_watts(pdata)
+            if system is None:
+                continue
+            total = sum(_read_unit_entries(pdata).values())
+            assert abs(total - system / 2) <= 35, (
+                f"{frame['ts']}: {total} vs {system / 2}"
+            )
+            checked += 1
+        assert checked == 6
+
+    def test_fixture_carries_no_real_identifier(self) -> None:
+        import re
+
+        fixture = json.loads(TWO_UNITS.read_text(encoding="utf-8"))
+        allowed = {fixture["unit_a"].encode(), fixture["unit_b"].encode()}
+        for frame in fixture["frames"]:
+            raw = bytes.fromhex(frame["pdata_hex"])
+            runs = [
+                run
+                for run in re.findall(rb"[A-Z0-9]{15,}", raw)
+                if set(run) != {ord("X")} and run not in allowed
+            ]
+            assert not runs, runs
+
+
+class TestPvStrings:
+    """The MPPT block on `254/39 f50.1`, against the ES21 owner's capture.
+
+    The reporter downloaded the diagnostics moments after noting his app:
+    strings 1 to 4 at 0, 34, 50 and 102 W, third-party solar 80 W, app solar
+    total 265 W. From the ES21 recording of 2026-08-16 on issue #231.
+    """
+
+    @staticmethod
+    def _at(stamp: str) -> dict:
+        """The parsed frame whose ISO timestamp starts with ``stamp``."""
+        for frame in _load(ES21_PV):
+            if frame["ts_iso"].startswith(stamp):
+                parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+                if parsed:
+                    return parsed
+        raise AssertionError(f"no parsed frame at {stamp}")
+
+    def test_no_identifier_survived_masking(self) -> None:
+        """The fixture ships in a public repo, so it carries no real device."""
+        blob = ES21_PV.read_text(encoding="utf-8").lower()
+        assert "2cbcbba60c94" not in blob
+
+    def test_the_strings_match_the_app_reading(self) -> None:
+        """The frame closest before the moment he read his app."""
+        parsed = self._at("2026-08-16T07:21:30")
+        strings = _own_strings(parsed)
+        assert strings["pv_total_w"] == pytest.approx(195.91, abs=0.01)
+        assert strings["pv2_w"] == pytest.approx(36.57, abs=0.01)
+        assert strings["pv3_w"] == pytest.approx(55.32, abs=0.01)
+        assert strings["pv4_w"] == pytest.approx(104.02, abs=0.01)
+        # String 1 was idle throughout the capture and the app showed 0 W.
+        # The field is absent, and the fill is what turns that into a
+        # reading: the three present strings account for the total exactly.
+        assert strings["pv1_w"] == 0.0
+        # The third-party figure is a different quantity, not the total.
+        assert parsed["solar_w"] == pytest.approx(81.0)
+
+    def test_the_strings_never_reach_the_frame_flat(self) -> None:
+        """Only the coordinator may lift a unit's strings, by its serial (#401)."""
+        for frame in _load(ES21_PV):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            for key in PV_KEYS:
+                assert key not in parsed, (frame["ts_iso"], key)
+
+    def test_the_total_equals_the_sum_of_the_strings(self) -> None:
+        """The identity the block has to preserve, on every real frame.
+
+        Every key is read strictly: an idle string omitted from the wire is
+        filled to 0 because the present strings account for the total, and
+        this is the test that says the fill still does that.
+        """
+        checked = 0
+        for frame in _load(ES21_PV):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            if UNIT_PV_BY_SN_KEY not in parsed:
+                continue
+            entry = _own_strings(parsed)
+            total = entry.get("pv_total_w")
+            if total is None or total == 0.0:
+                continue
+            strings = sum(entry[f"pv{n}_w"] for n in (1, 2, 3, 4))
+            assert strings == pytest.approx(total, abs=0.01), frame["ts_iso"]
+            checked += 1
+        assert checked >= 7
+
+    def test_the_strings_fall_to_zero_instead_of_latching(self) -> None:
+        """After sunset the block arrives without the total or any string.
+
+        Keyed on the total rather than on the group, the fill would leave all
+        five holding their last daylight reading until sunrise. Both frames
+        here carry `f50.1`, one a full get-all and one a delta.
+        """
+        daylight = _own_strings(self._at("2026-08-15T07:34:19"))
+        assert daylight["pv_total_w"] == pytest.approx(310.96, abs=0.01)
+
+        for stamp in ("2026-08-15T22:15:26", "2026-08-16T00:27:49"):
+            night = _own_strings(self._at(stamp))
+            for key in PV_KEYS:
+                assert night[key] == 0.0, (stamp, key)
+
+    def test_battery_power_carries_the_charge_from_the_unit_own_strings(self) -> None:
+        """`f12.2` is the MPPT-to-battery edge and belongs in the sum.
+
+        Each figure here is the battery node total the same frame reports on
+        `f11.4`, halved, which the parser does not read: 570, 504, 68, 56 and
+        876. Without the edge the first two read 82 and 79, and the two dawn
+        frames reported 0 W while the pack was taking 34 W and 28 W of solar.
+        """
+        expected = {
+            "2026-08-15T07:34:19": 438.0,
+            "2026-08-16T06:56:30": 34.0,
+            "2026-08-16T06:58:46": 28.0,
+            "2026-08-16T07:21:30": 285.0,
+            "2026-08-16T07:21:52": 252.0,
+        }
+        seen = {}
+        for frame in _load(ES21_PV):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            stamp = frame["ts_iso"][:19]
+            if stamp in expected and "batt_w" in parsed:
+                seen[stamp] = parsed["batt_w"]
+        assert seen.keys() == expected.keys()
+        for stamp, value in expected.items():
+            assert seen[stamp] == pytest.approx(value, abs=0.01), stamp
+
+    def test_the_mppt_edge_is_absent_on_a_unit_without_pv(self) -> None:
+        """The ES22 sends no `f12.2`, so the fill may only ever add zero."""
+        for frame in _load(PUSHES) + _load(GET_REPLY):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            assert "_mppt_to_batt_w" not in parsed, frame["ts_iso"]
+
+    def test_a_unit_without_pv_never_reports_a_string(self) -> None:
+        """The gate rests on a non-zero reading, so a zero may not be one.
+
+        The ES22 these captures come from has no PV wired to it and still
+        sends `f50.1`, which is why the fill hands it five zeros. If any of
+        them ever read non-zero, five entities would appear on every unit of
+        the family.
+        """
+        seen = 0
+        for frame in _load(PUSHES) + _load(GET_REPLY):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            if UNIT_PV_BY_SN_KEY not in parsed:
+                continue
+            entry = _own_strings(parsed)
+            for key in PV_KEYS:
+                if key in entry:
+                    assert entry[key] == 0.0, (frame["ts_iso"], key)
+                    seen += 1
+        assert seen >= 5
+
+    def test_the_push_capture_produces_a_stamped_pv_block(self) -> None:
+        """Sharpens the floor `test_a_unit_without_pv_never_reports_a_string` checks.
+
+        That test sums `entry[key] == 0.0` hits across the push capture and
+        the get-reply against a floor of `>= 5`, while the fixture actually
+        produces 65 (60 from the 12 stamping push frames, 5 from the
+        get-reply). A regression that collapsed 12 of those 13 stamping
+        frames down to 1 would still clear that floor and pass unnoticed -
+        `hits == 12` is the exact count instead of a floor that lets almost
+        all of the block disappear silently. 12 of the 30 pushed frames
+        carry the block, each keyed by the unit's own masked serial: the
+        diagnostics mask turns a real serial into a run of 16 `X`, which is
+        still serial-shaped by `_serial_text`'s own format check
+        (upper-case alphanumeric ASCII), so it survives as a dict key
+        rather than collapsing to `None` and dropping the entry.
+        """
+        hits = 0
+        for frame in _load(PUSHES):
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+            if UNIT_PV_BY_SN_KEY not in parsed:
+                continue
+            entries = parsed[UNIT_PV_BY_SN_KEY]
+            assert entries, frame["ts_iso"]
+            for serial in entries:
+                assert serial == "XXXXXXXXXXXXXXXX", (frame["ts_iso"], serial)
+                assert set(PV_KEYS) <= entries[serial].keys(), (
+                    frame["ts_iso"],
+                    serial,
+                )
+            hits += 1
+        assert hits == 12
+
+    def test_the_get_reply_produces_a_stamped_pv_block(self) -> None:
+        """The mirror on the single get-all bundle: one frame, one stamped entry.
+
+        Same gap as above, on the other fixture: nothing today asserts that
+        `es22_get_reply_masked.json` ever produces `UNIT_PV_BY_SN_KEY` at all.
+        """
+        frames = _load(GET_REPLY)
+        assert len(frames) == 1
+        frame = frames[0]
+        parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+        assert UNIT_PV_BY_SN_KEY in parsed
+        entries = parsed[UNIT_PV_BY_SN_KEY]
+        assert entries
+        for serial in entries:
+            assert serial == "XXXXXXXXXXXXXXXX", serial
+            assert set(PV_KEYS) <= entries[serial].keys(), serial
+
+
+def _pv_entry(serial: bytes, *strings: float) -> bytes:
+    """Build one `f50.1` entry: serial, then strings 1 to 4 on `.9` to `.12`."""
+    inner = encode_field_bytes(1, serial)
+    inner += _encode_fixed32_field(3, sum(strings))
+    for field, watts in zip((9, 10, 11, 12), strings, strict=True):
+        inner += _encode_fixed32_field(field, watts)
+    return _sub(1, inner)
+
+
+class TestLinkedPairPvStrings:
+    """`f50` carries one `f50.1` entry per linked unit, each with its serial.
+
+    Issue #401: on the reporter's linked pair the master's frames carry both
+    units' string readings, one entry after the other, and decoded flat the
+    last entry won - unit 0166 published 0085's four strings. The fixture is
+    his own frames with the two masked serials made distinct: entry 1 is the
+    connection owner (0166), entry 2 the neighbour (0085).
+    """
+
+    @staticmethod
+    def _frames() -> list[dict]:
+        return json.loads(ES21_PAIR.read_text(encoding="utf-8"))["frames"]
+
+    @staticmethod
+    def _units() -> tuple[str, str]:
+        fixture = json.loads(ES21_PAIR.read_text(encoding="utf-8"))
+        return fixture["unit_a"], fixture["unit_b"]
+
+    @staticmethod
+    def _both_frame(index: int) -> dict:
+        """The parsed result of frame `index` of the both-connections fixture.
+
+        Both units' `f50`/`f54` entries, whichever connection captured the
+        frame - unlike `_frames()`/`_units()` above, which only ever see the
+        connection owner's own entry relayed flat (#401's original shape).
+        """
+        fixture = json.loads(ES21_PAIR_BOTH.read_text(encoding="utf-8"))
+        frame = fixture["frames"][index]
+        parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert parsed is not None, frame
+        return parsed
+
+    def test_an_idle_string_omitted_from_the_own_copy_still_reads_zero(self) -> None:
+        """Frame 0 of the single-unit capture (06:42:06): one string, `.3` equal to it.
+
+        The unit's own copy omits an idle string and its total accounts for
+        the ones present, so the fill runs and the absent strings read 0 W.
+        """
+        frames = json.loads(ES21_PV.read_text(encoding="utf-8"))["frames"]
+        parsed = parse_stream_ac5000_message(bytes.fromhex(frames[0]["hex"]))
+        assert parsed is not None
+        strings = next(iter(parsed[UNIT_PV_BY_SN_KEY].values()))
+        assert set(strings) - {UNIT_PV_ENTRY_SOC_KEY} == {*PV_KEYS, AC_KEY}
+        assert strings["pv_total_w"] > 0
+        present = [strings[f"pv{n}_w"] for n in (1, 2, 3, 4) if strings[f"pv{n}_w"] > 0]
+        assert len(present) == 1
+        assert present[0] == pytest.approx(strings["pv_total_w"], abs=0.01)
+
+    def test_a_pv_entry_with_a_total_and_a_missing_string_leaves_that_key_out(
+        self,
+    ) -> None:
+        """Frame 17 (07:36:38): entry AAAA sums to 217 of a stated 239.
+
+        `.12` (`pv4_w`) is absent from the wire while `.3`, `.9`, `.10`,
+        `.11` are present, so under the entry's own fields the fourth string
+        is producing and simply not in this frame - filling it to 0 would
+        publish a false reading for a live string (PLAN-145).
+        """
+        fixture = json.loads(ES21_PAIR_BOTH.read_text(encoding="utf-8"))
+        unit_a, unit_b = fixture["unit_a"], fixture["unit_b"]
+        parsed = self._both_frame(17)
+        entries = parsed[UNIT_PV_BY_SN_KEY]
+
+        entry_a = entries[unit_a]
+        assert {k: v for k, v in entry_a.items() if k in PV_KEYS} == {
+            "pv_total_w": pytest.approx(239.0),
+            "pv1_w": pytest.approx(72.0),
+            "pv2_w": pytest.approx(71.0),
+            "pv3_w": pytest.approx(74.0),
+        }
+        assert "pv4_w" not in entry_a
+        # The entry's own state of charge rides along under a private key.
+        assert entry_a[UNIT_PV_ENTRY_SOC_KEY] == 49.0
+
+        entry_b = entries[unit_b]
+        for key in PV_KEYS:
+            assert key in entry_b, key
+
+    def test_a_night_pv_entry_still_fills_all_five_to_zero(self) -> None:
+        """Frames 0, 1, 4: no total and no string on either serial.
+
+        None of the five keys is on the wire for either unit, so the fill
+        still runs in full - the night close this integration must not lose
+        while fixing the missing-string case above (PLAN-145).
+        """
+        fixture = json.loads(ES21_PAIR_BOTH.read_text(encoding="utf-8"))
+        unit_a, unit_b = fixture["unit_a"], fixture["unit_b"]
+        for index in (0, 1, 4):
+            parsed = self._both_frame(index)
+            entries = parsed[UNIT_PV_BY_SN_KEY]
+            for serial in (unit_a, unit_b):
+                strings = {k: v for k, v in entries[serial].items() if k in PV_KEYS}
+                assert strings == dict.fromkeys(PV_KEYS, 0.0), (index, serial)
+
+    def test_two_entries_survive_each_other(self) -> None:
+        """Two synthetic entries, distinct on every string, both come back."""
+        block = _sub(
+            50,
+            _pv_entry(b"ES21TESTUNITAAAA", 232.5, 475.7, 482.1, 290.0)
+            + _pv_entry(b"ES21TESTUNITBBBB", 337.0, 129.0, 233.0, 666.0),
+        )
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(block)))
+        assert result is not None
+        entries = result[UNIT_PV_BY_SN_KEY]
+        assert set(entries) == {"ES21TESTUNITAAAA", "ES21TESTUNITBBBB"}
+        assert entries["ES21TESTUNITAAAA"]["pv2_w"] == pytest.approx(475.7, abs=0.01)
+        assert entries["ES21TESTUNITBBBB"]["pv2_w"] == pytest.approx(129.0)
+        assert entries["ES21TESTUNITBBBB"]["pv_total_w"] == pytest.approx(1365.0)
+        for key in PV_KEYS:
+            assert key not in result
+
+    def test_an_entry_without_a_serial_is_not_reported(self) -> None:
+        """Nobody can claim it, so nobody publishes it."""
+        inner = _encode_fixed32_field(3, 100.0) + _encode_fixed32_field(9, 100.0)
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(50, _sub(1, inner))))
+        )
+        assert result is None or UNIT_PV_BY_SN_KEY not in result
+        # Nor does it fall back to the flat keys the old walk produced.
+        for key in PV_KEYS:
+            assert result is None or key not in result, key
+
+    def test_an_entry_without_strings_fills_its_own_zeros(self) -> None:
+        """The night fill runs per entry, so one idle unit does not zero the other."""
+        block = _sub(
+            50,
+            _sub(1, encode_field_bytes(1, b"ES21TESTUNITAAAA"))
+            + _pv_entry(b"ES21TESTUNITBBBB", 10.0, 20.0, 30.0, 40.0),
+        )
+        result = parse_stream_ac5000_message(_build_frame(254, 39, bytes(block)))
+        assert result is not None
+        entries = result[UNIT_PV_BY_SN_KEY]
+        assert entries["ES21TESTUNITAAAA"] == dict.fromkeys((*PV_KEYS, AC_KEY), 0.0)
+        assert entries["ES21TESTUNITBBBB"]["pv4_w"] == pytest.approx(40.0)
+
+    def test_the_real_master_frames_carry_both_units(self) -> None:
+        """Every `f50` frame on 0166's connection lists both serials."""
+        unit_a, unit_b = self._units()
+        seen = 0
+        for frame in self._frames():
+            if frame["connection"] != "unit_a":
+                continue
+            parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert parsed is not None, frame["ts"]
+            entries = parsed[UNIT_PV_BY_SN_KEY]
+            assert set(entries) == {unit_a, unit_b}, frame["ts"]
+            # The owner's entry keeps the identity exactly. The neighbour's
+            # arrives relayed as whole watts, and its total is the device's
+            # own sum before rounding: 1365 against 1366, 1371 against 1372,
+            # 1367 against 1369 on the three frames.
+            for serial, entry in entries.items():
+                strings = sum(entry[f"pv{n}_w"] for n in (1, 2, 3, 4))
+                tolerance = 0.01 if serial == unit_a else 2.0
+                assert strings == pytest.approx(entry["pv_total_w"], abs=tolerance), (
+                    serial
+                )
+            for key in PV_KEYS:
+                assert key not in parsed
+            seen += 1
+        assert seen == 3
+
+    def test_the_first_frame_matches_the_reporter_reading(self) -> None:
+        """08:22:35 UTC: entry 1 is 0166's shape, entry 2 is 0085's.
+
+        The bug was exactly this frame decoded flat: 337 / 129 / 233 / 666 W
+        under 0166, which is 0085's set.
+        """
+        unit_a, unit_b = self._units()
+        frame = self._frames()[0]
+        parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert parsed is not None
+        own = parsed[UNIT_PV_BY_SN_KEY][unit_a]
+        assert [own[f"pv{n}_w"] for n in (1, 2, 3, 4)] == pytest.approx(
+            [232.5, 475.7, 482.1, 290.0], abs=0.05
+        )
+        assert own["pv_total_w"] == pytest.approx(1480.3, abs=0.05)
+        other = parsed[UNIT_PV_BY_SN_KEY][unit_b]
+        assert [other[f"pv{n}_w"] for n in (1, 2, 3, 4)] == [337.0, 129.0, 233.0, 666.0]
+        assert other["pv_total_w"] == 1366.0
+
+    def test_the_slave_connection_carries_the_block_empty(self) -> None:
+        """0085's own frames say nothing about strings, so nothing is published."""
+        frame = next(f for f in self._frames() if f["connection"] == "unit_b")
+        parsed = parse_stream_ac5000_message(bytes.fromhex(frame["hex"])) or {}
+        assert UNIT_PV_BY_SN_KEY not in parsed
+        for key in PV_KEYS:
+            assert key not in parsed
+
+    def test_fixture_carries_no_real_identifier(self) -> None:
+        import re
+
+        fixture = json.loads(ES21_PAIR.read_text(encoding="utf-8"))
+        allowed = {fixture["unit_a"].encode(), fixture["unit_b"].encode()}
+        for frame in fixture["frames"]:
+            raw = bytes.fromhex(frame["hex"])
+            runs = [
+                run
+                for run in re.findall(rb"[A-Z0-9]{15,}", raw)
+                if set(run) != {ord("X")} and run not in allowed
+            ]
+            assert not runs, runs
+
+
+class TestTaskListShrink:
+    """A task list that shrinks must retract the task that left it.
+
+    Built from the two diagnostics downloads @slaapyhoofd attached to #234 on
+    2026-09-03, after adding a charge task beside an existing discharge task
+    and then deleting the discharge one. Before ADR-015 an `f40` carrying only
+    the survivor left the deleted kind's keys untouched, and the coordinator
+    merge, which exists so a frame without `f40` cannot wipe the setpoints,
+    kept them. The deleted task went on being reported.
+    """
+
+    @staticmethod
+    def _frames() -> dict[str, dict]:
+        data = json.loads((FIXTURES / "es22_task_delete_masked.json").read_text())
+        return {frame["role"]: frame for frame in data["frames"]}
+
+    def _parse(self, role: str) -> dict | None:
+        return parse_stream_ac5000_message(bytes.fromhex(self._frames()[role]["hex"]))
+
+    def test_the_fixture_carries_the_capture_it_claims_to(self) -> None:
+        """Positive control. A shrunk fixture would let the rest pass blind."""
+        frames = self._frames()
+        assert set(frames) == {
+            "both_tasks_push",
+            "delete_ack",
+            "stale_get_reply_after_delete",
+            "after_delete_get_reply",
+            "no_task_list_push",
+            "after_delete_push",
+            "after_own_write_push",
+        }
+        assert all(f["hex"] for f in frames.values())
+
+    def test_the_capture_sequence_retracts_the_deleted_task(self) -> None:
+        """The defect, in the order the frames arrived.
+
+        Step three is what was red before the fix: the reload readback carries
+        the charge task alone, and the discharge keys have to say so.
+        """
+        both = self._parse("both_tasks_push")
+        assert both is not None
+        assert both["scheduled_discharge_power_w"] == 0
+        assert both["scheduled_charge_power_w"] == 2500
+
+        after = self._parse("after_delete_get_reply")
+        assert after is not None
+        assert after["scheduled_charge_power_w"] == 2500
+        assert after["scheduled_discharge_power_w"] is None
+        assert after["scheduled_discharge_task_slot"] is None
+
+    def test_the_push_after_the_reload_agrees_with_the_readback(self) -> None:
+        result = self._parse("after_delete_push")
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 2500
+        assert result["scheduled_discharge_power_w"] is None
+
+    def test_a_frame_without_a_task_list_retracts_nothing(self) -> None:
+        """Most `254/39` frames carry no `f40` at all.
+
+        Absence of the container says nothing, which is why the coordinator
+        merge keeps the setpoints across them. Only a list that arrives is
+        evidence.
+        """
+        result = self._parse("no_task_list_push")
+        assert result is not None
+        assert not [key for key in result if key.startswith("scheduled_")]
+
+    def test_the_push_after_our_own_removal_retracts_the_other_kind(self) -> None:
+        """The only push on file that follows a removal we issued ourselves.
+
+        It carries the discharge task alone, 3.5 s after the write, and is the
+        third independent line for the whole-list rule.
+        """
+        result = self._parse("after_own_write_push")
+        assert result is not None
+        assert result["scheduled_discharge_power_w"] is not None
+        assert result["scheduled_charge_power_w"] is None
+
+    def test_a_set_reply_never_reaches_the_parser(self) -> None:
+        """The acknowledgement carries no task keys through the parser.
+
+        It echoes `f39`, the write's own entries. This test drives the parser
+        directly, so it pins one half: `(254, 38)` has no entry in the field
+        map. The other half, that the ingest returns on a `/set_reply` topic
+        before parsing at all, is a routing question and lives with the
+        coordinator tests. Saying otherwise here would claim coverage this
+        shape cannot have.
+        """
+        result = self._parse("delete_ack")
+        assert not [key for key in (result or {}) if key.startswith("scheduled_")]
+
+    def test_the_cleared_keys_per_kind_add_up_to_the_empty_list_keys(self) -> None:
+        """The per-kind clear derives its keys, so nothing may fall outside it.
+
+        `_finalize_task` clears a kind by prefix rather than from a second
+        hand-kept list. That the two agree today is arithmetic, not a rule:
+        six `scheduled_charge_*` and five `scheduled_discharge_*` happen to be
+        the eleven entries of `_TASK_KEYS`. A twelfth entry outside the scheme
+        would go uncleared, and on the empty-list path too, which is a silent
+        narrowing of what `main` already did.
+        """
+        from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+            _TASK_BLOCKS,
+            _TASK_KEYS,
+        )
+
+        by_kind = {
+            key
+            for kind, _group in _TASK_BLOCKS
+            for key in _TASK_KEYS
+            if key.startswith(f"scheduled_{kind}_")
+        }
+        assert by_kind
+        assert set(_TASK_KEYS) == by_kind
+
+    def test_a_block_that_does_not_decode_retracts_nothing(self) -> None:
+        """Absence is evidence only when the list was read in full.
+
+        A block that fails to decode, or that carries neither power container,
+        leaves the frame unable to say what the device holds. It publishes what
+        it did read and clears nothing. Without that rule one corrupt block
+        would wipe a live task's setpoint, and by the write path's rule that
+        drops the next removal too, which is the one-sided failure #234 is
+        about.
+        """
+        good = (
+            encode_field_varint(2, 1)
+            + encode_field_varint(3, 1)
+            + _sub(7, encode_varint((960 << 16) | 780))
+            + _sub(
+                8,
+                encode_field_varint(1, 1)
+                + _sub(
+                    3,
+                    encode_field_bytes(1, b"ES22TEST00000001")
+                    + encode_field_varint(2, 100)
+                    + encode_field_varint(3, 600),
+                ),
+            )
+        )
+        # A second block carrying neither power container: a slot and a window
+        # and nothing that says which kind it is.
+        kindless = encode_field_varint(2, 1) + _sub(7, encode_varint(60))
+
+        result = parse_stream_ac5000_message(
+            _build_frame(254, 39, bytes(_sub(40, _sub(1, good) + _sub(1, kindless))))
+        )
+        assert result is not None
+        assert result["scheduled_charge_power_w"] == 600
+        assert not [key for key in result if key.startswith("scheduled_discharge_")]
+
+
+def _unit_frames(unit: str) -> list[dict]:
+    """The frames of one unit in the issue #458 fixture."""
+    return json.loads(SOCKET_458.read_text(encoding="utf-8"))[unit]["frames"]
+
+
+def _raw_group(frame: dict, group: int) -> dict[int, float]:
+    """One top-level group of a frame's `254/39` payload, read off the wire.
+
+    The parser's own field map is what is under test, so the node balances
+    below are computed here without it: a fixed32 is a float, a varint an
+    integer, and a field that is not on the wire is simply not in the result.
+    """
+    headers, _ = decode_header_message(bytes.fromhex(frame["hex"]))
+    out: dict[int, float] = {}
+    for header in headers:
+        if (int(header.get("cmd_func", -1)), int(header.get("cmd_id", -1))) != (
+            254,
+            39,
+        ):
+            continue
+        out.update(_wire_group(bytes.fromhex(header.get("pdata") or ""), group))
+    return out
+
+
+def _wire_group(buf: bytes, group: int) -> dict[int, float]:
+    out: dict[int, float] = {}
+    i = 0
+    while i < len(buf):
+        tag, i = _read_varint(buf, i)
+        assert tag is not None
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value, i = _read_varint(buf, i)
+            assert value is not None
+            payload: bytes | float = value
+        elif wire == 1:
+            payload = struct.unpack("<d", buf[i : i + 8])[0]
+            i += 8
+        elif wire == 2:
+            length, i = _read_varint(buf, i)
+            assert length is not None
+            payload = bytes(buf[i : i + length])
+            i += length
+        elif wire == 5:
+            payload = struct.unpack("<f", buf[i : i + 4])[0]
+            i += 4
+        else:
+            raise AssertionError(f"unexpected wire type {wire}")
+        if field == group and isinstance(payload, bytes):
+            out.update(
+                {
+                    f: v
+                    for f, v in _wire_scalars(payload).items()
+                    if not isinstance(v, bytes)
+                }
+            )
+    return out
+
+
+def _wire_scalars(buf: bytes) -> dict[int, float | bytes]:
+    out: dict[int, float | bytes] = {}
+    i = 0
+    while i < len(buf):
+        tag, i = _read_varint(buf, i)
+        assert tag is not None
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value, i = _read_varint(buf, i)
+            assert value is not None
+            out[field] = value
+        elif wire == 5:
+            out[field] = struct.unpack("<f", buf[i : i + 4])[0]
+            i += 4
+        elif wire == 2:
+            length, i = _read_varint(buf, i)
+            assert length is not None
+            out[field] = bytes(buf[i : i + length])
+            i += length
+        elif wire == 1:
+            out[field] = struct.unpack("<d", buf[i : i + 8])[0]
+            i += 8
+        else:
+            raise AssertionError(f"unexpected wire type {wire}")
+    return out
+
+
+class TestAcSocketLoad:
+    """Issue #458: a load on the AC socket is a third consumer of grid power.
+
+    `f12.18` is the grid-to-socket edge and `f11.7` the socket output node.
+    Both are checked against balances computed from the raw frame, not
+    against numbers typed in here.
+    """
+
+    ANCHOR_TS = "2026-10-02T21:04:22.509376+00:00"
+
+    @staticmethod
+    def _anchor() -> dict:
+        (frame,) = [
+            f
+            for f in _unit_frames("unit_socket")
+            if f["ts_iso"] == TestAcSocketLoad.ANCHOR_TS
+        ]
+        return frame
+
+    def test_grid_import_closes_the_grid_node_on_the_anchor_frame(self) -> None:
+        """Home plus battery alone read 200 W of a 549 W node.
+
+        The node is `f11.2` in half-watts; the socket edge is the rest.
+        """
+        frame = self._anchor()
+        node_w = _raw_group(frame, 11)[2] / 2
+        socket_w = _raw_group(frame, 12)[18]
+        assert socket_w > 0
+        result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert result is not None
+        assert result["grid_import_power_w"] == pytest.approx(node_w)
+        assert result["grid_import_power_w"] > result["home_from_grid_w"]
+
+    def test_grid_import_is_the_sum_of_the_three_edges_on_every_socket_frame(
+        self,
+    ) -> None:
+        checked = 0
+        for frame in _unit_frames("unit_socket"):
+            edges = _raw_group(frame, 12)
+            if not edges:
+                continue
+            result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert result is not None
+            expected = edges.get(6, 0) + edges.get(7, 0) + edges.get(18, 0)
+            assert result["grid_import_power_w"] == pytest.approx(expected)
+            checked += 1
+        # 14 of the unit's 16 frames carry `f12`; a loop over fewer would pass
+        # while comparing nothing.
+        assert checked == 14
+
+    def test_grid_import_equals_the_grid_node_wherever_the_frame_reports_it(
+        self,
+    ) -> None:
+        """The node `f11.2` is half-watts and is not part of the formula.
+
+        Comparing against it, rather than against the three edges again, is
+        what shows the edges account for the whole node: 6 of 6 frames that
+        carry both.
+        """
+        closed = 0
+        for frame in _unit_frames("unit_socket"):
+            node = _raw_group(frame, 11)
+            if 2 not in node:
+                continue
+            result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert result is not None
+            assert result["grid_import_power_w"] == pytest.approx(node[2] / 2)
+            closed += 1
+        assert closed == 6
+
+    def test_an_idle_socket_adds_nothing_to_grid_import(self) -> None:
+        """The unit with nothing on the socket never sends `f12.18`.
+
+        Its import stays at the home edge, and no frame is read as if the
+        missing edge were an unknown.
+        """
+        checked = 0
+        for frame in _unit_frames("unit_idle"):
+            edges = _raw_group(frame, 12)
+            if not edges:
+                continue
+            assert 18 not in edges
+            result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert result is not None
+            assert result["grid_import_power_w"] == pytest.approx(
+                edges[6] + edges.get(7, 0)
+            )
+            assert result["grid_import_power_w"] == pytest.approx(200.0)
+            checked += 1
+        assert checked == 5
+
+    def test_a_frame_without_f12_reports_no_grid_import(self) -> None:
+        """Absent means unchanged: only a frame that carries `f12` speaks for it."""
+        checked = 0
+        for unit in ("unit_socket", "unit_idle"):
+            for frame in _unit_frames(unit):
+                headers, _ = decode_header_message(bytes.fromhex(frame["hex"]))
+                if not headers or _raw_group(frame, 12):
+                    continue
+                result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+                if result is None:
+                    continue
+                assert "grid_import_power_w" not in result
+                checked += 1
+        # The three idle-unit frames that decode but carry other groups only.
+        assert checked == 3
+
+    def test_ac_output_is_the_socket_node_in_half_watts(self) -> None:
+        """`f11.7` halved is the app's "AC output", 352 W against 351 W here."""
+        checked = 0
+        for frame in _unit_frames("unit_socket"):
+            node = _raw_group(frame, 11)
+            if not node:
+                continue
+            result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert result is not None
+            assert result["ac_output_power_w"] == pytest.approx(node[7] / 2)
+            checked += 1
+        assert checked == 6
+        anchor = parse_stream_ac5000_message(bytes.fromhex(self._anchor()["hex"]))
+        assert anchor is not None
+        assert 340 < anchor["ac_output_power_w"] < 360
+
+    def test_ac_output_falls_to_zero_on_a_unit_with_nothing_on_the_socket(
+        self,
+    ) -> None:
+        """The idle unit never sends `f11.7`, so a frame with `f11` reads 0.
+
+        Left unfilled, an unplugged load would hold its last reading for good.
+        """
+        checked = 0
+        for frame in _unit_frames("unit_idle"):
+            if not _raw_group(frame, 11):
+                continue
+            result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert result is not None
+            assert result["ac_output_power_w"] == 0.0
+            checked += 1
+        assert checked == 5
+
+
+SOCKET_BATTERY_458 = FIXTURES / "es22_socket_battery_458_masked.json"
+
+
+def _battery_frames(unit: str) -> list[dict]:
+    """The frames of one unit in the second issue #458 download."""
+    return json.loads(SOCKET_BATTERY_458.read_text(encoding="utf-8"))[unit]["frames"]
+
+
+class TestAcSocketOnBattery:
+    """Issue #458, second download: a socket fed from the battery.
+
+    `f12.19` is the battery-to-socket edge. Expected values are computed from
+    the raw frame, never typed in: the unit's own signed battery reading in
+    `f50.1.4` (negative is discharge) is the independent witness.
+    """
+
+    GRID_CUT_TS = "2026-10-06T12:00:23.897555+00:00"
+
+    @staticmethod
+    def _frame(ts: str) -> dict:
+        (frame,) = [f for f in _battery_frames("unit_idle") if f["ts_iso"] == ts]
+        return frame
+
+    def test_battery_power_is_the_discharge_when_the_grid_is_cut(self) -> None:
+        """45 W on the socket from the battery used to read as an idle battery."""
+        frame = self._frame(self.GRID_CUT_TS)
+        socket_from_battery = _raw_group(frame, 12)[19]
+        assert socket_from_battery > 0
+        result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        assert result is not None
+        assert result["batt_w"] == pytest.approx(-socket_from_battery)
+        assert result["batt_discharge_power_w"] == pytest.approx(socket_from_battery)
+        assert result["batt_charge_power_w"] == 0.0
+
+    def test_battery_power_is_inflow_minus_every_outflow_on_every_frame(self) -> None:
+        """`batt_w` is the battery inflow minus home, grid and socket outflow.
+
+        Computed from the raw edges of every frame that carries `f12`; frames
+        without it leave `batt_w` out and are not compared.
+        """
+        checked = 0
+        for unit in ("unit_socket", "unit_idle"):
+            for frame in _battery_frames(unit):
+                edges = _raw_group(frame, 12)
+                if not edges:
+                    continue
+                result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+                assert result is not None
+                into = edges.get(2, 0) + edges.get(7, 0) + edges.get(9, 0)
+                out = edges.get(4, 0) + edges.get(5, 0) + edges.get(19, 0)
+                assert result["batt_w"] == pytest.approx(into - out)
+                checked += 1
+        # Both units carry `f12` in most frames; a loop over a handful would
+        # pass while comparing almost nothing.
+        assert checked >= 40
+
+    def test_a_socket_load_from_the_grid_leaves_battery_power_alone(self) -> None:
+        """STREAM 1 runs its socket from the grid and its battery sits idle."""
+        checked = 0
+        for frame in _battery_frames("unit_socket"):
+            edges = _raw_group(frame, 12)
+            if not edges or edges.get(19, 0) > 5:
+                continue
+            result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+            assert result is not None
+            assert abs(result["batt_w"]) < 10
+            checked += 1
+        assert checked == 21
+
+
+@pytest.mark.parametrize(
+    ("path", "frames"),
+    [(GET_REPLY, 1), (ES21_PV, 9), (ES21_PAIR_BOTH, 14), (SOCKET_BATTERY_458, 30)],
+)
+def test_cycles_follow_the_lifetime_counters(path: Path, frames: int) -> None:
+    """`32/50` field 14 is the BMS cycle count (`cycles`, as on the Delta 3).
+
+    Each reading sits within one cycle of the lifetime throughput (`50`
+    charged, `51` discharged, the smaller of the two) over the full capacity
+    `13`, which is what a cycle count is.
+    """
+    from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+        _decode_scalar,
+        _iter_fields,
+    )
+
+    hexes: list[str] = []
+
+    def find(node: object) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "hex" and isinstance(value, str):
+                    hexes.append(value)
+                else:
+                    find(value)
+        elif isinstance(node, list):
+            for item in node:
+                find(item)
+
+    find(json.loads(path.read_text(encoding="utf-8")))
+    checked = 0
+    for frame_hex in hexes:
+        for header in decode_header_message(bytes.fromhex(frame_hex))[0]:
+            if (header.get("cmd_func"), header.get("cmd_id")) != (32, 50):
+                continue
+            raw = {
+                n: _decode_scalar(w, value, "int")
+                for n, w, value in _iter_fields(bytes.fromhex(header["pdata"]))
+                if w == 0
+            }
+            parsed = parse_stream_ac5000_message(
+                _build_frame(32, 50, bytes.fromhex(header["pdata"]))
+            )
+            assert parsed is not None
+            assert parsed["bms_cycles"] == raw[14]
+            throughput = min(raw[50], raw[51]) / raw[13]
+            assert abs(throughput - raw[14]) < 1, raw
+            checked += 1
+    # Pinned per recording, so a walker that stops early fails here.
+    assert checked == frames
+
+
+ULTRA_PAIR = FIXTURES / "es22_ultra_pv_pair_masked.json"
+
+
+def _ultra_pair_frames() -> dict[str, dict]:
+    """Parse every frame of the ES22 + Stream Ultra fixture, keyed by time."""
+    parsed = {}
+    for frame in _load(ULTRA_PAIR):
+        result = parse_stream_ac5000_message(bytes.fromhex(frame["hex"]))
+        parsed[frame["ts"]] = result or {}
+    return parsed
+
+
+class TestUltraPvPair:
+    """An ES22 that computes the system, linked with a Stream Ultra carrying PV.
+
+    The Ultra's strings reach the ES22 flow matrix as the MPPT edges `f12.1`
+    (to home), `.2` (to battery) and `.3` (to grid). App screenshot at 08:58:
+    system discharging 7 W, ES22 0 W, Ultra 7 W.
+    """
+
+    def test_solar_to_home_is_the_whole_house_load_in_daylight(self) -> None:
+        frames = _ultra_pair_frames()
+        for ts in ("08:42:58", "08:55:00", "08:55:05", "08:55:08"):
+            assert frames[ts]["home_from_solar_w"] == frames[ts]["home_w"], ts
+        assert frames["08:42:58"]["home_from_solar_w"] == 133.0
+
+    def test_solar_to_home_reads_zero_at_night(self) -> None:
+        """`.1` is absent with no sun; the fill must not hold a daylight value."""
+        assert _ultra_pair_frames()["21:55:13"]["home_from_solar_w"] == 0.0
+
+    def test_solar_export_counts_towards_grid_export(self) -> None:
+        """`.3` closes the grid node: `f11.2` = 39 half-watts at 08:42:58."""
+        frames = _ultra_pair_frames()
+        assert frames["08:42:58"]["grid_export_power_w"] == 20.0
+        # `.3` = 5 plus battery to grid `.5` = 2, against `f11.2` = 13.
+        assert frames["08:55:05"]["grid_export_power_w"] == 7.0
+
+    def test_each_unit_gets_its_own_signed_battery_power(self) -> None:
+        frames = _ultra_pair_frames()
+        es22, ultra = "ES22TESTUNITAAAA", "BK11TESTUNITBBBB"
+        assert frames["08:55:08"]["_unit_batt_w_by_sn"] == {es22: 0.0, ultra: 12.0}
+        assert frames["08:55:05"]["_unit_batt_w_by_sn"] == {es22: 0.0, ultra: -1.5}
+        # No `f50` in this push, but the ES22 reads 0: the Ultra is the whole
+        # system, where the battery feeds 15 W of the house.
+        assert frames["08:57:03"]["_unit_batt_w_by_sn"] == {es22: 0.0, ultra: -17.5}
+
+    def test_each_unit_gets_its_own_ac_grid_connection_power(self) -> None:
+        """The Ultra feeds 153 W of its 187 W solar out; the ES22 is at rest."""
+        entries = _ultra_pair_frames()["08:42:58"][UNIT_PV_BY_SN_KEY]
+        assert entries["BK11TESTUNITBBBB"][AC_KEY] == 153.0
+        assert entries["ES22TESTUNITAAAA"][AC_KEY] == 0.0
+
+
+def _f50_entries(path: Path) -> list[dict[int, float]]:
+    """Every `f50.1` entry of every `254/39` payload in a fixture, raw."""
+    from ecoflow_energy.ecoflow.parsers.stream_ac5000_proto import (
+        _decode_scalar,
+        _iter_fields,
+    )
+
+    hexes: list[str] = []
+
+    def find(node: object) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "hex" and isinstance(value, str):
+                    hexes.append(value)
+                else:
+                    find(value)
+        elif isinstance(node, list):
+            for item in node:
+                find(item)
+
+    find(json.loads(path.read_text(encoding="utf-8")))
+    entries = []
+    for frame_hex in hexes:
+        for header in decode_header_message(bytes.fromhex(frame_hex))[0]:
+            if (header.get("cmd_func"), header.get("cmd_id")) != (254, 39):
+                continue
+            for num, wire, raw in _iter_fields(bytes.fromhex(header["pdata"])):
+                if num != 50 or wire != 2:
+                    continue
+                for _n, _w, entry in _iter_fields(raw):
+                    entries.append(
+                        {
+                            n: _decode_scalar(w, value, "float")
+                            for n, w, value in _iter_fields(entry)
+                            if w == 5
+                        }
+                    )
+    return entries
+
+
+@pytest.mark.parametrize(
+    ("path", "entries"),
+    [
+        (GET_REPLY, 1),
+        (PUSHES, 12),
+        (ES21_PV, 6),
+        (ES21_PAIR, 6),
+        (ES21_PAIR_BOTH, 29),
+        (SOCKET_458, 5),
+        (ULTRA_PAIR, 4),
+        (SOCKET_BATTERY_458, 26),
+    ],
+)
+def test_ac_power_closes_the_unit_balance(path: Path, entries: int) -> None:
+    """`.4` (battery) = `.3` (solar) - `.7` (AC power) - `.8` (socket).
+
+    What makes `.7` this unit's AC power with output positive rather than a
+    guess: it closes the unit's own balance in every entry that carries it,
+    grid charging and discharging, with and without solar and socket load.
+    """
+    checked = 0
+    for entry in _f50_entries(path):
+        if 7 not in entry:
+            continue
+        expected = entry.get(3, 0.0) - entry[7] - entry.get(8, 0.0)
+        assert entry.get(4, 0.0) == pytest.approx(expected, abs=0.5), entry
+        checked += 1
+    # Pinned per recording, so a walker that stops early fails here.
+    assert checked == entries

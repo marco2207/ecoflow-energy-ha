@@ -1,0 +1,641 @@
+"""EcoFlow API constants and default configuration."""
+
+from __future__ import annotations
+
+from hashlib import sha256
+from typing import Any
+
+# MQTT Broker
+MQTT_HOST = "mqtt-e.ecoflow.com"
+MQTT_PORT_TCP = 8883
+MQTT_PORT_WSS = 8084
+MQTT_WSS_PATH = "/mqtt"
+
+# Default MQTT settings
+DEFAULT_MQTT_KEEPALIVE = 60
+DEFAULT_WSS_KEEPALIVE = 30
+DEFAULT_MQTT_CLEAN_SESSION = True
+DEFAULT_MAX_RECONNECT_ATTEMPTS = 10
+DEFAULT_RECONNECT_DELAY = 5
+DEFAULT_MAX_RECONNECT_DELAY = 60
+DEFAULT_COUNTER_RESET_INTERVAL = 300  # 5 min
+
+# IoT Developer API
+IOT_API_BASE = "https://api-e.ecoflow.com"
+IOT_CERT_PATH = "/iot-open/sign/certification"
+IOT_DEVICE_LIST_PATH = "/iot-open/sign/device/list"
+IOT_QUOTA_PATH = "/iot-open/sign/device/quota"
+IOT_QUOTA_ALL_PATH = "/iot-open/sign/device/quota/all"
+
+# Rate limits
+IOT_MIN_FETCH_INTERVAL_S = 60.0
+QUOTA_HTTP_MIN_INTERVAL_S = 10.0
+HTTP_RETRIES = 3
+HTTP_RETRY_BACKOFF_S = 2.0
+
+# Device types
+DEVICE_TYPE_POWEROCEAN = "powerocean"
+DEVICE_TYPE_DELTA = "delta"
+DEVICE_TYPE_DELTA3 = "delta3"
+DEVICE_TYPE_SMARTPLUG = "smartplug"
+DEVICE_TYPE_STREAM = "stream"
+# Carries the Stream name but not the Stream protocol: no 254/21 frame, and
+# nested submessages where the BK series uses flat scalars.
+DEVICE_TYPE_STREAM_AC5000 = "stream_ac5000"
+# Microinverter, not a battery. Shares nothing with the Stream line but the
+# five letters in the middle of its name (#230).
+DEVICE_TYPE_POWERSTREAM = "powerstream"
+# Three-phase grid meter (EF-EM-P3-120). It measures and reports; it stores
+# nothing and switches nothing, so it shares the BK-series envelope with the
+# Stream line and none of its battery, PV or outlet fields (#331).
+DEVICE_TYPE_SMART_METER = "smart_meter"
+# Single Axis Solar Tracker. One type for both account serial prefixes it
+# ships under, `HZ31` and `S02F`: same product id (7937), same productType
+# (31), same report message (32/1). Reported in #339.
+DEVICE_TYPE_SOLAR_TRACKER = "solar_tracker"
+# WAVE 3 portable air conditioner (`AC71`, app productType 44, internal
+# family AC517). Enhanced mode only: the Developer API lists the unit with
+# an empty product name and refuses every quota read with error 1006, and
+# the app channel carries no product name either, so the type is reached
+# through the serial prefix below and never through a keyword (#161).
+DEVICE_TYPE_WAVE3 = "wave3"
+# PowerPulse 2 wallbox (`C376`). Enhanced-only, same reasoning as WAVE 3
+# above: it has its own account-channel connection and its own protocol
+# envelope (cmd_func 2, HeartBeat/ParamReport), so it is reached through the
+# serial prefix below and never through a keyword. Until PLAN-132 this
+# device had no channel of its own and was read as an accessory relayed by
+# the PowerOcean it happened to be coupled to (`(241, 3)` in
+# `proto/runtime.py`); that relay path is retired in the same change that
+# adds this type, so a `C376` is never read twice (#7, #247). One part of
+# `(241, 3)` is read again since #553: the settings block, for a wallbox
+# whose own channel never carries it, handed to the wallbox's own device
+# (`parse_relayed_wallbox_settings`); its readings stay retired.
+DEVICE_TYPE_POWERPULSE2 = "powerpulse2"
+# PowerPulse 2 display block (settings report `1.4.8.21`, PLAN-188, issue
+# #495): the brightness percentages the wallbox accepts and reports for its
+# LED indicator and its screen. Four steps; any other byte is not a value the
+# app sends and is neither published nor written.
+POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS: tuple[int, ...] = (25, 50, 75, 100)
+# The four named bytes of the display block, in wire order (byte 0 first). The
+# parser, the coordinator's write and the payload builder all take the layout
+# from this one tuple; the first two are on/off bytes, the last two brightness.
+POWERPULSE2_DISPLAY_KEYS: tuple[str, ...] = (
+    "ev_led_enabled",
+    "ev_screen_enabled",
+    "ev_led_brightness_pct",
+    "ev_screen_brightness_pct",
+)
+POWERPULSE2_DISPLAY_SWITCH_KEYS: frozenset[str] = frozenset(
+    POWERPULSE2_DISPLAY_KEYS[:2]
+)
+# The display block's two forms in bytes, and the internal key the parser sets
+# to the form a report used.
+POWERPULSE2_DISPLAY_BLOCK_LENGTHS: tuple[int, ...] = (6, 32)
+POWERPULSE2_DISPLAY_BLOCK_LEN_KEY = "_display_block_len"
+
+
+def powerpulse2_display_value_valid(key: str, value: Any) -> bool:
+    """Whether `value` is one the wallbox takes for the display byte `key`.
+
+    An on/off byte takes 0 or 1 (a bool counts), a brightness byte one of
+    `POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS`. The one rule behind the parser's
+    validation, the write's checks and the builder's last line of defence.
+    """
+    if key in POWERPULSE2_DISPLAY_SWITCH_KEYS:
+        return type(value) in (bool, int) and value in (0, 1)
+    return type(value) is int and value in POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS
+
+
+# Ocean 2 home battery (`RE11`, `RE17`, `RE41`, `RE42`, `RE43`). Enhanced-only
+# and reached through the serial prefix alone: the Developer API refuses every
+# quota read for it with error 1006, and neither channel carries a product name
+# that any keyword list here would match. Despite sharing five letters with the
+# PowerOcean line it is a different protocol - `cmd_func` 254 with nested
+# submessages, where the PowerOcean uses the 96 family - so it gets its own
+# parser rather than a routing entry (#145).
+DEVICE_TYPE_OCEAN2 = "ocean2"
+# OCEAN Smart Electrical Panel 40 (`HR61`, #434). Enhanced-only: the one
+# capture on record came over the app broker, and what the Developer API
+# returns for this device has not been observed. Its own protocol -
+# `cmd_func` 254, cmd_id 21 for the property push and 25 for the grid-code
+# block - is decoded by its own parser (`hr61_proto.py`) rather than a
+# routing entry.
+DEVICE_TYPE_SMART_PANEL_40 = "smart_panel_40"
+# DELTA Pro Ultra (`Y711`, #464). Enhanced-only and read-only: the frames on
+# record came over the app broker, and whether the Developer API answers for
+# this model has not been observed. Its `cmd_func` 2 headers (cmd_id 1 to 4)
+# are decoded by its own parser (`delta_pro_ultra_proto.py`) rather than a
+# routing entry, and every frame is incremental.
+DEVICE_TYPE_DELTA_PRO_ULTRA = "delta_pro_ultra"
+# Smart Home Panel 2 (`HD31`, #464). Enhanced-only and read-only: the frames
+# on record came over the app broker. Its `cmd_func` 12 headers (cmd_id 1
+# for the time-series block, 32 for the push) are decoded by its own parser
+# (`smart_home_panel_2_proto.py`) rather than a routing entry, and a frame
+# carries only the readings that changed.
+DEVICE_TYPE_SMART_HOME_PANEL_2 = "smart_home_panel_2"
+DEVICE_TYPE_UNKNOWN = "unknown"
+
+# Keywords used to classify devices from productName strings.
+# Delta 3 keywords must be checked BEFORE the generic "delta" keyword:
+# "DELTA 3 Max Plus" contains "delta" and would otherwise be routed to
+# the Delta 2 Max parser, whose field map matches none of its quota keys.
+_POWEROCEAN_KEYWORDS = ("powerocean", "power ocean")
+# Family net: intentionally matches the whole Delta 3 line (base Delta 3,
+# Delta 3 Plus, Delta 3 Max Plus). Their quota key sets are identical; the
+# base model just omits PV2, so one parser and one device type serve all.
+_DELTA3_KEYWORDS = ("delta 3", "delta3")
+_DELTA_KEYWORDS = ("delta",)
+_SMARTPLUG_KEYWORDS = ("smart plug", "smartplug")
+_STREAM_KEYWORDS = ("stream",)
+# Checked before the Stream list, and the order is the whole point. The match
+# is by substring with no word boundary, so "PowerStream" contains "stream":
+# in the other order a microinverter is classified as a Stream battery and
+# given its full entity set, which then stays empty for good, which is exactly
+# what #188 reported. Until this parser existed the same ordering was used to
+# route the name to DEVICE_TYPE_UNKNOWN instead.
+_POWERSTREAM_KEYWORDS = ("powerstream", "power stream")
+
+_SN_PREFIX_MAP = {
+    "HJ31": DEVICE_TYPE_POWEROCEAN,
+    "HJ32": DEVICE_TYPE_POWEROCEAN,
+    # PowerOcean gateway variant (#165). Unlike every other prefix here this
+    # one rests on a third-party report rather than on a capture from a user
+    # of this integration, so the field layout is assumed rather than shown.
+    # Routing it costs nothing if the assumption holds and produces a
+    # diagnosable device if it does not - which beats "unsupported device"
+    # either way, because that state carries no information at all.
+    "HJ35": DEVICE_TYPE_POWEROCEAN,
+    # Three-phase PowerOcean variant (#267). The reporter's own diagnostics
+    # run the Developer API path: 337 raw quota keys go into the existing
+    # PowerOcean parser and 102 readings come out, across all three grid
+    # phases, both MPPT strings, the EMS block and one battery pack. So the
+    # field layout is shown rather than assumed. Without the prefix the unit
+    # is only classified by product name, which the Developer API supplies
+    # and the app API leaves empty - which is why the same device works in
+    # Standard mode and is refused as unsupported in Enhanced mode.
+    "HJ36": DEVICE_TYPE_POWEROCEAN,
+    # Three-phase PowerOcean variant (#245). Two raw captures from the same
+    # reporter unit carry `96/1`, `96/7`, `96/8`, `96/33` and `96/39` - the EMS
+    # heartbeat, the battery pack heartbeat, the EMS change report, the energy
+    # stream report that holds the core power readings, and the PV inverter
+    # stream. All five are decoded today, so this unit reports live data into
+    # the existing parser rather than merely being recognised. The captures
+    # also hold `96/34`, `53/14`, `53/113`, `241/5`, `224/38` and the `209`
+    # family, none of which is registered - as with every other PowerOcean
+    # variant here, the device says more than the parser reads.
+    "HJ37": DEVICE_TYPE_POWEROCEAN,
+    # European PowerOcean variant (#89): verified against live hardware in
+    # Enhanced mode - telemetry matches the EcoFlow app (grid, battery, MPPT).
+    "J32D": DEVICE_TYPE_POWEROCEAN,
+    # Single-phase European PowerOcean variant (#89): verified via reporter
+    # diagnostics in Enhanced mode - live data across grid/battery/MPPT;
+    # single-phase unit, so only grid phases A and B carry values.
+    "J32E": DEVICE_TYPE_POWEROCEAN,
+    # PowerOcean variant (#194): shown by a raw capture from a reporter unit,
+    # which carries a cmd_func 96 / cmd_id 1 frame - the EMS heartbeat this
+    # integration already decodes. That command family is PowerOcean only;
+    # the Delta 3 generation uses 254. The capture also holds frames on
+    # 254/32, 53/14 and 241/36, none of which is registered, so the unit
+    # reports more than the PowerOcean parser reads. Routing it delivers
+    # what the parser understands today rather than nothing at all.
+    "J32B": DEVICE_TYPE_POWEROCEAN,
+    # Single-phase 5 kW hybrid inverter, European (#225). Routed on the same
+    # evidence as J32B and rather more of it: a reporter capture holds 44
+    # command frames, of which the EMS change report `96/8` alone accounts for 17
+    # and `96/1`, `96/7` and `96/13` for six more. All four are already
+    # decoded, so this unit reports live data into the existing parser rather
+    # than merely being recognised. The capture also carries `96/11`, `96/26`,
+    # `96/34`, `254/32`, `53/14`, `241/5` and `241/36`, none registered, so it
+    # says more than the parser reads - the same situation as every other
+    # PowerOcean variant here.
+    "J327": DEVICE_TYPE_POWEROCEAN,
+    # Single-phase 6 kW hybrid inverter (#326), the larger sibling of the
+    # `J327` above: the app's own device registry keys it "PowerOcean
+    # Single Phase 6KW S2" against "PowerOcean Single Phase 5KW S2" for the
+    # J327, on the same product type 86 that also carries the 3.68 kW
+    # `J32B`. A reporter capture of about 4800 frames over 12.5 minutes
+    # carries `96/1`, `96/7` and `96/8` - the EMS heartbeat, the battery
+    # pack heartbeat and the EMS change report - all three decoded today,
+    # so this unit reports live data into the existing parser rather than
+    # merely being recognised. The capture also holds `96/26`, `96/35`,
+    # `96/51` and `96/53`, none of which is registered, so the device says
+    # more than the parser reads - the same situation as every other
+    # PowerOcean variant here. Without the prefix the unit is classified by
+    # product name alone, which the app API leaves empty, which is why it
+    # is skipped as unsupported in Enhanced mode.
+    "J329": DEVICE_TYPE_POWEROCEAN,
+    # PowerOcean Plus variants (#88): higher-power 3-phase hybrid units
+    # (e.g. P3-S1, ~25-30 kW). Not exposed through the Developer API, so
+    # Enhanced mode only - same situation as J32D/J32E. Routed to the
+    # PowerOcean parser so entities are created; field layout to be
+    # confirmed via reporter diagnostics on a Plus unit.
+    "R371": DEVICE_TYPE_POWEROCEAN,
+    # PowerOcean Plus 20kW. It sits between the 15kW `R371` and the 30kW
+    # `R374` in the app's device registry, on the same product type and the
+    # same `product_smart_re_307` family stem as both. (#205)
+    "R372": DEVICE_TYPE_POWEROCEAN,
+    # PowerOcean Plus, reported in #573 with an Enhanced Mode recording whose
+    # frames arrive on the same topics as the other Plus units.
+    "R373": DEVICE_TYPE_POWEROCEAN,
+    "R374": DEVICE_TYPE_POWEROCEAN,
+    "HJ3C": DEVICE_TYPE_POWEROCEAN,
+    # PowerOcean DC Fit, reported in #575 with an Enhanced Mode recording
+    # whose frames carry the same `96/x` and `254/32` headers as the other
+    # PowerOcean units. The recording is from Enhanced Mode; whether a
+    # Developer API key accepts the serial is untested, and the field layout
+    # of a DC-coupled unit is not confirmed.
+    "HC31": DEVICE_TYPE_POWEROCEAN,
+    "R351": DEVICE_TYPE_DELTA,
+    "R331": DEVICE_TYPE_DELTA,
+    "D3M1": DEVICE_TYPE_DELTA3,
+    # DELTA 3 Max, the variant below the Max Plus. The app's own device
+    # registry puts it in the same product family as the three prefixes
+    # above and below: `product_ps_delta_delta_3_m` against `_m_p` for the
+    # Max Plus, `_c` for the Classic and the bare stem for the base unit.
+    # It has no port priority, which is why it is listed in
+    # `_SN_PREFIX_EXCLUDED_KEYS`. (#216)
+    "D3N1": DEVICE_TYPE_DELTA3,
+    "P321": DEVICE_TYPE_DELTA3,
+    # DELTA 3 Plus. Reported as unsupported by an owner whose capture then
+    # showed the existing Delta 3 parser reading his unit completely: the
+    # three message types this generation uses are all there, and the values
+    # check each other, with 53.037 V over 16 cells against a reported
+    # 3319 mV high and 3302 mV low cell, and 18716 of 19987 mAh against a
+    # reported 93 % (#304).
+    "P351": DEVICE_TYPE_DELTA3,
+    # Base DELTA 3 (#182): confirmed from a reporter capture in Enhanced mode.
+    # The unit sends the same three frames as a Max Plus (32/2 battery, 32/50
+    # BMS, 254/21 status), and the status frame decodes through the existing
+    # Delta 3 binding with 22 mapped keys, so it needs routing and nothing else.
+    "P231": DEVICE_TYPE_DELTA3,
+    # RIVER 3 (#296). Routed on its own recorded frames, not on a shared
+    # product line: three units sent the 254/21, 32/50 and 32/2 frames, and
+    # all three decode through the Delta 3 messages with values that match the
+    # app (state of charge, input and output power, AC input, remaining time)
+    # and the rated hardware (cell count, design capacity). Read-only, see
+    # `_SN_PREFIX_EXCLUDED_KEYS`.
+    "R655": DEVICE_TYPE_DELTA3,
+    # RIVER 3 Plus (#296), routed on its own recording, not by analogy with
+    # the RIVER 3: one unit sent the same 254/21, 32/50 and 32/2 frames, and
+    # they decode through the Delta 3 messages to the owner's readings (64 %,
+    # AC input passed through to a ~70 W load, a phone on USB-C) and to a
+    # 7-cell pack. Read-only on the same terms as the RIVER 3.
+    "R631": DEVICE_TYPE_DELTA3,
+    "HW52": DEVICE_TYPE_SMARTPLUG,
+    # BK-series Stream devices:
+    #  - BK01: Stream Micro
+    #  - BK11: Stream Ultra
+    #  - BK31: Stream AC Pro
+    #  - BK41: Stream Max
+    #  - BK51: Stream AC
+    #  - BK61: Stream Ultra X
+    # The Stream Micro (#141) is a grid-tie PV inverter without a battery, so
+    # it shares the Stream parser but gets a reduced entity set (see
+    # STREAM_MICRO_EXCLUDED_KEYS).
+    "BK01": DEVICE_TYPE_STREAM,
+    "BK11": DEVICE_TYPE_STREAM,
+    "BK31": DEVICE_TYPE_STREAM,
+    "BK41": DEVICE_TYPE_STREAM,
+    "BK51": DEVICE_TYPE_STREAM,
+    "BK61": DEVICE_TYPE_STREAM,
+    # STREAM AC 5000 (#177): verified against live hardware in Enhanced mode,
+    # cross-checked against the app and an independent Tibber Pulse meter.
+    "ES22": DEVICE_TYPE_STREAM_AC5000,
+    # STREAM 5000 (#231). Same product type as the ES22 above (396) on a
+    # different model number, and a capture from a live unit sends the same
+    # four telemetry families: 254/39, 254/40, 32/2 and 32/50. Replayed
+    # through the ES22 parser unchanged those frames yield 26 readings that
+    # agree across independent message families - the home node total matches
+    # the sum of the flow edges feeding it, the grid meter matches the export
+    # derived from those edges - so this is the same parser rather than a
+    # guess from the shared name. Controls were a separate question and
+    # stayed off until a capture from an owner's unit showed it accepting a
+    # write, see STREAM_AC5000_CONTROL_PREFIXES in ../const.py.
+    "ES21": DEVICE_TYPE_STREAM_AC5000,
+    # PowerStream microinverter (#230, capture from #188). Standard Mode
+    # only: the whole device arrives as flat JSON under the `20_1.`
+    # namespace, and the reporter capture closes the unit's own power
+    # balance exactly, so the field map rests on arithmetic rather than on
+    # the field names. Mapping the prefix is what makes the name check below
+    # the second line of defence instead of the only one.
+    "HW51": DEVICE_TYPE_POWERSTREAM,
+    # EcoFlow Smart Meter (EF-EM-P3-120), the three-phase clamp meter sold
+    # alongside the Stream line (#331). It reports on the BK-series envelope
+    # and its own command pair 254/21 and 254/22, and the reporter capture
+    # decodes completely against it: aggregate grid power, per-phase power,
+    # voltage and current, the daily and lifetime import counters, the grid
+    # connection state and the three phase flags. The app API leaves its
+    # product name empty like every other BK prefix, so without this entry
+    # the unit is classified by name alone and skipped as unsupported.
+    "BK21": DEVICE_TYPE_SMART_METER,
+    # Single Axis Solar Tracker (#339). Both prefixes map to the one type:
+    # the app registry keys `HZ31` (`product_st_fd100`) and `S02F`
+    # (`product_st_sp002`) to the same productType 31, and a reporter
+    # capture from each prefix decodes to the same 27-field report message
+    # with the same product id. The app API leaves the product name empty
+    # for this family too, so without these entries the unit is classified
+    # by name alone and skipped as unsupported.
+    "HZ31": DEVICE_TYPE_SOLAR_TRACKER,
+    "S02F": DEVICE_TYPE_SOLAR_TRACKER,
+    # WAVE 3 (#161): productType 44, family AC517. The Developer API lists
+    # it (`productName` empty) and refuses its quota with 1006, the app API
+    # lists it without any product name, so without this entry the unit is
+    # classified by name alone and skipped as unsupported. Further `AC71*`
+    # regional variants join here as owners report them, like the BK series.
+    "AC71": DEVICE_TYPE_WAVE3,
+    # PowerPulse 2 wallbox (#7, #247, PLAN-132): its own account-channel
+    # connection and its own protocol, reached through this prefix like
+    # every other Enhanced-only type above. A `C376` no longer needs a
+    # coupled PowerOcean to report at all.
+    "C376": DEVICE_TYPE_POWERPULSE2,
+    # Second account prefix of the same wallbox (#7, 2026-09-11). One owner's
+    # recording of several charging sessions under `C374` carries the same
+    # message families, field numbers and scaling as the `C376` recordings
+    # the parser was built from (ADR-008, prefix scope). The app API gives
+    # it no product name either.
+    "C374": DEVICE_TYPE_POWERPULSE2,
+    # PowerPulse 2 (#446): a suspended 2/33 heartbeat and an overnight charge
+    # read through the same map; power and session energy matched the app.
+    # Read-only until a write is confirmed (POWERPULSE_CONTROL_PREFIXES).
+    "C371": DEVICE_TYPE_POWERPULSE2,
+    # Ocean 2 (#145). Mapped from a 16 h capture on the reporter's own unit
+    # and confirmed against a seven hour recording from a second, unrelated
+    # installation: the field numbers line up frame for frame, the
+    # load-bearing readings and the module block included.
+    "RE11": DEVICE_TYPE_OCEAN2,
+    # Ocean 2, 12 kW variant. EcoFlow's own device list carries `RE11` and
+    # `RE17` with different power ratings and nothing else: same message
+    # families, same payload shape, same screens, and no separate handling
+    # anywhere in the app client. For a read-only integration they are one
+    # device, so `RE17` is routed to the same parser rather than waiting for
+    # a capture that would only show the same frames again.
+    "RE17": DEVICE_TYPE_OCEAN2,
+    # Ocean 2 Plus, 8 kW, single-phase (#145). An owner's diagnostics
+    # download carries 459 telemetry frames and 15 module frames over about
+    # fifteen minutes with the `RE11`'s field numbers throughout. Single
+    # phase leaves Phase B and C of the per-phase sensors empty.
+    "RE41": DEVICE_TYPE_OCEAN2,
+    # Ocean 2 Plus, 12 kW, single-phase, four modules (#145). An owner's
+    # diagnostics download carries 43 frames over about half an hour with the
+    # `RE11`'s field numbers on every field the integration reads. Its AC power
+    # readings carry the opposite sign, see `OCEAN2_AC_SIGN_INVERTED`.
+    "RE43": DEVICE_TYPE_OCEAN2,
+    # Ocean 2, single-phase, three modules (#145). An owner's diagnostics
+    # download carries 89 frames over about fourteen hours, none truncated,
+    # with the `RE11`'s field numbers and wire types on every field the
+    # integration reads. Nothing else is established about the model, so it is
+    # routed as a plain Ocean 2. Its AC power readings carry the opposite
+    # sign, see `OCEAN2_AC_SIGN_INVERTED`.
+    "RE42": DEVICE_TYPE_OCEAN2,
+    # OCEAN Smart Electrical Panel 40 (#434). Mapped from a 46-frame capture
+    # of a live installation: the property push (254/21) and safety block
+    # (254/25) both decode, and grid/PV/battery close the panel's own power
+    # balance exactly on multiple frames.
+    "HR61": DEVICE_TYPE_SMART_PANEL_40,
+    # DELTA Pro Ultra (#464). Mapped from an owner's 66-frame recording whose
+    # main-unit headers (2.1 to 2.4) decode on this model's own field
+    # numbers. Without the prefix the unit is unknown on the account channel:
+    # the owner's diagnostics showed it skipped as an unknown type with an
+    # empty product name. Where a channel does report the name "DELTA Pro
+    # Ultra", it would reach the "delta" keyword and land on the Delta 2 Max
+    # set, whose entities this unit cannot fill.
+    "Y711": DEVICE_TYPE_DELTA_PRO_ULTRA,
+    # Smart Home Panel 2 (#464). Mapped from an owner's recording of its app
+    # channel whose headers decode on this panel's own field numbers. The
+    # app API reports an empty product name for it, so only the prefix
+    # reaches it.
+    "HD31": DEVICE_TYPE_SMART_HOME_PANEL_2,
+}
+
+_SN_PREFIX_DISPLAY_NAMES: dict[str, str] = {
+    # A base DELTA 3 reports an empty product name through the app API, same
+    # as the BK series below (#182).
+    "P231": "DELTA 3",
+    # Same empty product name from the app API as the base model above.
+    "P351": "DELTA 3 Plus",
+    # RIVER 3 family, each on its own recording (#296).
+    "R655": "RIVER 3",
+    "R631": "RIVER 3 Plus",
+    "BK01": "Stream Micro",
+    "BK11": "Stream Ultra",
+    "BK31": "Stream AC Pro",
+    "BK41": "Stream Max",
+    "BK51": "Stream AC",
+    "BK61": "Stream Ultra X",
+    "ES22": "STREAM AC 5000",
+    "ES21": "STREAM 5000",
+    "BK21": "Smart Meter",
+    "RE11": "Ocean 2",
+    "RE17": "Ocean 2",
+    "RE41": "Ocean 2 Plus",
+    "RE42": "Ocean 2",
+    "RE43": "Ocean 2 Plus",
+    "HR61": "OCEAN Smart Electrical Panel 40",
+    "Y711": "DELTA Pro Ultra",
+    "HD31": "Smart Home Panel 2",
+    "HZ31": "Solar Tracker",
+    "S02F": "Solar Tracker",
+    # WAVE 3: the app names it "WAVE 3-<tail>", neither channel gives a
+    # product name, so `get_device_name` renders "WAVE 3 (0052)" from here.
+    "AC71": "WAVE 3",
+}
+
+# --- Scheduled charge task: the charge power range the app offers ---
+#
+# The app does not read this range from the device. It opens the power prompt
+# with a ceiling picked by product family and refined per model by the first
+# four characters of the serial, and with a floor of 100 W per online battery
+# pack. The step is 100 W. There is no heartbeat field carrying any of it; the
+# only device-reported input is the pack count, which the floor uses.
+POWEROCEAN_SCHEDULE_POWER_MAX_W: dict[str, int] = {
+    # Three-phase units, per model.
+    "HJ31": 10000,
+    "HJ35": 6000,
+    "HJ36": 8000,
+    "HJ37": 12000,
+    # Single-phase units. The app multiplies this by the number of linked
+    # units when a system runs in parallel. Nothing in this integration reads
+    # that count, so a parallel installation is offered the single-unit
+    # ceiling rather than a guessed multiple of it.
+    "J32B": 6000,
+    "J32D": 6000,
+    "J32E": 6000,
+    "J327": 6000,
+    "J329": 6000,
+    # PowerOcean Plus.
+    "R371": 29900,
+    "R372": 29900,
+    "R374": 29900,
+}
+
+# What a prefix outside the table above gets: the value its product family
+# carries, which is what the app falls back to when no per-model override
+# exists. A new PowerOcean prefix therefore lands on its family ceiling
+# instead of on the builder's 30000 W guard.
+_POWEROCEAN_SCHEDULE_POWER_MAX_FAMILY_W: tuple[tuple[str, int], ...] = (
+    ("HJ3", 10000),
+    ("J32", 6000),
+    ("R37", 29900),
+)
+
+# The grid every value sits on, and the floor for one pack. Also the floor
+# used when the pack count has not been reported: never 0, because the app
+# cannot send 0 and the device's answer to it has never been seen.
+POWEROCEAN_SCHEDULE_POWER_STEP_W = 100
+POWEROCEAN_SCHEDULE_POWER_MIN_W = 100
+POWEROCEAN_SCHEDULE_POWER_MAX_DEFAULT_W = 10000
+
+# The feed-to-grid schedule's own power range (ADR-027 addendum, #381) -
+# narrower than the charge schedule above because it is a separate app
+# prompt, not because the wire says so. 100 W is one step above zero: the
+# disable switch is how a slot is made to export nothing, and zero has never
+# been seen in a power field of either schedule family. 5000 W is the one app
+# maximum on record (#381, reporter, 2026-09-10, equal to his own Feed Power
+# Limit) and stands only as a placeholder until the device's own
+# `ems_feed_power_limit_w` reading arrives; the number entity narrows to that
+# reading, uncapped, once it does - a unit with a higher feed limit must not
+# be clipped to this default. The step is the same 100 W grid, so no second
+# step constant exists.
+POWEROCEAN_FEED_SCHEDULE_POWER_MIN_W = 100
+POWEROCEAN_FEED_SCHEDULE_POWER_MAX_DEFAULT_W = 5000
+
+
+def schedule_power_max_w(sn: str) -> int:
+    """Return the scheduled charge power ceiling for this unit, in watts."""
+    prefix = (sn or "")[:4].upper()
+    exact = POWEROCEAN_SCHEDULE_POWER_MAX_W.get(prefix)
+    if exact is not None:
+        return exact
+    for family, ceiling in _POWEROCEAN_SCHEDULE_POWER_MAX_FAMILY_W:
+        if prefix.startswith(family):
+            return ceiling
+    return POWEROCEAN_SCHEDULE_POWER_MAX_DEFAULT_W
+
+
+def schedule_power_min_w(online_battery_packs: int | None) -> int:
+    """Return the scheduled charge power floor, in watts.
+
+    100 W per online battery pack, which is the app's own rule. A pack count
+    that has not been reported yet gives the one-pack floor rather than zero.
+    """
+    if online_battery_packs is None or online_battery_packs < 1:
+        return POWEROCEAN_SCHEDULE_POWER_MIN_W
+    return online_battery_packs * POWEROCEAN_SCHEDULE_POWER_MIN_W
+
+
+#: Ocean 2 prefixes whose total AC power (protobuf path 4.1) and inverter phase
+#: active power (4.3.1[n].3) read with the opposite sign of the `RE11`/`RE41`.
+#: Measured 2026-09-30 from one `RE42` unit's diagnostics download (#145): it
+#: reads -182..-4,267 W while supplying the house, where an `RE41` reads
+#: +311..+415 W and an `RE11` up to +10,476 W in the same state. Battery, grid,
+#: solar, home load and apparent power agree in sign on all three. One unit is
+#: one measurement: an installation setting behind the sign is not ruled out.
+#: An `RE43` unit (#145) reads the same way: -7,340 W raw while the battery
+#: supplied a 7,800 W house load. With the battery idle and the grid carrying
+#: the house it reads about +55 W raw, about -55 W once corrected.
+OCEAN2_AC_SIGN_INVERTED: frozenset[str] = frozenset({"RE42", "RE43"})
+
+
+def ocean2_ac_sign_inverted(sn: str) -> bool:
+    """Return True when this Ocean 2 serial reports AC power inverted."""
+    return (sn or "")[:4].upper() in OCEAN2_AC_SIGN_INVERTED
+
+
+def get_device_name(product_name: str, sn: str = "") -> str:
+    """Return a human-friendly name for the device.
+
+    A serial-prefix-derived name is provided for the device families that
+    report an empty product name through the app API: the Stream (BK-series)
+    units and the base DELTA 3. For the rest the product name is returned
+    when present and
+    an empty string otherwise, so callers keep their existing fallback
+    (device-type display name or bare serial).
+    """
+    if product_name:
+        return product_name
+
+    if not sn:
+        return ""
+    base_name = _SN_PREFIX_DISPLAY_NAMES.get(sn[:4].upper(), "")
+    if not base_name:
+        return ""
+
+    serial_tail = sn[-4:]
+    if len(serial_tail) == 4 and serial_tail.isdigit():
+        return f"{base_name} ({serial_tail})"
+    return base_name
+
+
+def get_device_type(product_name: str, sn: str = "") -> str:
+    """Classify a device based on its SN prefix or productName string.
+
+    Returns DEVICE_TYPE_POWEROCEAN, DEVICE_TYPE_DELTA, DEVICE_TYPE_DELTA3,
+    DEVICE_TYPE_SMARTPLUG, DEVICE_TYPE_STREAM, DEVICE_TYPE_STREAM_AC5000,
+    DEVICE_TYPE_POWERSTREAM, DEVICE_TYPE_SMART_METER,
+    DEVICE_TYPE_SOLAR_TRACKER, DEVICE_TYPE_WAVE3, DEVICE_TYPE_POWERPULSE2,
+    DEVICE_TYPE_OCEAN2, DEVICE_TYPE_SMART_PANEL_40,
+    DEVICE_TYPE_DELTA_PRO_ULTRA, DEVICE_TYPE_SMART_HOME_PANEL_2, or
+    DEVICE_TYPE_UNKNOWN.
+
+    The Smart Meter, the Solar Tracker, the WAVE 3 and the PowerPulse 2 have
+    no keyword of their own: all four are reached by their serial prefix
+    only. None of their names matches any keyword list below, and the app
+    API reports an empty product name for each, so a keyword would be an
+    assumption about a string no capture has ever shown.
+
+    The DELTA Pro Ultra is reached by its prefix as well. The owner's
+    diagnostics (#464) showed it skipped as an unknown type with an empty
+    product name, so on the account channel no keyword is involved. Where a
+    channel does report the name "DELTA Pro Ultra", it would match the
+    "delta" keyword and land on the Delta 2 Max set, which is why the prefix
+    check below runs first.
+
+    The Smart Home Panel 2 is reached by its prefix only: the app API
+    reports an empty product name for it, so no keyword is involved.
+    """
+    # The prefix is exact evidence, the product name a substring guess, so
+    # the prefix wins. Every prefix mapped before this ordering existed
+    # agreed with its keyword anyway; an ES22 would not, since "STREAM AC
+    # 5000" matches the BK-series keyword.
+    if sn:
+        prefix = sn[:4].upper()
+        if prefix in _SN_PREFIX_MAP:
+            return _SN_PREFIX_MAP[prefix]
+
+    name = (product_name or "").lower()
+    for kw in _POWERSTREAM_KEYWORDS:
+        if kw in name:
+            return DEVICE_TYPE_POWERSTREAM
+    for kw in _POWEROCEAN_KEYWORDS:
+        if kw in name:
+            return DEVICE_TYPE_POWEROCEAN
+    for kw in _DELTA3_KEYWORDS:
+        if kw in name:
+            return DEVICE_TYPE_DELTA3
+    for kw in _DELTA_KEYWORDS:
+        if kw in name:
+            return DEVICE_TYPE_DELTA
+    for kw in _SMARTPLUG_KEYWORDS:
+        if kw in name:
+            return DEVICE_TYPE_SMARTPLUG
+    for kw in _STREAM_KEYWORDS:
+        if kw in name:
+            return DEVICE_TYPE_STREAM
+    return DEVICE_TYPE_UNKNOWN
+
+
+def device_log_tag(sn: str) -> str:
+    """Name a device in a log line without carrying more of the serial than
+    the four-character prefix already used everywhere else (PLAN-124, ADR-019).
+
+    Returns the four-character prefix, a dash, and the first four hex
+    characters of sha256(sn) - stable across restarts, distinct for two
+    devices sharing a prefix, and a one-way function of the hidden twelve
+    characters (never a second slice of the serial).
+
+    Below the four-character floor there is nothing to protect and nothing
+    to hash, so the serial is returned unchanged.
+    """
+    if len(sn) < 4:
+        return sn
+    return f"{sn[:4]}-{sha256(sn.encode()).hexdigest()[:4]}"

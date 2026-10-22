@@ -1,0 +1,788 @@
+"""EcoFlow Energy integration for Home Assistant."""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from datetime import datetime
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_call_later
+
+from .const import (
+    AUTH_METHOD_APP,
+    AUTH_METHOD_DEVELOPER,
+    CONF_AUTH_METHOD,
+    CONF_DEVICES,
+    CONF_EMAIL,
+    CONF_MODE,
+    CONF_PASSWORD,
+    CONF_RAW_CAPTURE,
+    CONF_RAW_CAPTURE_UNTIL,
+    DATA_DEVICE_PROBES,
+    DATA_SKIPPED_DEVICES,
+    DEVICE_TYPE_DISPLAY_NAMES,
+    DEVICE_TYPE_POWEROCEAN,
+    DEVICE_TYPE_POWERPULSE2,
+    DEVICE_TYPE_POWERSTREAM,
+    DEVICE_TYPE_UNKNOWN,
+    DOMAIN,
+    ENHANCED_ONLY_DEVICE_TYPES,
+    LOCAL_PLATFORMS,
+    MODE_ENHANCED,
+    MODE_LOCAL,
+    PLATFORMS,
+    get_device_type,
+    raw_capture_window_open,
+)
+from .coordinator import EcoFlowDeviceCoordinator
+from .coordinator.local_modbus import EcoFlowLocalModbusCoordinator
+from .device_probe import (
+    UnroutedDeviceProbe,
+    async_start_probe_watchdog,
+    async_start_probes,
+)
+from .ecoflow.const import device_log_tag
+
+_LOGGER = logging.getLogger(__name__)
+
+type EcoFlowConfigEntry = ConfigEntry
+
+
+CONFIG_VERSION = 3
+
+
+async def _async_raw_capture_active(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Return whether the raw capture is switched on and still within its window.
+
+    The deadline is stored as wall-clock time so it survives restarts: a
+    capture left on before a reboot must not get a fresh 24 hours out of it.
+    An expired window is switched off here rather than merely ignored, so the
+    options screen tells the truth about what is running.
+
+    The check itself is `raw_capture_window_open`; this adds the one side
+    effect that needs the config entry.
+    """
+    if raw_capture_window_open(entry.data):
+        return True
+    if not entry.data.get(CONF_RAW_CAPTURE):
+        return False
+
+    _LOGGER.info(
+        "The raw data capture window has expired - switching it off. Enable it "
+        "again in the integration options if more data is needed."
+    )
+    _async_disable_raw_capture(hass, entry)
+    return False
+
+
+def _async_disable_raw_capture(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Clear the raw capture flag, which reloads the entry and stops the probes."""
+    new_data = dict(entry.data)
+    new_data[CONF_RAW_CAPTURE] = False
+    new_data.pop(CONF_RAW_CAPTURE_UNTIL, None)
+    hass.config_entries.async_update_entry(entry, data=new_data)
+
+
+def _async_schedule_raw_capture_expiry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Switch the capture off when its window closes, without a restart.
+
+    The check at setup only runs on startup and reload. Without this timer a
+    capture enabled on a machine that stays up for weeks would keep its
+    connection open for exactly that long.
+    """
+    remaining = entry.data.get(CONF_RAW_CAPTURE_UNTIL, 0) - time.time()
+    if remaining <= 0:
+        return
+
+    # `@callback` is load-bearing, not decoration. Without it Home Assistant
+    # classifies the timer's action as a blocking function and runs it in the
+    # executor, and the config write inside it is not thread-safe - the write
+    # is reported as unsafe and the window never actually closes. It went
+    # unnoticed because no test had ever let the timer fire.
+    @callback
+    def _expire(_now: datetime) -> None:
+        _LOGGER.info("The raw data capture window has ended - switching it off.")
+        _async_disable_raw_capture(hass, entry)
+
+    entry.async_on_unload(async_call_later(hass, remaining, _expire))
+
+
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Migrate old config entries to current schema."""
+    if config_entry.version > CONFIG_VERSION:
+        return False
+
+    if config_entry.version < 3:
+        _LOGGER.debug(
+            "Migrating config entry %s from version %d to 3",
+            config_entry.entry_id,
+            config_entry.version,
+        )
+        new_data = {**config_entry.data}
+        new_data.setdefault(CONF_AUTH_METHOD, AUTH_METHOD_DEVELOPER)
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data=new_data,
+            version=3,
+        )
+        _LOGGER.info(
+            "Migration of config entry %s to version 3 successful",
+            config_entry.entry_id,
+        )
+
+    return True
+
+
+# Entities that shipped once and were then withdrawn. Home Assistant keeps a
+# registry entry for every entity it has ever seen, and nothing removes one when
+# its definition disappears from the code - it simply stays, permanently
+# unavailable, on the device page of everyone who ran the release that had it.
+#
+# Matched by the suffix of the unique id, which is `<serial>_<entity key>`, so
+# one line covers every device that carried the entity.
+#
+# `ac_charge_mode` was a Delta 3 select in v1.16.0-beta.11 and beta.12. It was
+# withdrawn because the device reports its charge mode only when that mode
+# changes, which is far too rarely for a control that has to show where the
+# device stands.
+#
+# The five `grid_*_wh` suffixes were the Smart Meter (BK21) energy counters
+# of v1.19.0-beta.1 through beta.7, built on a schema whose "today" and
+# "reactive" labels turned out wrong for every one of the five: a capture
+# spanning local midnight showed none of them resetting, and a house that
+# exports fell the ones then classed `total_increasing`. PLAN-123/ADR-018
+# replaces all five with six new keys under the direction the device's own
+# arithmetic actually shows (import, export, net, three phase nets), so the
+# old ids are withdrawn rather than migrated.
+_WITHDRAWN_ENTITY_SUFFIXES: tuple[str, ...] = (
+    "_ac_charge_mode",
+    "_grid_energy_total_wh",
+    "_grid_energy_today_wh",
+    "_grid_l1_energy_today_wh",
+    "_grid_l2_energy_today_wh",
+    "_grid_l3_energy_today_wh",
+)
+
+# HW51 PowerStream microinverters could once be classified as Stream batteries.
+# These are the Stream-only platform/key pairs exposed by v1.17. The 16 sensor
+# keys shared by both families are deliberately absent so their entity ids and
+# history survive the corrected classification. A key on another platform is
+# a different entity: the current read-only sensor ``led_brightness`` survives,
+# while the historical writable number with the same key does not.
+_HW51_LEGACY_STREAM_SENSOR_KEYS: frozenset[str] = frozenset(
+    {
+        "ac_current_a",
+        "ac_grid_connection_power_w",
+        "ac_outlet_1_w",
+        "ac_outlet_2_w",
+        "batt_charge_capacity_ah",
+        "batt_charge_energy_kwh",
+        "batt_charge_discharge_state",
+        "batt_charge_power_w",
+        "batt_design_cap_mah",
+        "batt_discharge_capacity_ah",
+        "batt_discharge_energy_kwh",
+        "batt_discharge_power_w",
+        "batt_full_cap_mah",
+        "batt_max_cell_temp_c",
+        "batt_max_cell_vol_mv",
+        "batt_max_mos_temp_c",
+        "batt_min_cell_temp_c",
+        "batt_min_cell_vol_mv",
+        "batt_remain_cap_mah",
+        "bms_soh_pct",
+        "backup_reserve_pct",
+        "feed_grid_power_limit_w",
+        "grid_connection_power_w",
+        "grid_connection_state",
+        "home_energy_kwh",
+        "home_from_batt_w",
+        "home_from_grid_w",
+        "home_from_solar_w",
+        "home_w",
+        "pv3_energy_kwh",
+        "pv3_w",
+        "pv4_energy_kwh",
+        "pv4_w",
+        "pv_current_a",
+        "pv_voltage_v",
+        "pv2_current_a",
+        "soc_precise_pct",
+        "sys_grid_connection_power_w",
+    }
+)
+_HW51_LEGACY_STREAM_KEYS_BY_DOMAIN: dict[str, frozenset[str]] = {
+    "sensor": _HW51_LEGACY_STREAM_SENSOR_KEYS,
+    "binary_sensor": frozenset(
+        {
+            "ac_outlet_1_enabled",
+            "ac_outlet_2_enabled",
+        }
+    ),
+    "switch": frozenset({"ac_outlet_1_switch", "ac_outlet_2_switch"}),
+    "number": frozenset(
+        {
+            "backup_reserve",
+            "led_brightness",
+            "stream_charge_limit",
+            "stream_discharge_limit",
+        }
+    ),
+}
+_HW51_SERIAL_RE = re.compile(r"^HW51[A-Z0-9]{11,}$")
+
+# The six WAVE 3 (AC71) sensors and the running flag that became
+# number/select/switch entities under the same keys once the 1.20.0 controls
+# shipped (ADR-020, PLAN-047). Domain AND key must both match for a removal,
+# so a control entity (number/select/switch) with the same unique-id key
+# survives untouched.
+_AC71_RETIRED_KEYS_BY_DOMAIN: dict[str, frozenset[str]] = {
+    "sensor": frozenset(
+        {
+            "operating_mode",
+            "target_temp_c",
+            "airflow_speed_pct",
+            "operating_submode",
+            "target_humidity_pct",
+            "screen_brightness_pct",
+        }
+    ),
+    "binary_sensor": frozenset({"running"}),
+}
+_AC71_SERIAL_RE = re.compile(r"^AC71[A-Z0-9]{11,}$")
+
+# One row per retired-entity generation: a serial-prefix pattern paired with
+# the platform/key pairs that generation's retirement removes. Table-driven
+# so the next retirement is one more row rather than a near-duplicate helper.
+_RETIRED_KEYS_BY_SERIAL: tuple[
+    tuple[re.Pattern[str], dict[str, frozenset[str]]], ...
+] = (
+    (_HW51_SERIAL_RE, _HW51_LEGACY_STREAM_KEYS_BY_DOMAIN),
+    (_AC71_SERIAL_RE, _AC71_RETIRED_KEYS_BY_DOMAIN),
+)
+
+
+def _async_remove_withdrawn_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop registry entries for entities this integration no longer offers.
+
+    Runs before the platforms are set up, so a withdrawn entity never briefly
+    reappears. Removing a registry entry does not touch recorded history; the
+    statistics of a deleted entity stay until the user clears them, which is
+    the same behaviour as renaming one.
+    """
+    registry = er.async_get(hass)
+    for existing in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if existing.platform != DOMAIN:
+            continue
+        if not existing.unique_id.endswith(_WITHDRAWN_ENTITY_SUFFIXES):
+            continue
+        _LOGGER.debug("Removing withdrawn entity %s", existing.entity_id)
+        registry.async_remove(existing.entity_id)
+
+
+def _async_remove_retired_platform_entities(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Remove registry entries a platform once created for a serial prefix
+    whose entities a later release retired - HW51's Stream misclassification,
+    and the WAVE 3 (AC71) sensors and running flag replaced by controls under
+    the same keys (see `_RETIRED_KEYS_BY_SERIAL`).
+    """
+    registry = er.async_get(hass)
+    for existing in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if existing.platform != DOMAIN:
+            continue
+        entity_domain = existing.entity_id.partition(".")[0]
+        serial, separator, key = existing.unique_id.partition("_")
+        if not separator:
+            continue
+        for serial_re, stale_by_domain in _RETIRED_KEYS_BY_SERIAL:
+            stale_keys = stale_by_domain.get(entity_domain)
+            if not stale_keys or key not in stale_keys:
+                continue
+            if not serial_re.fullmatch(serial):
+                continue
+            _LOGGER.debug("Removing retired entity %s", existing.entity_id)
+            registry.async_remove(existing.entity_id)
+            break
+
+
+# The five wallbox sensor keys the retired `(241, 3)` relay used to fill on
+# the PowerOcean for a coupled PowerPulse 2. Four of them the PowerPulse 2
+# now reports on its own device; the fifth, `ev_vehicle_id`, the relay filled
+# with a placeholder because the PowerPulse 2 does not report a vehicle at
+# all, so its row is as dead as the other four once the relay is gone. All
+# five stay DEFINED on the PowerOcean list on purpose: the PowerPulse 1
+# (`AC31`) still reports them through the PowerOcean on `(209, 8)` and would
+# lose every wallbox entity if the definitions went away with the relay.
+_POWERPULSE2_RELAYED_SENSOR_KEYS: frozenset[str] = frozenset(
+    {
+        "ev_charge_power_w",
+        "ev_session_energy_wh",
+        "ev_session_duration_s",
+        "ev_charge_status",
+        "ev_vehicle_id",
+    }
+)
+
+# The PowerPulse 1, which keeps reporting through the PowerOcean. It is not a
+# device type of its own - it is skipped at setup like any unsupported device
+# - so the only thing that names it is its serial prefix.
+_POWERPULSE1_SN_PREFIX = "AC31"
+
+
+def _async_remove_relayed_wallbox_entities(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Drop the PowerOcean-side copies of a PowerPulse 2's wallbox readings.
+
+    Until PLAN-132 a `C376` reported through the PowerOcean it was coupled
+    to, so its readings carried `<powerocean_sn>_<key>`. The wallbox has
+    its own device type now and reports on its own channel, and the relay
+    (`(241, 3)`) is retired - those five registry entries are fed by nothing
+    and would sit on the PowerOcean's page permanently unavailable. The
+    first pre-release removed four and left `Wallbox Vehicle` standing;
+    v1.21.0-beta.3 removes it too.
+
+    They are removed rather than renamed onto the wallbox's serial. The
+    reporter who owns both devices was asked on #7 and answered on
+    2026-09-09 that he uses none of the five and that a break in their
+    history is fine, so the value a migration would have bought is not there
+    - and `async_migrate_entries` raises `ValueError` on a unique id that is
+    already taken, which inside `async_setup_entry` takes down the whole
+    config entry rather than one wallbox.
+
+    Nothing is removed when the entry also holds a PowerPulse 1 (`AC31`).
+    That wallbox reports the same five keys through the same PowerOcean on
+    `(209, 8)`, which this change does not touch, so on such an entry a
+    `<powerocean_sn>_<key>` entity may be its live reading rather than a
+    stale relay copy, and the two are not distinguishable from a unique id.
+    Leaving a stale row is the smaller harm.
+
+    Nothing is removed either when the entry holds no PowerPulse 2 (`C376`)
+    at all. The five rows only exist because a `C376` used to relay through
+    the PowerOcean, so a plain PowerOcean entry that never had one has no
+    stale copy to clean up.
+    """
+    devices = entry.data.get(CONF_DEVICES, [])
+    if any(
+        str(device.get("sn", "")).startswith(_POWERPULSE1_SN_PREFIX)
+        for device in devices
+    ):
+        _LOGGER.debug(
+            "Keeping relayed wallbox entities: this entry holds a PowerPulse 1, "
+            "which reports the same keys through the PowerOcean"
+        )
+        return
+    device_types = {
+        get_device_type(device.get("product_name") or "", sn)
+        for device in devices
+        if (sn := device.get("sn", ""))
+    }
+    if DEVICE_TYPE_POWERPULSE2 not in device_types:
+        return
+    powerocean_sns = {
+        sn
+        for device in devices
+        if (sn := device.get("sn", ""))
+        and get_device_type(device.get("product_name") or "", sn)
+        == DEVICE_TYPE_POWEROCEAN
+    }
+    if not powerocean_sns:
+        return
+
+    registry = er.async_get(hass)
+    for existing in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if existing.platform != DOMAIN:
+            continue
+        serial, separator, key = existing.unique_id.partition("_")
+        if not separator or serial not in powerocean_sns:
+            continue
+        if key not in _POWERPULSE2_RELAYED_SENSOR_KEYS:
+            continue
+        _LOGGER.debug("Removing relayed wallbox entity %s", existing.entity_id)
+        registry.async_remove(existing.entity_id)
+
+
+async def _async_setup_local_entry(
+    hass: HomeAssistant, entry: EcoFlowConfigEntry
+) -> bool:
+    """Set up a local Modbus entry: one device, no credentials, sensors only.
+
+    None of the cloud setup applies, so it runs before the registry cleanups
+    and the auth upgrade: a local entry has no account, no probes and nothing
+    that could start a reauth.
+    """
+    devices = entry.data.get(CONF_DEVICES, [])
+    if len(devices) != 1:
+        raise ConfigEntryError("A local Modbus entry needs exactly one device")
+
+    try:
+        coordinator = EcoFlowLocalModbusCoordinator(hass, entry, devices[0])
+    except HomeAssistantError as err:
+        # The device is already held on the shared connection with other link
+        # settings. Retrying cannot change that: the owner has to, so this is
+        # a setup error with the reason, not a retry.
+        # Home Assistant's reason names the host and port. Home Assistant logs a
+        # ConfigEntryError with its traceback at ERROR, and the traceback prints
+        # a chained cause in full, so the cause is dropped (``from None``) and
+        # only its type goes to the log, at DEBUG.
+        _LOGGER.debug(
+            "The shared Modbus connection refused the device: %s", type(err).__name__
+        )
+        raise ConfigEntryError(
+            "The shared Modbus connection already holds this device with other "
+            "link settings (host string or port differ from the other integration)"
+        ) from None
+    # A device that does not answer raises ConfigEntryNotReady here, and Home
+    # Assistant retries with its own backoff.
+    await coordinator.async_config_entry_first_refresh()
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        coordinator.device_sn: coordinator
+    }
+    await hass.config_entries.async_forward_entry_setups(entry, LOCAL_PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
+    """Set up EcoFlow Energy from a config entry."""
+    if entry.data.get(CONF_MODE) == MODE_LOCAL:
+        return await _async_setup_local_entry(hass, entry)
+
+    _async_remove_withdrawn_entities(hass, entry)
+    _async_remove_retired_platform_entities(hass, entry)
+    _async_remove_relayed_wallbox_entities(hass, entry)
+
+    # Auto-upgrade: Enhanced Mode entries with email+password -> app-auth.
+    # This lets existing Enhanced users benefit from the app-auth path
+    # (no Developer Keys needed for MQTT) without manual reconfiguration.
+    if (
+        entry.data.get(CONF_MODE) == MODE_ENHANCED
+        and entry.data.get(CONF_AUTH_METHOD) != AUTH_METHOD_APP
+        and entry.data.get(CONF_EMAIL)
+        and entry.data.get(CONF_PASSWORD)
+    ):
+        new_data = {**entry.data, CONF_AUTH_METHOD: AUTH_METHOD_APP}
+        hass.config_entries.async_update_entry(entry, data=new_data)
+        _LOGGER.info(
+            "Auto-upgraded Enhanced Mode entry %s to app-auth",
+            entry.entry_id,
+        )
+
+    devices = entry.data.get(CONF_DEVICES, [])
+    coordinators: dict[str, EcoFlowDeviceCoordinator] = {}
+
+    is_enhanced = entry.data.get(CONF_MODE) == MODE_ENHANCED
+    enhanced_count = len(devices) if is_enhanced else 0
+    standard_count = len(devices) - enhanced_count
+    _LOGGER.debug(
+        "EcoFlow Energy: %d device(s) configured (Enhanced: %d, Standard: %d)",
+        len(devices),
+        enhanced_count,
+        standard_count,
+    )
+
+    # Read before the loop, because the coordinators built inside it read the
+    # same window to pick their frame-buffer depth. The check has a side
+    # effect - an expired flag is switched off - and a coordinator created
+    # before that happened would keep a deep buffer for a window that closed.
+    capture_on = entry.data.get(
+        CONF_AUTH_METHOD
+    ) == AUTH_METHOD_APP and await _async_raw_capture_active(hass, entry)
+
+    skipped_devices: list[dict[str, str | bool]] = []
+    for device_info in devices:
+        sn = device_info["sn"]
+        # Both device producers may pass product_name through as null, so
+        # coalesce to "" here (get(..., "") would still return None).
+        product_name = device_info.get("product_name") or ""
+        # Re-classify from product_name + SN on every setup: classification
+        # rules improve over releases (e.g. Delta 3 split from Delta 2 Max),
+        # and the type stored at config-flow time may be outdated.
+        device_type = get_device_type(product_name, sn)
+        if device_type == DEVICE_TYPE_UNKNOWN:
+            device_type = device_info.get("device_type", "")
+        if (
+            entry.data.get(CONF_AUTH_METHOD) == AUTH_METHOD_APP
+            and device_type == DEVICE_TYPE_POWERSTREAM
+        ):
+            _LOGGER.warning(
+                "Skipping PowerStream %s: this device requires Standard Mode",
+                device_log_tag(sn),
+            )
+            skipped_devices.append(
+                {
+                    "sn_prefix": sn[:4],
+                    "device_tag": device_log_tag(sn),
+                    "sn": sn,
+                    "product_name": product_name or "PowerStream",
+                    "reason": "PowerStream requires Standard Mode",
+                    "probe_eligible": False,
+                }
+            )
+            continue
+        if (
+            entry.data.get(CONF_AUTH_METHOD) != AUTH_METHOD_APP
+            and device_type in ENHANCED_ONLY_DEVICE_TYPES
+        ):
+            # The developer API answers for these devices with an empty quota,
+            # so a Standard Mode entry would create entities that can never
+            # fill. They report on the app channel and nowhere else.
+            label = DEVICE_TYPE_DISPLAY_NAMES.get(device_type, device_type)
+            _LOGGER.warning(
+                "Skipping %s %s: this device requires Enhanced Mode",
+                label,
+                device_log_tag(sn),
+            )
+            skipped_devices.append(
+                {
+                    "sn_prefix": sn[:4],
+                    "device_tag": device_log_tag(sn),
+                    "sn": sn,
+                    "product_name": product_name or label,
+                    "reason": f"{label} requires Enhanced Mode",
+                    "probe_eligible": False,
+                }
+            )
+            continue
+        if not device_type or device_type == DEVICE_TYPE_UNKNOWN:
+            # One WARNING per unsupported device per setup: the user sees
+            # the device in the EcoFlow account but gets no entities, so
+            # this degradation must be visible and actionable.
+            #
+            # The instruction has to match the mode, because the two modes
+            # reach the device's raw data by different routes and only one
+            # of them has a switch. On account sign-in the capture checkbox
+            # exists (config_flow_options renders it for AUTH_METHOD_APP
+            # only) and is the sole route. With developer keys there is no
+            # checkbox at all, and none is needed: a diagnostics download
+            # already fetches the raw HTTP quota of a device we do not parse.
+            # Telling that user to look for a switch sends them after a
+            # control their config flow never shows.
+            if entry.data.get(CONF_AUTH_METHOD) == AUTH_METHOD_APP:
+                how_to_help = (
+                    "switch on the raw data capture in the integration "
+                    "options and attach a diagnostics download to the issue "
+                    "- it records what the device sends and turns itself "
+                    "off again after 24 hours"
+                )
+            else:
+                how_to_help = (
+                    "attach a diagnostics download to the issue - it fetches "
+                    "the raw data this device reports on the way out, nothing "
+                    "needs to be switched on first"
+                )
+            _LOGGER.warning(
+                "Skipping unsupported EcoFlow device %s (%s) - no parser "
+                "available for this model yet. Please open an issue at "
+                "https://github.com/shuette42/ecoflow-energy-ha/issues so "
+                "support can be added. To help with that, %s",
+                device_log_tag(sn),
+                product_name or "unknown product",
+                how_to_help,
+            )
+            skipped_devices.append(
+                {
+                    "sn_prefix": sn[:4],
+                    "device_tag": device_log_tag(sn),
+                    # Full SN is carried in-memory only so diagnostics can fetch
+                    # this device's raw quota to help add parser support. It is
+                    # never persisted and never included in diagnostics output
+                    # (only the prefix is exposed there).
+                    "sn": sn,
+                    "product_name": product_name,
+                    "reason": "no parser available for this device type",
+                }
+            )
+            continue
+        device_info = {**device_info, "device_type": device_type}
+        coordinator = EcoFlowDeviceCoordinator(hass, entry, device_info)
+        await coordinator.async_setup()
+        # First refresh - raises ConfigEntryNotReady on failure so HA retries.
+        # Partial-setup cleanup is handled by HA core: the coordinator
+        # registers async_shutdown as an entry on_unload callback, and HA
+        # processes those callbacks when setup fails, so coordinators
+        # created before a failing device do not leak MQTT clients
+        # (guarded by a regression test).
+        await coordinator.async_config_entry_first_refresh()
+        coordinators[sn] = coordinator
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinators
+    hass.data.setdefault(DATA_SKIPPED_DEVICES, {})[entry.entry_id] = skipped_devices
+
+    # Home Assistant does not unload config entries when it stops. It fires
+    # this event, waits for the listeners, and then closes the event loop -
+    # so without a listener here the MQTT clients are never disconnected and
+    # their paho threads go on delivering into a loop that is gone. Measured
+    # on a live installation before this existed: 21 warnings from five
+    # clients over ten seconds, on every restart, about a condition no user
+    # can act on. A reload never showed it, because a reload does unload the
+    # entry.
+    #
+    # Both lists are read when the event fires rather than captured now: if
+    # the entry was unloaded first, the shutdown already happened and popped
+    # them, and this finds nothing left to do.
+    async def _async_stop_connections(_event: Event) -> None:
+        for coordinator in hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).values():
+            await coordinator.async_shutdown()
+        for probe in hass.data.get(DATA_DEVICE_PROBES, {}).get(entry.entry_id, []):
+            await probe.async_stop()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_connections)
+    )
+
+    # A skipped device produces no entities and no data path, so the bytes
+    # needed to add support for it can never be collected from a normal
+    # installation. In app-auth mode a listen-only probe captures them for
+    # diagnostics. Standard mode has the raw quota capture instead, and for
+    # the models where the Developer API refuses (error 1006) this is the
+    # only route that exists.
+    #
+    # Only a skipped device gets a probe. A device with a parser already has a
+    # coordinator on the same stream, so its frames are recorded there - the
+    # opt-in deepens that buffer instead of opening a second session, and a
+    # supported device must never cost one.
+    #
+    # Off by default. The capture helps exactly one person - whoever
+    # volunteered - and costs an extra connection plus a larger diagnostics
+    # download, so it is opt-in and expires on its own.
+    # A skipped device carries one non-string value, `probe_eligible`, and
+    # `async_start_probes` reads only `sn` and `product_name`. Name those two
+    # rather than filtering on the type of the value: a key added later with
+    # a non-string value would be dropped by a type filter without anything
+    # saying so, and a probe that never starts is the quietest way for that
+    # to show up.
+    probe_devices: list[dict[str, str]] = [
+        {
+            key: value
+            for key in ("sn", "product_name")
+            if isinstance(value := device.get(key, ""), str)
+        }
+        for device in skipped_devices
+        if device.get("probe_eligible", True)
+    ]
+    if capture_on and probe_devices:
+        probes = await async_start_probes(
+            hass,
+            probe_devices,
+            entry.data.get(CONF_EMAIL, ""),
+            entry.data.get(CONF_PASSWORD, ""),
+        )
+        hass.data.setdefault(DATA_DEVICE_PROBES, {})[entry.entry_id] = probes
+
+        # The capture runs for up to 24 hours and every session in that
+        # window gets dropped at some point. Its client cannot rebuild one
+        # on its own - the broker refuses a client id it has already seen -
+        # so without this the recording ends at the first drop and usually
+        # arrives empty.
+        if probes:
+            entry.async_on_unload(async_start_probe_watchdog(hass, probes))
+
+        # Probes hold live WSS connections and their own paho threads. If
+        # setup fails after this point, async_unload_entry never runs, so
+        # every HA retry would leave another set of connections behind.
+        # Popping here means the regular unload path wins when it ran, and
+        # this callback only has work to do when it did not.
+        async def _stop_orphaned_probes() -> None:
+            for probe in hass.data.get(DATA_DEVICE_PROBES, {}).pop(entry.entry_id, []):
+                await probe.async_stop()
+
+        entry.async_on_unload(_stop_orphaned_probes)
+
+    # Bound to the window, not to the probes. The deeper frame buffers run on
+    # every configured device, so an account whose devices are all supported
+    # has a capture to end as well - and before this it never reached the
+    # expiry path at all, which left the flag switched on for good and the
+    # options screen showing a capture nothing would stop.
+    if capture_on:
+        _async_schedule_raw_capture_expiry(hass, entry)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Reload integration when config entry data changes (e.g. mode switch via
+    # Options Flow)
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
+    return True
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Allow deleting a device this entry no longer serves.
+
+    A device stays in the registry after it is deselected in the options, for
+    example when a PowerOcean moves from a cloud entry to a Local entry, and
+    Home Assistant offers to delete it only when the integration agrees. Agree
+    when none of its serials is selected in the entry and none is served by a
+    running coordinator of the entry; refuse everything else, including a
+    device that carries no identifier of this integration.
+    """
+    serials = {
+        identifier
+        for domain, identifier in device_entry.identifiers
+        if domain == DOMAIN
+    }
+    if not serials:
+        return False
+    selected = {
+        str(device.get("sn", "")) for device in config_entry.data.get(CONF_DEVICES, [])
+    }
+    running = set(hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {}))
+    return not serials & (selected | running)
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the integration when the config entry is updated."""
+    _LOGGER.debug("Config entry updated - reloading EcoFlow Energy")
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
+    """Unload an EcoFlow Energy config entry."""
+    # The platforms to unload are the ones this entry set up, read from the
+    # coordinators it runs, not from entry.data: a reconfigure that switches
+    # mode replaces the data before the reload unloads the entry, and the
+    # other mode's platform list names platforms this entry never loaded
+    # (Home Assistant then fails the unload and the reload stops there).
+    running = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    is_local = any(
+        isinstance(coordinator, EcoFlowLocalModbusCoordinator)
+        for coordinator in running.values()
+    )
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, LOCAL_PLATFORMS if is_local else PLATFORMS
+    )
+    if not unload_ok:
+        return False
+
+    # Shut down coordinators
+    coordinators: dict[
+        str, EcoFlowDeviceCoordinator | EcoFlowLocalModbusCoordinator
+    ] = hass.data[DOMAIN].pop(entry.entry_id, {})
+    hass.data.get(DATA_SKIPPED_DEVICES, {}).pop(entry.entry_id, None)
+    probes: list[UnroutedDeviceProbe] = hass.data.get(DATA_DEVICE_PROBES, {}).pop(
+        entry.entry_id, []
+    )
+    for probe in probes:
+        await probe.async_stop()
+    for coordinator in coordinators.values():
+        await coordinator.async_shutdown()
+
+    return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove opt-in charging ledgers when their integration entry is deleted."""
+    from .charging_history import async_remove_history_stores
+
+    await async_remove_history_stores(hass, entry)

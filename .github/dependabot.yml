@@ -1,0 +1,50 @@
+version: 2
+updates:
+  # Python dependencies (paho-mqtt, protobuf, cryptography)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        # The two gate tools are excluded from the group so each gets its own
+        # pull request. They are not libraries: a new minor changes what counts
+        # as an error, which can turn CI red on a branch that touched neither
+        # the rule nor the file, so raising one is a decision with its own
+        # findings to fix rather than a line in a batch of six.
+        exclude-patterns: ["ruff", "mypy"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # The test framework decides which Home Assistant the type gate reads its
+      # annotations from, so it is raised deliberately, in a commit that fixes
+      # whatever the newer release reports, rather than by a dependency bump.
+      - dependency-name: "pytest-homeassistant-custom-component"
+
+  # GitHub Actions versions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 3
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        # The two gate tools are excluded from the group so each gets its own
+        # pull request. They are not libraries: a new minor changes what counts
+        # as an error, which can turn CI red on a branch that touched neither
+        # the rule nor the file, so raising one is a decision with its own
+        # findings to fix rather than a line in a batch of six.
+        exclude-patterns: ["ruff", "mypy"]
+        update-types: ["minor", "patch"]

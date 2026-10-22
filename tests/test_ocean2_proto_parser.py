@@ -1,0 +1,1124 @@
+"""Tests for the Ocean 2 (RE11) protobuf telemetry parser.
+
+The frames are assembled here rather than replayed from a capture. A real
+Ocean 2 frame carries the serial number in its header, and the readings used
+below are the ones that were confirmed against the EcoFlow app, so building
+the wire format from those numbers keeps the evidence and drops the identity.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+from pathlib import Path
+
+import pytest
+from ecoflow_energy.ecoflow.const import (
+    DEVICE_TYPE_OCEAN2,
+    DEVICE_TYPE_POWEROCEAN,
+    get_device_name,
+    get_device_type,
+)
+from ecoflow_energy.ecoflow.parsers.ocean2_proto import (
+    MAX_MODULES,
+    parse_ocean2_proto_message,
+)
+from ecoflow_energy.ecoflow.parsers.powerocean import EMS_WORK_STATES
+
+
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    while value > 0x7F:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _f32(field: int, value: float) -> bytes:
+    """A 32-bit float field - how the device sends every power reading."""
+    return _varint((field << 3) | 5) + struct.pack("<f", value)
+
+
+def _vint(field: int, value: int) -> bytes:
+    return _varint((field << 3) | 0) + _varint(value)
+
+
+def _msg(field: int, body: bytes) -> bytes:
+    """A length-delimited sub-message."""
+    return _varint((field << 3) | 2) + _varint(len(body)) + body
+
+
+def _frame(pdata: bytes, cmd_func: int = 254, cmd_id: int = 39) -> bytes:
+    """Wrap a payload in the EcoFlow outer frame."""
+    header = _msg(1, pdata) + _vint(8, cmd_func) + _vint(9, cmd_id)
+    return _msg(1, header)
+
+
+def _pv_string(
+    index: int,
+    watts: float,
+    *,
+    volts: float | None = None,
+    amps: float | None = None,
+) -> bytes:
+    body = _f32(1, float(index))
+    if volts is not None:
+        body += _f32(2, volts)
+    if amps is not None:
+        body += _f32(3, amps)
+    body += _f32(4, watts)
+    return _msg(1, body)
+
+
+def _phase_record(
+    index: int,
+    *,
+    field_index: int,
+    voltage: float | None = None,
+    current: float | None = None,
+    active_w: float | None = None,
+    reactive_var: float | None = None,
+    apparent_va: float | None = None,
+    freq_hz: float | None = None,
+) -> bytes:
+    """One record inside a `4.3` or `4.4` container.
+
+    `field_index` is 6 for an inverter-phase record and 5 for a grid-phase
+    record - the two groups disagree on which field carries the phase index.
+    """
+    body = b""
+    if voltage is not None:
+        body += _f32(1, voltage)
+    if current is not None:
+        body += _f32(2, current)
+    if active_w is not None:
+        body += _f32(3, active_w)
+    if reactive_var is not None:
+        body += _f32(4, reactive_var)
+    if apparent_va is not None:
+        body += _f32(5, apparent_va)
+    if freq_hz is not None:
+        body += _f32(3, freq_hz)
+    body += _f32(field_index, float(index))
+    return _msg(1, body)
+
+
+def _telemetry(
+    *,
+    summary: bytes = b"",
+    flow: dict[int, bytes] | None = None,
+    inverter: bytes = b"",
+) -> bytes:
+    body = b""
+    if summary:
+        body += _msg(65, summary)
+    for block, content in (flow or {}).items():
+        body += _msg(block, content)
+    if inverter:
+        body += _msg(4, inverter)
+    return _frame(body)
+
+
+class TestDeviceClassification:
+    def test_serial_prefix_routes_to_ocean2(self) -> None:
+        assert get_device_type("", "RE11TEST00000001") == DEVICE_TYPE_OCEAN2
+
+    def test_the_12kw_variant_shares_the_read_path(self) -> None:
+        # RE11 and RE17 differ in power rating and in nothing this integration
+        # reads: same message families, same payload shape.
+        assert get_device_type("", "RE17TEST00000001") == DEVICE_TYPE_OCEAN2
+
+    def test_the_plus_shares_the_read_path(self) -> None:
+        # An `RE41` diagnostics download on #145 carries the `RE11`'s field
+        # numbers throughout. Single phase changes only the per-phase block:
+        # eighteen entities read it (fifteen inverter phase readings, three
+        # grid phase voltages), and a single-phase unit simply leaves phases
+        # B and C absent rather than needing a separate entity set.
+        assert get_device_type("", "RE41TEST00000001") == DEVICE_TYPE_OCEAN2
+
+    def test_the_prefix_beats_a_powerocean_product_name(self) -> None:
+        # "PowerOcean" as a product name would otherwise claim the unit and
+        # hand it to a parser that decodes none of its frames. The prefix is
+        # exact evidence and is checked first.
+        assert get_device_type("PowerOcean", "RE11TEST00000001") == DEVICE_TYPE_OCEAN2
+
+    def test_powerocean_is_unaffected(self) -> None:
+        assert get_device_type("PowerOcean", "HJ31000000000000") == (
+            DEVICE_TYPE_POWEROCEAN
+        )
+
+    def test_display_name_falls_back_to_the_prefix(self) -> None:
+        # The app API reports an empty product name for this device.
+        assert get_device_name("", "RE11TEST00001234") == "Ocean 2 (1234)"
+        assert get_device_name("", "RE17TEST00001234") == "Ocean 2 (1234)"
+        assert get_device_name("", "RE41TEST00001234") == "Ocean 2 Plus (1234)"
+
+
+class TestTelemetryFrame:
+    def test_reads_the_system_summary(self) -> None:
+        # PV 3210 W, SoC 81.5 %, 4110 Wh left in the pack.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(summary=_f32(4, 3210.0) + _f32(15, 4110.0) + _f32(17, 81.5))
+        )
+        assert parsed is not None
+        assert parsed["solar_w"] == pytest.approx(3210.0)
+        assert parsed["soc_pct"] == pytest.approx(81.5)
+        assert parsed["batt_remaining_wh"] == pytest.approx(4110.0)
+
+    def test_reads_the_balanced_energy_flow_block(self) -> None:
+        # PV 3210 - battery 1500 - grid (-1847) = home 560, and it adds up.
+        flow = _f32(1, 560.0) + _f32(2, -1847.0) + _f32(3, 3210.0) + _f32(4, 1500.0)
+        parsed = parse_ocean2_proto_message(_telemetry(flow={87: flow}))
+        assert parsed is not None
+        assert parsed["home_w"] == pytest.approx(560.0)
+        assert parsed["solar_w"] == pytest.approx(3210.0)
+        assert parsed["batt_w"] == pytest.approx(1500.0)
+
+    def test_block_87_wins_over_block_7(self) -> None:
+        # Observed on hardware: block 7 trails block 87 by about one
+        # measurement cycle, and the app shows what block 87 reports.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(flow={7: _f32(1, 550.0), 87: _f32(1, 560.0)})
+        )
+        assert parsed is not None
+        assert parsed["home_w"] == pytest.approx(560.0)
+
+    def test_block_87_wins_over_block_7_for_solar(self) -> None:
+        # Same precedence, checked on the field that used to take the
+        # opposite block (7 before 87) before the source-precedence fix.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(flow={7: _f32(3, 3100.0), 87: _f32(3, 3210.0)})
+        )
+        assert parsed is not None
+        assert parsed["solar_w"] == pytest.approx(3210.0)
+
+    def test_a_missing_field_does_not_overwrite_a_good_value(self) -> None:
+        # Block 87 carries only the home load here. Block 7's grid reading has
+        # to survive, because telemetry is partial by design.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(flow={7: _f32(1, 550.0) + _f32(2, -1200.0), 87: _f32(1, 560.0)})
+        )
+        assert parsed is not None
+        assert parsed["home_w"] == pytest.approx(560.0)
+        assert parsed["grid_w"] == pytest.approx(-1200.0)
+
+    def test_the_flow_block_wins_over_inverter_field_13(self) -> None:
+        # Both read the grid from their own instant; the flow block is the
+        # one that balances with the other three readings of its instant.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(flow={87: _f32(2, -1800.0)}, inverter=_f32(13, 1719.0))
+        )
+        assert parsed is not None
+        assert parsed["grid_w"] == pytest.approx(-1800.0)
+
+    def test_inverter_field_13_is_a_fallback_for_a_frame_without_the_flow_block(
+        self,
+    ) -> None:
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=_f32(13, 1719.0)))
+        assert parsed is not None
+        assert parsed["grid_w"] == pytest.approx(1719.0)
+
+    def test_the_flow_block_wins_over_the_summary_for_solar(self) -> None:
+        # 65.4 and 87.3 read the same quantity from different instants; the
+        # flow block is the one that balances with home/grid/battery.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(summary=_f32(4, 3193.0), flow={87: _f32(3, 3210.0)})
+        )
+        assert parsed is not None
+        assert parsed["solar_w"] == pytest.approx(3210.0)
+
+    def test_reads_per_string_pv_power(self) -> None:
+        strings = _msg(14, _pv_string(1, 1780.0) + _pv_string(2, 1430.0))
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=strings))
+        assert parsed is not None
+        assert parsed["pv1_w"] == pytest.approx(1780.0)
+        assert parsed["pv2_w"] == pytest.approx(1430.0)
+
+    def test_reads_the_inverter_ac_power(self) -> None:
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=_f32(1, 2450.0)))
+        assert parsed is not None
+        assert parsed["pcs_ac_power_w"] == pytest.approx(2450.0)
+
+    def test_drops_a_non_finite_inverter_ac_power(self) -> None:
+        # A NaN reaching a sensor raises inside Home Assistant's rounding;
+        # the grid fallback on the same inverter block must survive it.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(inverter=_f32(1, float("nan")) + _f32(13, 1719.0))
+        )
+        assert parsed is not None
+        assert "pcs_ac_power_w" not in parsed
+        assert parsed["grid_w"] == pytest.approx(1719.0)
+
+    def test_reports_a_resting_battery_as_zero(self) -> None:
+        parsed = parse_ocean2_proto_message(_telemetry(summary=_f32(20, 0.0)))
+        assert parsed is not None
+        assert parsed["batt_w"] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize(
+        ("summary_value", "expected"),
+        [(-871.0, 871.0), (1859.0, -1859.0)],
+    )
+    def test_the_summary_battery_field_is_signed_the_other_way(
+        self, summary_value: float, expected: float
+    ) -> None:
+        # Measured on an RE11 while charging: 65.20 runs negative where block
+        # 87.4 runs positive, so the sign is inverted rather than absent.
+        parsed = parse_ocean2_proto_message(_telemetry(summary=_f32(20, summary_value)))
+        assert parsed is not None
+        assert parsed["batt_w"] == pytest.approx(expected)
+
+    def test_the_flow_block_wins_over_the_summary(self) -> None:
+        # Both present: the flow block is the one that balances with the other
+        # three readings of its own instant.
+        parsed = parse_ocean2_proto_message(
+            _telemetry(summary=_f32(20, -871.0), flow={87: _f32(4, 880.0)})
+        )
+        assert parsed is not None
+        assert parsed["batt_w"] == pytest.approx(880.0)
+
+
+class TestInverterPhases:
+    def test_reads_two_reported_phases_and_leaves_the_third_absent(self) -> None:
+        container = _msg(
+            3,
+            _phase_record(
+                1,
+                field_index=6,
+                voltage=231.2,
+                current=4.1,
+                active_w=947.0,
+                reactive_var=12.0,
+                apparent_va=948.5,
+            )
+            + _phase_record(
+                2,
+                field_index=6,
+                voltage=230.8,
+                current=3.9,
+                active_w=900.0,
+                reactive_var=10.0,
+                apparent_va=901.2,
+            ),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["inv_phase_a_voltage_v"] == pytest.approx(231.2)
+        assert parsed["inv_phase_a_current_a"] == pytest.approx(4.1)
+        assert parsed["inv_phase_a_active_power_w"] == pytest.approx(947.0)
+        assert parsed["inv_phase_a_reactive_power_var"] == pytest.approx(12.0)
+        assert parsed["inv_phase_a_apparent_power_va"] == pytest.approx(948.5)
+        assert parsed["inv_phase_b_voltage_v"] == pytest.approx(230.8)
+        assert not any(key.startswith("inv_phase_c_") for key in parsed)
+
+    def test_drops_a_non_finite_inverter_phase_reading(self) -> None:
+        # A NaN reaching a sensor raises inside Home Assistant's rounding;
+        # the good readings on the same record must survive it.
+        container = _msg(
+            3,
+            _phase_record(
+                1, field_index=6, voltage=float("nan"), current=4.1, active_w=900.0
+            ),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert "inv_phase_a_voltage_v" not in parsed
+        assert parsed["inv_phase_a_current_a"] == pytest.approx(4.1)
+
+
+class TestGridPhases:
+    def test_reads_voltage_and_frequency_but_not_current_or_power(self) -> None:
+        # Field 2 (current) and field 4 (power) are present on the wire and
+        # must not reach the output - only voltage (field 1) and the shared
+        # frequency (field 3) are read here.
+        record = (
+            _f32(1, 231.0)
+            + _f32(2, 5.0)
+            + _f32(3, 50.02)
+            + _f32(4, 1150.0)
+            + _f32(5, 1.0)
+        )
+        container = _msg(4, _msg(1, record))
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["grid_phase_a_voltage_v"] == pytest.approx(231.0)
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(50.02)
+        assert "grid_phase_a_current_a" not in parsed
+        assert "grid_phase_a_power_w" not in parsed
+        assert not any("current" in key or "active_power" in key for key in parsed)
+
+    def test_frequency_appears_once_across_multiple_phase_records(self) -> None:
+        container = _msg(
+            4,
+            _phase_record(1, field_index=5, voltage=231.0, freq_hz=50.0)
+            + _phase_record(2, field_index=5, voltage=230.5, freq_hz=50.0)
+            + _phase_record(3, field_index=5, voltage=229.9, freq_hz=50.0),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(50.0)
+        assert parsed["grid_phase_a_voltage_v"] == pytest.approx(231.0)
+        assert parsed["grid_phase_b_voltage_v"] == pytest.approx(230.5)
+        assert parsed["grid_phase_c_voltage_v"] == pytest.approx(229.9)
+        # One shared key, never split per phase.
+        assert "grid_phase_a_freq_hz" not in parsed
+
+    def test_three_phase_frequency_comes_from_the_phase_a_record(self) -> None:
+        # Distinct values per phase, so that phase A and the last record
+        # differ: a real RE11 repeats one frequency, but the rule is pinned.
+        container = _msg(
+            4,
+            _phase_record(1, field_index=5, voltage=231.0, freq_hz=50.0)
+            + _phase_record(2, field_index=5, voltage=230.5, freq_hz=50.1)
+            + _phase_record(3, field_index=5, voltage=229.9, freq_hz=49.9),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(50.0)
+
+    def test_single_phase_frequency_survives_the_zero_records_around_it(self) -> None:
+        # Single-phase RE41 order: an unindexed record with 0.0 first, phase A
+        # with the real frequency, then B and C at 0.0. The last record used
+        # to win, which published 0.0 Hz for the whole device.
+        container = _msg(
+            4,
+            _msg(1, _f32(3, 0.0))
+            + _phase_record(1, field_index=5, voltage=231.0, freq_hz=49.94)
+            + _phase_record(2, field_index=5, freq_hz=0.0)
+            + _phase_record(3, field_index=5, freq_hz=0.0),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(49.94)
+        assert parsed["grid_phase_a_voltage_v"] == pytest.approx(231.0)
+
+    def test_frequency_falls_back_when_phase_a_carries_no_frequency_field(
+        self,
+    ) -> None:
+        # Phase A sends no field 3 at all: the first other indexed record
+        # with a frequency above zero stands in for it.
+        container = _msg(
+            4,
+            _phase_record(1, field_index=5, voltage=231.0)
+            + _phase_record(2, field_index=5, freq_hz=50.1)
+            + _phase_record(3, field_index=5, freq_hz=49.9),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(50.1)
+
+    def test_frequency_is_phase_a_whatever_the_record_order(self) -> None:
+        # Phase A is named by its index, not by its position in the block.
+        container = _msg(
+            4,
+            _phase_record(2, field_index=5, voltage=230.5, freq_hz=50.1)
+            + _phase_record(3, field_index=5, voltage=229.9, freq_hz=49.9)
+            + _phase_record(1, field_index=5, voltage=231.0, freq_hz=49.94),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(49.94)
+
+    def test_a_zero_sent_by_phase_a_is_published_not_replaced_by_another_phase(
+        self,
+    ) -> None:
+        # Phase A does send a frequency, and it is 0.0. That is the reading,
+        # even with a live-looking value on phase B.
+        container = _msg(
+            4,
+            _phase_record(1, field_index=5, voltage=0.0, freq_hz=0.0)
+            + _phase_record(2, field_index=5, freq_hz=50.1),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == 0.0
+
+    def test_an_unindexed_record_does_not_supply_the_frequency(self) -> None:
+        # Only records that name a phase count; a stray unindexed reading
+        # ahead of phase A must not stand in for the frequency.
+        container = _msg(
+            4,
+            _msg(1, _f32(3, 60.0))
+            + _phase_record(1, field_index=5, voltage=231.0, freq_hz=49.94),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(49.94)
+
+    def test_all_zero_indexed_records_publish_zero_hertz(self) -> None:
+        # A grid outage: every indexed record reports 0 V and 0 Hz. Zero is
+        # the reading, published next to the voltage of the same record.
+        container = _msg(
+            4,
+            _msg(1, _f32(3, 0.0))
+            + _phase_record(1, field_index=5, voltage=0.0, freq_hz=0.0)
+            + _phase_record(2, field_index=5, freq_hz=0.0)
+            + _phase_record(3, field_index=5, freq_hz=0.0),
+        )
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert parsed["pcs_ac_freq_hz"] == 0.0
+        assert parsed["grid_phase_a_voltage_v"] == 0.0
+
+    def test_a_grid_outage_frame_replaces_the_last_frequency_after_the_merge(
+        self,
+    ) -> None:
+        # The coordinator merges every frame with `dict.update`, so a key the
+        # parser leaves out keeps its old value. After a 50 Hz frame, an
+        # all-zero indexed frame must therefore carry the 0.0 itself.
+        live = _msg(
+            4,
+            _msg(1, _f32(3, 0.0))
+            + _phase_record(1, field_index=5, voltage=231.0, freq_hz=49.94)
+            + _phase_record(2, field_index=5, freq_hz=0.0)
+            + _phase_record(3, field_index=5, freq_hz=0.0),
+        )
+        outage = _msg(
+            4,
+            _msg(1, _f32(3, 0.0))
+            + _phase_record(1, field_index=5, voltage=0.0, freq_hz=0.0)
+            + _phase_record(2, field_index=5, freq_hz=0.0)
+            + _phase_record(3, field_index=5, freq_hz=0.0),
+        )
+        state: dict[str, float] = {}
+        for container in (live, outage):
+            parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+            assert parsed is not None
+            state.update(parsed)
+        assert state["pcs_ac_freq_hz"] == 0.0
+        assert state["grid_phase_a_voltage_v"] == 0.0
+
+    def test_drops_a_non_finite_grid_phase_voltage(self) -> None:
+        record = _f32(1, float("nan")) + _f32(3, 50.0) + _f32(5, 1.0)
+        container = _msg(4, _msg(1, record))
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=container))
+        assert parsed is not None
+        assert "grid_phase_a_voltage_v" not in parsed
+        assert parsed["pcs_ac_freq_hz"] == pytest.approx(50.0)
+
+
+class TestPVStringElectricals:
+    def test_reads_voltage_and_current_alongside_power(self) -> None:
+        strings = _msg(14, _pv_string(1, 1780.0, volts=385.2, amps=4.62))
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=strings))
+        assert parsed is not None
+        assert parsed["pv1_w"] == pytest.approx(1780.0)
+        assert parsed["pv1_voltage_v"] == pytest.approx(385.2)
+        assert parsed["pv1_current_a"] == pytest.approx(4.62)
+
+    def test_drops_a_non_finite_pv_string_voltage(self) -> None:
+        # The bad voltage must not blank out the power and current readings
+        # from the same string record.
+        strings = _msg(14, _pv_string(1, 1780.0, volts=float("nan"), amps=4.62))
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=strings))
+        assert parsed is not None
+        assert "pv1_voltage_v" not in parsed
+        assert parsed["pv1_w"] == pytest.approx(1780.0)
+        assert parsed["pv1_current_a"] == pytest.approx(4.62)
+
+
+class TestDirectionalSplits:
+    @pytest.mark.parametrize(
+        ("grid_w", "expected_import", "expected_export"),
+        [(1719.0, 1719.0, 0.0), (-1847.0, 0.0, 1847.0), (0.0, 0.0, 0.0)],
+    )
+    def test_splits_grid_power(
+        self, grid_w: float, expected_import: float, expected_export: float
+    ) -> None:
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=_f32(13, grid_w)))
+        assert parsed is not None
+        assert parsed["grid_import_power_w"] == pytest.approx(expected_import)
+        assert parsed["grid_export_power_w"] == pytest.approx(expected_export)
+
+    @pytest.mark.parametrize(
+        ("batt_w", "expected_charge", "expected_discharge"),
+        [(1500.0, 1500.0, 0.0), (-900.0, 0.0, 900.0)],
+    )
+    def test_splits_battery_power(
+        self, batt_w: float, expected_charge: float, expected_discharge: float
+    ) -> None:
+        parsed = parse_ocean2_proto_message(_telemetry(flow={87: _f32(4, batt_w)}))
+        assert parsed is not None
+        assert parsed["batt_charge_power_w"] == pytest.approx(expected_charge)
+        assert parsed["batt_discharge_power_w"] == pytest.approx(expected_discharge)
+
+    def test_writes_both_halves_so_neither_sensor_freezes(self) -> None:
+        # A charge that stops has to push the discharge side to 0 as well;
+        # otherwise its energy counter keeps integrating a flow that ended.
+        parsed = parse_ocean2_proto_message(_telemetry(flow={87: _f32(4, 0.0)}))
+        assert parsed is not None
+        assert parsed["batt_charge_power_w"] == pytest.approx(0.0)
+        assert parsed["batt_discharge_power_w"] == pytest.approx(0.0)
+
+
+class TestRobustness:
+    def test_drops_a_non_finite_reading(self) -> None:
+        # A NaN reaching a sensor raises inside Home Assistant's rounding and
+        # aborts the rest of that update.
+        parsed = parse_ocean2_proto_message(_telemetry(inverter=_f32(13, float("nan"))))
+        assert parsed is None or "grid_w" not in parsed
+
+    def test_ignores_frames_from_other_command_ids(self) -> None:
+        # cmd_id 46 is the per-module battery frame. A telemetry-shaped body
+        # sent under it declares no module fields, so it must not be decoded
+        # through the telemetry layout either.
+        payload = _frame(_msg(65, _f32(4, 3210.0)), cmd_id=46)
+        assert parse_ocean2_proto_message(payload) is None
+
+    @pytest.mark.parametrize("payload", [b"", b"\x00", b"\x0a\xff", b"not protobuf"])
+    def test_survives_malformed_input(self, payload: bytes) -> None:
+        assert parse_ocean2_proto_message(payload) is None
+
+    def test_returns_none_when_no_mapped_field_is_present(self) -> None:
+        assert parse_ocean2_proto_message(_frame(_vint(999, 1))) is None
+
+    def test_decodes_a_xor_masked_payload(self) -> None:
+        pdata = _msg(65, _f32(17, 81.5))
+        masked = bytes(b ^ 0x2A for b in pdata)
+        header = (
+            _msg(1, masked)
+            + _vint(6, 1)
+            + _vint(8, 254)
+            + _vint(9, 39)
+            + _vint(14, 0x2A)
+        )
+        parsed = parse_ocean2_proto_message(_msg(1, header))
+        assert parsed is not None
+        assert parsed["soc_pct"] == pytest.approx(81.5)
+
+
+def _module(index: int, body: bytes = b"") -> bytes:
+    """A `254/46` frame: one module per header, module number in 5.15."""
+    return _frame(_msg(5, _vint(15, index) + body), cmd_id=46)
+
+
+class TestModuleFrame:
+    def test_reads_one_module(self) -> None:
+        # Power 1122.59 W, SoH 100 %, 4 cycles - the readings confirmed
+        # against a four-week-old system on 2026-07-28.
+        # 39 for the state of health, as a float - field 3 carries the same
+        # number as a varint, which is how the two are told apart.
+        body = _f32(1, 1122.59) + _f32(39, 100.0) + _vint(17, 4) + _f32(38, 81.5)
+        parsed = parse_ocean2_proto_message(_module(1, body))
+        assert parsed is not None
+        assert parsed["module1_power_w"] == pytest.approx(1122.59, rel=1e-4)
+        assert parsed["module1_soh_pct"] == pytest.approx(100.0)
+        assert parsed["module1_cycles"] == 4
+        assert parsed["module1_soc_pct"] == pytest.approx(81.5)
+
+    def test_reads_the_state_of_health_as_a_float_from_39(self) -> None:
+        # Field 3 holds the same number as a varint on real frames. Declaring
+        # it as a float made the walker reject it on type and left the entity
+        # empty - a mistake the earlier tests hid by building 3 as a float.
+        parsed = parse_ocean2_proto_message(_module(1, _vint(3, 100) + _f32(39, 97.5)))
+        assert parsed is not None
+        assert parsed["module1_soh_pct"] == pytest.approx(97.5)
+
+    def test_keeps_modules_apart(self) -> None:
+        # A frame bundles one header per module - two here, fourteen on a
+        # large installation. Readings must not bleed between them.
+        payload = _module(1, _f32(1, 1122.0)) + _module(2, _f32(1, -880.0))
+        parsed = parse_ocean2_proto_message(payload)
+        assert parsed is not None
+        assert parsed["module1_power_w"] == pytest.approx(1122.0)
+        assert parsed["module2_power_w"] == pytest.approx(-880.0)
+
+    def test_publishes_the_hottest_power_electronics_reading(self) -> None:
+        # Four board readings, one entity: the hottest is what matters, and
+        # four near-identical sensors per module would be noise at fourteen.
+        body = _f32(23, 41.0) + _f32(24, 47.5) + _f32(32, 39.0) + _f32(33, 44.0)
+        parsed = parse_ocean2_proto_message(_module(1, body))
+        assert parsed is not None
+        assert parsed["module1_mos_temp_c"] == pytest.approx(47.5)
+
+    def test_keeps_the_cell_temperatures_apart(self) -> None:
+        # min <= average <= max holds in every frame; they are separate
+        # readings, not one value rounded three ways.
+        body = _f32(21, 24.0) + _f32(30, 26.0) + _f32(31, 22.0)
+        parsed = parse_ocean2_proto_message(_module(1, body))
+        assert parsed is not None
+        assert parsed["module1_cell_temp_c"] == pytest.approx(24.0)
+        assert parsed["module1_cell_temp_max_c"] == pytest.approx(26.0)
+        assert parsed["module1_cell_temp_min_c"] == pytest.approx(22.0)
+
+    def test_drops_a_module_without_a_number(self) -> None:
+        # Without 5.15 there is nothing to attach the readings to, and
+        # guessing a position would file one module's cells under another.
+        payload = _frame(_msg(5, _f32(1, 1122.0)), cmd_id=46)
+        assert parse_ocean2_proto_message(payload) is None
+
+    @pytest.mark.parametrize("index", [0, MAX_MODULES + 1, 99])
+    def test_ignores_an_out_of_range_module_number(self, index: int) -> None:
+        assert parse_ocean2_proto_message(_module(index, _f32(1, 1.0))) is None
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_drops_a_non_finite_module_number_instead_of_raising(
+        self, bad: float
+    ) -> None:
+        # `int()` on a NaN or an infinity raises; the shared scalar decoder now
+        # skips such a field, so a module number that is not finite leaves the
+        # frame without one and the frame is dropped. The number is the only
+        # 5.15 here: a frame that also carries a valid one keeps it, because
+        # the invalid field is skipped rather than overriding it.
+        payload = _frame(_msg(5, _f32(15, bad) + _f32(1, 1122.0)), cmd_id=46)
+        assert parse_ocean2_proto_message(payload) is None
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_keeps_a_valid_module_number_beside_a_non_finite_one(
+        self, bad: float
+    ) -> None:
+        # The other half of the comment above: the invalid 5.15 is skipped,
+        # so the valid one that follows still files the reading.
+        body = _f32(15, bad) + _f32(15, 2.0) + _f32(1, 1122.0)
+        parsed = parse_ocean2_proto_message(_frame(_msg(5, body), cmd_id=46))
+        assert parsed is not None
+        assert parsed["module2_power_w"] == pytest.approx(1122.0)
+
+    def test_drops_a_non_finite_module_reading(self) -> None:
+        # A NaN or an infinity reaching a sensor raises inside Home
+        # Assistant's rounding, the same reason the telemetry frame drops
+        # them - the module frame decodes through a different function and
+        # needs the same guard rather than inheriting it.
+        payload = _module(1, _f32(1, float("nan")) + _f32(38, 81.5))
+        parsed = parse_ocean2_proto_message(payload)
+        assert parsed is not None
+        assert "module1_power_w" not in parsed
+        assert parsed["module1_soc_pct"] == pytest.approx(81.5)
+
+    def test_a_non_finite_power_electronics_reading_does_not_poison_the_max(
+        self,
+    ) -> None:
+        # max() over a list containing NaN returns NaN in Python - one bad
+        # board sensor must not blank out the other three good ones.
+        body = _f32(23, 41.0) + _f32(24, float("nan")) + _f32(32, 39.0) + _f32(33, 44.0)
+        parsed = parse_ocean2_proto_message(_module(1, body))
+        assert parsed is not None
+        assert parsed["module1_mos_temp_c"] == pytest.approx(44.0)
+
+    def test_reads_telemetry_and_modules_from_one_payload(self) -> None:
+        # Both frame types can arrive bundled; neither may swallow the other.
+        payload = _telemetry(summary=_f32(17, 81.5)) + _module(1, _f32(1, 1122.0))
+        parsed = parse_ocean2_proto_message(payload)
+        assert parsed is not None
+        assert parsed["soc_pct"] == pytest.approx(81.5)
+        assert parsed["module1_power_w"] == pytest.approx(1122.0)
+
+
+class TestRealModuleFrames:
+    """Two `254/46` payloads captured from an RE11 while the pack rested.
+
+    Serial numbers are replaced length-preservingly - protobuf carries a
+    length before every field, so a shorter replacement would make
+    everything after it unreadable and the fixture worthless for the purpose
+    it was taken for.
+    """
+
+    MODULE_1 = (
+        "081e2ae7020d00000000106318642a140000e8410000e0410000e0410000e0410000d841"
+        "3500d056453d0040554540014d48e1884155f0480bbf5d76be5644650000000068007214"
+        "00d0564500d0564500f055450040554500d0564578018201105858585858585858585858"
+        "58585858588801239001009d0100002f45a50100c02845ad010000e041b5010000e841bd"
+        "010000e041c5010000e041cd0100001042d001e8d1a005d801c9f0a305e001909513e801"
+        "d98f13f5010000e841fd010000d84185020000e0418d020000d8419002009802ffff03a0"
+        "0221a802cebfafd506b5021c32c742bd020000c842c00220c80205d00264d80201e00200"
+        "e80283d001f00201f802ab828408800385808408880302900301980301a00300a803f701"
+        "b50391ff9c45bd031c32c742c50300000000cd031c32c742d5031c32c742dd0300000000"
+        "e50343a0c742ed0300acc742f00300f803008004008804bead0b9004b3870ba00402ad04"
+        "00a05645"
+    )
+    MODULE_2 = (
+        "081e2ae7020d00000000106318642a140000d8410000d8410000d8410000d0410000d041"
+        "35007056453d00f0544540014da4708841555d1710bf5d94c35644650000000068007214"
+        "00f05445001056450070564500e0554500d0554578028201105858585858585858585858"
+        "58585858588801239001009d0100c02845a50100c02845ad010000d841b5010000e041bd"
+        "010000d841c5010000d841cd0100000c42d001fcb99e05d8018bb1a105e001909513e801"
+        "d98f13f5010000d841fd010000d04185020000d8418d020000d8419002009802ffff03a0"
+        "0221a802a3bfafd506b5025b37c742bd020000c842c00220c80205d00264d80201e00200"
+        "e80283d001f00201f802ab828408800385808408880302900301980301a00300a803f701"
+        "b50391ff9c45bd031c32c742c50300000000cd031c32c742d5031c32c742dd0300000000"
+        "e50343a0c742ed0300acc742f00300f803008004008804bead0b9004b3870ba00402ad04"
+        "00f05445"
+    )
+
+    # A `254/46` record captured while the module was actually discharging
+    # (~2.3 kW), not resting - the two frames above hit 0.0 W on field 1 and
+    # cannot verify the mapping, its scale or its sign, however real they
+    # are. Same 2026-09-07 RE11 recording, serial already masked in the
+    # capture on file.
+    MODULE_3 = (
+        "081e2ae8020d24230dc5105718642a1400000442000004420000004200000042000000"
+        "423500404c453d00104c4540014dec518241552b690bc35d86ce454465b8d80ac36800"
+        "721400404c4500304c4500204c4500104c4500204c4578018201105858585858585858"
+        "58585858585858588801229001009d0100009645a50100c08f45ad010000f041b50100"
+        "001c42bd0100002c42c50100003442cd0100003042d001ecb28c05d801b28f8e05e001"
+        "909513e801ee8f13f50100000442fd01000000428502000040428d0200003442900200"
+        "9802ffff03a00221a802efd6fad406b50265ddae42bd020000c842c00200c80205d002"
+        "64d80201e00200e80283d001f00201f802ab8284088003858084088803029003019803"
+        "01a0039901a8038402b50328138945bd03689eae42c50300000000cd0365ddae42d503"
+        "65ddae42dd035a2c783fe503b0a4c742ed0366aec742f00300f803008004008804d1fe"
+        "0a9004bdda0aa00402ad0400304c45"
+    )
+
+    def test_decodes_a_real_frame(self) -> None:
+        parsed = parse_ocean2_proto_message(
+            _frame(bytes.fromhex(self.MODULE_1), cmd_id=46)
+        )
+        assert parsed is not None
+        # State of charge moves, state of health does not - the pair that
+        # was mapped the wrong way round before.
+        assert parsed["module1_soc_pct"] == pytest.approx(99.598, abs=0.01)
+        assert parsed["module1_soh_pct"] == pytest.approx(100.0)
+        assert parsed["module1_remaining_wh"] == pytest.approx(5023.9, abs=0.1)
+        assert parsed["module1_cycles"] == 35
+
+    def test_the_cell_voltage_is_millivolts(self) -> None:
+        # 3437 mV, not 3437 V. Five cells in series at 3.437 V make 17.19 V
+        # against the 17.11 V the module reports as its own voltage - which
+        # is both the scale check and the proof that 5.6 is a cell.
+        parsed = parse_ocean2_proto_message(
+            _frame(bytes.fromhex(self.MODULE_1), cmd_id=46)
+        )
+        assert parsed is not None
+        cell_mv = parsed["module1_cell_voltage_mv"]
+        pack_v = parsed["module1_voltage_v"]
+        assert cell_mv == pytest.approx(3437.0)
+        assert 5 * cell_mv / 1000 == pytest.approx(pack_v, abs=0.2)
+
+    def test_reads_a_real_bundle_as_two_modules(self) -> None:
+        # The bundle size is not the module count: a frame carries one header
+        # per heartbeat, and a capture with bundles of fourteen still held
+        # only two distinct module numbers.
+        payload = _frame(bytes.fromhex(self.MODULE_1), cmd_id=46) + _frame(
+            bytes.fromhex(self.MODULE_2), cmd_id=46
+        )
+        parsed = parse_ocean2_proto_message(payload)
+        assert parsed is not None
+        assert parsed["module1_soc_pct"] == pytest.approx(99.598, abs=0.01)
+        assert parsed["module2_soc_pct"] == pytest.approx(99.608, abs=0.01)
+        assert parsed["module1_voltage_v"] != parsed["module2_voltage_v"]
+
+    def test_the_power_reading_holds_up_while_the_module_is_loaded(self) -> None:
+        # MODULE_1 and MODULE_2 are both a resting pack (field 1 is 0.0 in
+        # both), which cannot verify a power mapping, its scale, or its sign
+        # - MODULE_3 is a real record from the same capture with the module
+        # under ~2.3 kW load.
+        parsed = parse_ocean2_proto_message(
+            _frame(bytes.fromhex(self.MODULE_3), cmd_id=46)
+        )
+        assert parsed is not None
+        power = parsed["module1_power_w"]
+        voltage = parsed["module1_voltage_v"]
+        current = parsed["module1_current_a"]
+
+        # V x I hits the reported power within 1%.
+        assert voltage * current == pytest.approx(power, rel=0.01)
+
+        # Signed like the system reading: positive charges, negative
+        # discharges. A negative current here (power flowing out of the
+        # module) has to land on a negative power.
+        assert current < 0
+        assert power < 0
+
+
+class TestBackupReserveFields:
+    """Top-level 10 (backup reserve %) and 92 (edev SoC ratio %)."""
+
+    @pytest.mark.parametrize("invert_ac_sign", [False, True])
+    def test_snapshot_carries_reserve_and_ratio_untouched_by_the_sign_flip(
+        self, invert_ac_sign: bool
+    ) -> None:
+        # Field 8 (a discharge-down limit, 0 in every snapshot) is present
+        # and undeclared. The inverter block rides along so the flip has
+        # something real to act on: it must reach 4.1 and nothing else.
+        rest = (
+            _vint(10, 29)
+            + _vint(92, 80)
+            + _msg(65, _f32(17, 55.0))
+            + _msg(4, _f32(1, 1200.0))
+        )
+        parsed = parse_ocean2_proto_message(
+            _frame(_vint(8, 0) + rest), invert_ac_sign=invert_ac_sign
+        )
+        assert parsed is not None
+        assert parsed["backup_reserve_pct"] == 29
+        assert parsed["edev_soc_ratio_pct"] == 80
+        assert parsed["soc_pct"] == pytest.approx(55.0)
+        assert parsed["pcs_ac_power_w"] == pytest.approx(
+            -1200.0 if invert_ac_sign else 1200.0
+        )
+        # Field 8 contributes nothing: the same frame without it parses to
+        # the identical result, so no key was declared for it.
+        assert parsed == parse_ocean2_proto_message(
+            _frame(rest), invert_ac_sign=invert_ac_sign
+        )
+
+    def test_a_push_without_the_fields_leaves_both_keys_absent(self) -> None:
+        # The change-only pushes carry blocks 7 / 65 / 87 and never the
+        # settings. An absent key means "no update", never zero: a default
+        # of 0 here would write a 0 % reserve over the real one on every push.
+        payload = _telemetry(
+            summary=_f32(17, 55.0),
+            flow={
+                7: _f32(1, 800.0) + _f32(3, 2000.0),
+                87: _f32(1, 810.0) + _f32(3, 2010.0),
+            },
+        )
+        parsed = parse_ocean2_proto_message(payload)
+        assert parsed is not None
+        assert parsed["soc_pct"] == pytest.approx(55.0)
+        assert "backup_reserve_pct" not in parsed
+        assert "edev_soc_ratio_pct" not in parsed
+
+    def test_a_present_zero_reserve_is_published(self) -> None:
+        # proto3 optional: an explicit 0 on the wire is a real 0 % reserve,
+        # and must not be mistaken for an absent field.
+        parsed = parse_ocean2_proto_message(_frame(_vint(10, 0)))
+        assert parsed is not None
+        assert parsed["backup_reserve_pct"] == 0
+        assert "edev_soc_ratio_pct" not in parsed
+
+
+# The field-3 record of a get_reply full upload from an RE11 (tag and length
+# included), as a user's recording carries it: work mode 1, state 7, and an
+# explicit 3.10 = 0 (`50 00`) among seventeen sub-fields.
+_EMS_RECORD = bytes.fromhex(
+    "1a250800100118072000286430023800400148005000583260016810700178008001810488010e"
+)
+
+_EMS_KEYS = (
+    "ems_work_mode",
+    "ems_work_state",
+    "ems_control_mode",
+)
+
+
+class TestEmsStatusFields:
+    """Field 3 of the snapshot: work mode (3.2), state (3.3), control mode (3.10)."""
+
+    def test_the_real_snapshot_record_gives_all_three_states(self) -> None:
+        parsed = parse_ocean2_proto_message(
+            _frame(_EMS_RECORD + _msg(65, _f32(17, 55.0)))
+        )
+        assert parsed is not None
+        assert parsed["ems_work_mode"] == "self_use"
+        assert parsed["ems_work_state"] == "running"
+        assert parsed["ems_control_mode"] == "none"
+        # The rest of the frame still parses around the nested record.
+        assert parsed["soc_pct"] == pytest.approx(55.0)
+
+    def test_a_push_without_field_3_leaves_the_keys_absent(self) -> None:
+        # The change-only pushes carry blocks 7 / 65 / 87 and, as a rule, no
+        # field 3 (one property frame in the 2026-09-19 RE11 recording has it).
+        # An absent key means "no update": the last state must stay in place.
+        payload = _telemetry(
+            summary=_f32(17, 55.0),
+            flow={7: _f32(1, 800.0), 87: _f32(1, 810.0)},
+        )
+        parsed = parse_ocean2_proto_message(payload)
+        assert parsed is not None
+        assert parsed["soc_pct"] == pytest.approx(55.0)
+        assert not set(_EMS_KEYS) & set(parsed)
+
+    def test_an_explicit_zero_control_mode_is_none_not_absent(self) -> None:
+        # 3.10 = 0 means no override is active. It is a value, so it must
+        # survive; 3.2 and 3.3 are not on the wire here and stay absent.
+        parsed = parse_ocean2_proto_message(_frame(_msg(3, _vint(10, 0))))
+        assert parsed is not None
+        assert parsed["ems_control_mode"] == "none"
+        assert "ems_work_mode" not in parsed
+        assert "ems_work_state" not in parsed
+
+    def test_values_the_device_has_not_shown_are_omitted(self) -> None:
+        # 3.2 = 0 is not a mode, 3.3 = 12 and 3.10 = 99 are outside the tables.
+        # Present-but-unknown must not become a guessed state or the previous
+        # one rewritten.
+        record = _msg(3, _vint(2, 0) + _vint(3, 12) + _vint(10, 99))
+        parsed = parse_ocean2_proto_message(_frame(record + _msg(65, _f32(17, 40.0))))
+        assert parsed is not None
+        assert parsed["soc_pct"] == pytest.approx(40.0)
+        assert not set(_EMS_KEYS) & set(parsed)
+
+        # A frame with nothing else in it yields no result at all.
+        assert parse_ocean2_proto_message(_frame(record)) is None
+
+    @pytest.mark.parametrize(
+        ("sub_field", "key", "names"),
+        [
+            (2, "ems_work_mode", {1: "self_use", 2: "ai_schedule"}),
+            (
+                3,
+                "ems_work_state",
+                {
+                    0: "none",
+                    1: "init",
+                    2: "idle",
+                    3: "startup_ext_bp",
+                    4: "startup_inner_bp",
+                    5: "startup_pv",
+                    6: "startup_grid",
+                    7: "running",
+                    8: "stop",
+                    9: "maintain",
+                },
+            ),
+            (
+                10,
+                "ems_control_mode",
+                {
+                    0: "none",
+                    1: "soc_calibration",
+                    2: "storm_guard",
+                    3: "eco",
+                    4: "task",
+                    5: "schedule",
+                    6: "ac_backup",
+                    7: "grid_operator",
+                    8: "remote",
+                    9: "standby",
+                    10: "frequency_response",
+                    11: "third_party",
+                },
+            ),
+        ],
+    )
+    def test_every_wire_value_has_its_name(
+        self, sub_field: int, key: str, names: dict[int, str]
+    ) -> None:
+        for wire, name in names.items():
+            parsed = parse_ocean2_proto_message(_frame(_msg(3, _vint(sub_field, wire))))
+            assert parsed is not None, (key, wire)
+            assert parsed[key] == name, (key, wire)
+
+    def test_the_system_state_is_the_powerocean_table_not_a_copy(self) -> None:
+        # One distinction, one registration: the Ocean 2 sends the PowerOcean's
+        # EMS work states with the same meaning, so every wire value has to come
+        # out under the name the PowerOcean parser gives it.
+        assert len(EMS_WORK_STATES) == 10
+        for wire, name in EMS_WORK_STATES.items():
+            parsed = parse_ocean2_proto_message(_frame(_msg(3, _vint(3, wire))))
+            assert parsed is not None, wire
+            assert parsed["ems_work_state"] == name, wire
+
+    def test_field_3_ten_is_not_the_top_level_reserve(self) -> None:
+        # Top-level 10 is the backup reserve, 3.10 the control mode: the same
+        # number at two depths. Each reading comes from its own path.
+        parsed = parse_ocean2_proto_message(
+            _frame(_vint(10, 29) + _msg(3, _vint(10, 5)))
+        )
+        assert parsed is not None
+        assert parsed["backup_reserve_pct"] == 29
+        assert parsed["ems_control_mode"] == "schedule"
+
+
+_STORM_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "ocean2" / "storm_guard_frames.json"
+)
+_STORM_FIXTURE = json.loads(_STORM_FIXTURE_PATH.read_text())
+
+
+class TestStormGuardReadBack:
+    def test_the_three_recorded_snapshots_read_off_on_off(self) -> None:
+        # The app switched the guard on and then off between these three full
+        # snapshots (tags carry the order of the recording).
+        snapshots = [f for f in _STORM_FIXTURE["frames"] if f["role"] == "get_reply"]
+        assert [f["recording"] for f in snapshots] == ["2026-09-19"] * 3
+        states = []
+        for snapshot in snapshots:
+            parsed = parse_ocean2_proto_message(bytes.fromhex(snapshot["hex"]))
+            assert parsed is not None, snapshot["tag"]
+            states.append(parsed.get("storm_guard_enabled"))
+        assert states == [False, True, False]
+
+    def test_a_push_without_field_21_leaves_the_key_absent(self) -> None:
+        # The change-only pushes never carry the storm guard record. Absent
+        # means "no update", never "off": a default would switch the entity
+        # off on every push.
+        parsed = parse_ocean2_proto_message(_telemetry(summary=_f32(17, 55.0)))
+        assert parsed is not None
+        assert parsed["soc_pct"] == pytest.approx(55.0)
+        assert "storm_guard_enabled" not in parsed
+
+    def test_the_open_flag_and_end_time_do_not_stand_in_for_the_switch(self) -> None:
+        # 21.2 and 21.3 are not mapped. A record that carries them but not 21.1
+        # reports nothing, and one that carries all three reports only 21.1.
+        only_others = parse_ocean2_proto_message(
+            _frame(_vint(10, 29) + _msg(21, _vint(2, 1) + _vint(3, 1_760_000_000)))
+        )
+        assert only_others is not None
+        assert "storm_guard_enabled" not in only_others
+        full = parse_ocean2_proto_message(
+            _frame(_msg(21, _vint(1, 1) + _vint(2, 1) + _vint(3, 1_760_000_000)))
+        )
+        assert full == {"storm_guard_enabled": True}
+
+
+_RE41_FIXTURE = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "ocean2" / "re41_control_frames.json"
+    ).read_text()
+)
+
+
+def _re41_frame(kind: str) -> bytes:
+    """The recorded RE41 frame of one `kind` (looked up by name, not by index)."""
+    matches = [f for f in _RE41_FIXTURE["frames"] if f["kind"] == kind]
+    assert len(matches) == 1, kind
+    return bytes.fromhex(matches[0]["hex"])
+
+
+class TestRe41RecordedControlFrames:
+    def test_the_get_reply_before_the_switch_reads_zero_reserve_and_guard_off(
+        self,
+    ) -> None:
+        parsed = parse_ocean2_proto_message(_re41_frame("f21_080010001800"))
+        assert parsed is not None
+        assert parsed["backup_reserve_pct"] == 0
+        assert parsed["edev_soc_ratio_pct"] == 100
+        assert parsed["storm_guard_enabled"] is False
+
+    def test_the_read_back_after_the_app_switched_on_reads_true(self) -> None:
+        parsed = parse_ocean2_proto_message(_re41_frame("f21_0801"))
+        assert parsed is not None
+        assert parsed["storm_guard_enabled"] is True
+
+    def test_the_frame_after_the_off_write_carries_no_field_21(self) -> None:
+        # Absent means "no update", never "off" (see TestStormGuardReadBack).
+        parsed = parse_ocean2_proto_message(_re41_frame("no_f21"))
+        assert parsed is not None
+        assert "storm_guard_enabled" not in parsed
+
+
+_RE43_FIXTURE = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "ocean2" / "re43_control_frames.json"
+    ).read_text()
+)
+
+
+def _re43_frame(kind: str) -> bytes:
+    """The recorded RE43 snapshot of one `kind` (looked up by name, not by index)."""
+    matches = [
+        f
+        for f in _RE43_FIXTURE["frames"]
+        if f["kind"] == kind and f["role"] == "get_reply"
+    ]
+    assert len(matches) == 1, kind
+    return bytes.fromhex(matches[0]["hex"])
+
+
+class TestRe43RecordedReserveReadBack:
+    def test_the_snapshot_before_the_app_write_reads_reserve_10_ceiling_80(
+        self,
+    ) -> None:
+        parsed = parse_ocean2_proto_message(_re43_frame("reserve_10_ceiling_80"))
+        assert parsed is not None
+        assert parsed["backup_reserve_pct"] == 10
+        assert parsed["edev_soc_ratio_pct"] == 80
+
+    def test_the_snapshot_after_the_app_write_reads_reserve_30_ceiling_80(
+        self,
+    ) -> None:
+        parsed = parse_ocean2_proto_message(_re43_frame("reserve_30_ceiling_80"))
+        assert parsed is not None
+        assert parsed["backup_reserve_pct"] == 30
+        assert parsed["edev_soc_ratio_pct"] == 80

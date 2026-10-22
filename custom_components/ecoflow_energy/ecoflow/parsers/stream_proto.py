@@ -1,0 +1,520 @@
+"""Protobuf telemetry parser for EcoFlow Stream devices.
+
+Current scope targets BkSeries stream devices in app-auth MQTT mode.
+The parser was derived from the BK31 Stream AC Pro capture and is
+intentionally conservative: only fields observed repeatedly in live
+captures are mapped. The same parser is reused for other BK-series
+device prefixes until hardware-specific differences are identified.
+
+The map is prefix-blind on purpose. A BK01 Stream Micro carries a
+two-string PV front end and no battery, a BK31 carries a battery and no
+PV, and both describe those readings with the same field numbers in the
+same message. Which entities exist is decided per device prefix in
+`const.py`, not by forking this map.
+
+TODO: verify BK11 / BK41 / BK51 / BK61 field layouts against real
+hardware; the current implementation assumes the same protobuf frames
+and field numbers as BK31.
+
+Current field notes from dump analysis:
+- `grid_w` tracks the summed AC grid intake seen in the app "grid
+  connection" view and matches the group AC-side battery power (field
+  518, not mapped, see below) plus `home_from_grid_w` during charging
+  cycles.
+- `ac_grid_connection_power_w` is derived from the signed system grid
+  connection path and matches the app "grid connection" / "Netz-Anschluss"
+  value. It includes battery charging plus AC outlet pass-through load:
+  negative = input from grid, positive = output/feed-in.
+- `batt_w` is the signed per-unit battery power (positive = charging),
+  taken from the BMS frame `32/50` as `field 26 - field 27` (charge minus
+  discharge, whole watts, DC pack side). Both fields must be present. The
+  same two fields feed `batt_charge_power_w` / `batt_discharge_power_w`.
+  `254/21 field 518` is NOT used: it is a group aggregate (AC side) that
+  only one unit of a multi-unit group publishes, the others send 0.0
+  (#486). The BMS frame arrives about once a minute. AC outlet activity
+  is exposed separately via `ac_outlet_1_w` / `ac_outlet_2_w`.
+- `grid_w`, `home_w`, `solar_w`, `sys_grid_connection_power_w`,
+  `home_from_batt_w` and `home_from_grid_w` are system readings. In a group
+  of several units only one unit fills them; the others send 0.0, which is
+  published as None (unknown), see `_SYSTEM_BLOCK_KEYS` (#486).
+- `home_w` behaves like the overall active load path. In zero-export
+  discharge captures, `home_w` stays aligned with the group discharge power while
+  `ac_outlet_1_w` remains a diagnostic breakdown of that total rather
+  than an extra load to add on top.
+- `solar_w` appears to be Smart-Meter/App energy-flow data rather than
+  direct PV production on the AC-coupled battery. Without a paired meter
+  it may be absent or misleading, and in zero-export setups it can remain
+  zero until surplus power would be exported.
+- LED brightness is confirmed separately from battery health:
+  `254/21 field 994` carries the live brightness percentage and is the
+  only field mapped to `led_brightness`. `254/18 field 384` carries the
+  set/ack (slider target) value and is intentionally not mapped, so the
+  live value never flaps to the slider target on a SET acknowledgement.
+  `32/50 field 15` stayed at `100` throughout the dedicated LED capture
+  and does not track brightness changes.
+"""
+
+from __future__ import annotations
+
+import struct
+from math import isfinite
+from typing import Any
+
+from ..proto.decoder import decode_header_message
+
+_TYPE_INT = "int"
+_TYPE_FLOAT = "float"
+_FLOAT_ZERO_EPS = 1e-6
+
+# The unit's own state of charge offered as a stand-in for `soc_pct` when a
+# message carries no system figure. Private: the coordinator promotes it on
+# a single unit and drops it once a system figure has been seen (#323).
+SOC_FALLBACK_KEY = "_soc_pct_fallback"
+
+# cmd_func/cmd_id -> field_number -> (sensor_key, scalar_type)
+_STREAM_FIELD_MAP: dict[tuple[int, int], dict[int, tuple[str, str]]] = {
+    # Main status frame (observed every few seconds)
+    (254, 21): {
+        # Two states of charge, and they are only the same number on a single
+        # unit. 262 is the system figure a linked pair reports as one battery
+        # (the app's System SOC), 242 is this unit's own BMS. Both used to
+        # land on `soc_pct`, so on two units joined by a parallel cable the
+        # battery sensor flapped between them with every frame (#323).
+        242: ("unit_soc_pct", _TYPE_INT),
+        262: ("soc_pct", _TYPE_INT),
+        270: ("max_charge_soc_pct", _TYPE_INT),
+        271: ("min_discharge_soc_pct", _TYPE_INT),
+        # PV string 1 input. Both are floats on the wire; the vendor quota
+        # exposes the same two values as `plugInInfoPvVol` / `plugInInfoPvAmp`,
+        # and `380 * 381` reproduces the PV 1 power in field 361.
+        380: ("pv_voltage_v", _TYPE_FLOAT),
+        381: ("pv_current_a", _TYPE_FLOAT),
+        442: ("pv2_voltage_v", _TYPE_FLOAT),
+        71: ("pv2_current_a", _TYPE_FLOAT),
+        # Per-string PV power. The sum of both equals the grid connection
+        # power in field 616 on units that feed everything into the grid.
+        361: ("pv1_w", _TYPE_FLOAT),
+        70: ("pv2_w", _TYPE_FLOAT),
+        # Strings 3 and 4 on the four-input units. In two frames from a
+        # Stream Ultra X with strings 2-4 wired, `70 + 996 + 997` equals the
+        # solar total in field 517 (764.4 vs 763 W, 337.4 vs 335 W). Which of
+        # the two is string 3 and which is string 4 is UNVERIFIED: only their
+        # sum is pinned down, so a swap would show up as PV 3 and PV 4
+        # exchanging values against the app.
+        # Fields 998-1001 are the voltage and current of those same two
+        # strings. In one frame from a Stream Ultra X, `998 * 999` = 21.23 W
+        # matches 996 and `1000 * 1001` = 39.33 W matches 997, so the pairing
+        # follows the power fields. The string 3/4 assignment is as above.
+        996: ("pv3_w", _TYPE_FLOAT),
+        997: ("pv4_w", _TYPE_FLOAT),
+        998: ("pv3_voltage_v", _TYPE_FLOAT),
+        999: ("pv3_current_a", _TYPE_FLOAT),
+        1000: ("pv4_voltage_v", _TYPE_FLOAT),
+        1001: ("pv4_current_a", _TYPE_FLOAT),
+        461: ("backup_reserve_pct", _TYPE_INT),
+        # Configured feed-in cap in watts (user-changeable in the app).
+        521: ("feed_grid_power_limit_w", _TYPE_INT),
+        # Summed AC intake from grid. Charge-dump correlation:
+        # grid_w ~= (group AC-side battery power, field 518) + home_from_grid_w.
+        515: ("grid_w", _TYPE_FLOAT),
+        # Overall active load path. Outlet power appears to be included in
+        # this total and is published separately for diagnostics.
+        516: ("home_w", _TYPE_FLOAT),
+        517: ("solar_w", _TYPE_FLOAT),
+        # Field 518 is deliberately NOT mapped to `batt_w`. It is a group
+        # aggregate (AC side) that only ONE unit of a multi-unit group
+        # publishes; every other unit sends 0.0, so a follower showed 0 W while
+        # charging or discharging (#486). Per-unit battery power comes from the
+        # BMS frame (32/50 fields 26 and 27) instead.
+        # WiFi module signal strength in dBm (negative). This is a radio
+        # reading, not a power path: it must never reach a battery key.
+        602: ("wifi_rssi_dbm", _TYPE_FLOAT),
+        613: ("ac_voltage_v", _TYPE_FLOAT),
+        614: ("ac_current_a", _TYPE_FLOAT),
+        615: ("ac_frequency_hz", _TYPE_FLOAT),
+        616: ("grid_connection_power_w", _TYPE_FLOAT),
+        # Grid connection state, mapped to its enum labels in
+        # _finalize_stream_state.
+        619: ("_grid_connection_state_raw", _TYPE_INT),
+        # Sole source for the AC outlet enable flags on the telemetry frame.
+        # The config-write path carries its own outlet fields, but those hold
+        # the requested target rather than the live relay state and are
+        # deliberately not mapped (same reasoning as LED field 384).
+        #
+        # UNVERIFIED AGAINST HARDWARE: no BK31 telemetry frame exists in this
+        # repo, so that these two carry the live relay state rests on the
+        # protocol definition alone. Fields 380/381 used to feed the same two
+        # keys and were corrected to PV voltage and current; if these two turn
+        # out not to be present on a BK31, both outlet sensors go permanently
+        # stale without anything being logged. A BK31 frame carrying 380/381
+        # but not 980/982 would disprove this and reopen the question.
+        980: ("ac_outlet_1_enabled", _TYPE_INT),
+        982: ("ac_outlet_2_enabled", _TYPE_INT),
+        992: ("sys_grid_connection_power_w", _TYPE_FLOAT),
+        # Live LED brightness percentage. The set/ack value (field 384) is
+        # intentionally NOT mapped to the same key: it carries the slider
+        # target rather than the live value and would otherwise flap with 994.
+        994: ("led_brightness", _TYPE_INT),
+        1003: ("home_from_batt_w", _TYPE_FLOAT),
+        # House/system load supplied from grid, excluding battery path.
+        1004: ("home_from_grid_w", _TYPE_FLOAT),
+        # Confirmed by live load dumps on AC1/AC2 outlets. These values act
+        # as a diagnostic split of the total load path, not an extra load
+        # that should be summed on top of `home_w`.
+        1210: ("ac_outlet_1_w", _TYPE_FLOAT),
+        1211: ("ac_outlet_2_w", _TYPE_FLOAT),
+    },
+    # Auxiliary status/config frame with a more precise SoC value
+    (32, 50): {
+        7: ("_batt_voltage_mv", _TYPE_INT),
+        9: ("batt_temp_c", _TYPE_INT),
+        11: ("batt_design_cap_mah", _TYPE_INT),
+        12: ("batt_remain_cap_mah", _TYPE_INT),
+        13: ("batt_full_cap_mah", _TYPE_INT),
+        # Charge cycles (`cycles` in the BMS heartbeat, as on the Delta 3). A
+        # Stream Ultra reading 141 had charged 14,166,121 mAh into a
+        # 100,000 mAh pack (field 50 over field 13), 141.7 full cycles.
+        14: ("bms_cycles", _TYPE_INT),
+        # Stable 100 even during a dedicated LED brightness sweep.
+        15: ("bms_soh_pct", _TYPE_INT),
+        16: ("batt_max_cell_vol_mv", _TYPE_INT),
+        17: ("batt_min_cell_vol_mv", _TYPE_INT),
+        18: ("batt_max_cell_temp_c", _TYPE_INT),
+        19: ("batt_min_cell_temp_c", _TYPE_INT),
+        20: ("batt_max_mos_temp_c", _TYPE_INT),
+        25: ("soc_precise_pct", _TYPE_FLOAT),
+        # Per-pack power in whole watts, DC side. Both fields are sent
+        # explicitly (one of them 0) and equal V x I of fields 7 and 8 within
+        # 1 W. Field 8 (signed pack current) is not mapped: these two carry
+        # the same reading already split by direction. Combined into `batt_w`
+        # and the charge/discharge pair in _finalize_stream_state (#486).
+        26: ("_batt_charge_power_w", _TYPE_INT),
+        27: ("_batt_discharge_power_w", _TYPE_INT),
+        32: ("_batt_charge_capacity_ah_rounded", _TYPE_INT),
+        50: ("_batt_charge_capacity_mah_total", _TYPE_INT),
+        51: ("_batt_discharge_capacity_mah_total", _TYPE_INT),
+    },
+    # SET acknowledgement path for backup reserve slider. Only the backup
+    # reserve is read back here: the acknowledgement echoes the requested
+    # target, so any field that also exists on the telemetry frame would
+    # overwrite a live reading with a set-point (see LED field 384).
+    (254, 18): {
+        102: ("backup_reserve_pct", _TYPE_INT),
+    },
+}
+
+# The system block of cmd 254/21: readings only the unit that computes the
+# system fills. Field 518 is in the block as well but is not mapped, and the
+# system state of charge (262) is resolved in the coordinator (#336).
+_SYSTEM_BLOCK_KEYS: tuple[str, ...] = (
+    "grid_w",  # 515
+    "home_w",  # 516
+    "solar_w",  # 517
+    "sys_grid_connection_power_w",  # 992
+    "home_from_batt_w",  # 1003
+    "home_from_grid_w",  # 1004
+)
+
+# Grid connection state enum. Values outside this table decode to None so an
+# unknown state can never reach an enum sensor as a raw integer.
+_GRID_CONNECTION_STATE = {
+    0: "invalid",
+    1: "grid_in",
+    2: "not_online",
+    3: "feed_grid",
+}
+
+
+def _read_varint(mv: memoryview, pos: int) -> tuple[int, int]:
+    """Decode one protobuf varint from ``mv`` starting at ``pos``.
+
+    Raises ``ValueError`` on an oversized (>64-bit) varint and ``IndexError``
+    on truncated input; both are caught by the outer parse guard.
+    """
+    shift = 0
+    value = 0
+    while True:
+        byte = mv[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("oversized varint")
+
+
+def _decode_scalar(wire_type: int, raw: bytes, scalar_type: str) -> float | int | None:
+    """Decode one mapped scalar field into the requested target type."""
+    if wire_type == 0:
+        value, _ = _read_varint(memoryview(raw), 0)
+        # Negative int32/int64 values arrive as 64-bit two's complement
+        # (e.g. signed power/temperature paths below zero).
+        if value >= 1 << 63:
+            value -= 1 << 64
+        return float(value) if scalar_type == _TYPE_FLOAT else int(value)
+
+    if wire_type == 5:
+        if len(raw) != 4:
+            return None
+        fval = struct.unpack("<f", raw)[0]
+        if scalar_type == _TYPE_FLOAT:
+            return fval
+        # inf and NaN have no integer: skip the field instead of raising
+        # OverflowError/ValueError and losing the whole message with it.
+        return int(round(fval)) if isfinite(fval) else None
+
+    if wire_type == 1:
+        if len(raw) != 8:
+            return None
+        dval = struct.unpack("<d", raw)[0]
+        if scalar_type == _TYPE_FLOAT:
+            return dval
+        return int(round(dval)) if isfinite(dval) else None
+
+    return None
+
+
+def _iter_fields(payload: bytes) -> list[tuple[int, int, bytes]]:
+    """Return ``(field_number, wire_type, raw_bytes)`` for one protobuf level.
+
+    One level only: a length-delimited field comes back as its raw bytes, so
+    a caller that needs to descend into a nested record calls this again on
+    them. That is what the Smart Meter parser does with its energy record.
+
+    Raises ``ValueError`` or ``IndexError`` on malformed input, which the
+    caller treats as "this payload candidate is not protobuf".
+    """
+    fields: list[tuple[int, int, bytes]] = []
+    mv = memoryview(payload)
+    pos = 0
+
+    while pos < len(mv):
+        tag, pos = _read_varint(mv, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+
+        if wire_type == 0:
+            start = pos
+            _, pos = _read_varint(mv, pos)
+            raw = mv[start:pos].tobytes()
+        elif wire_type == 1:
+            raw = mv[pos : pos + 8].tobytes()
+            pos += 8
+        elif wire_type == 2:
+            length, pos = _read_varint(mv, pos)
+            raw = mv[pos : pos + length].tobytes()
+            pos += length
+        elif wire_type == 5:
+            raw = mv[pos : pos + 4].tobytes()
+            pos += 4
+        else:
+            break
+
+        fields.append((field_num, wire_type, raw))
+
+    return fields
+
+
+def _decode_mapped_fields(
+    pdata: bytes,
+    field_map: dict[int, tuple[str, str]],
+) -> dict[str, Any]:
+    """Decode only the mapped fields from a protobuf payload."""
+    result: dict[str, Any] = {}
+
+    for field_num, wire_type, raw in _iter_fields(pdata):
+        mapping = field_map.get(field_num)
+        if mapping is None:
+            continue
+
+        sensor_key, scalar_type = mapping
+        value = _decode_scalar(wire_type, raw, scalar_type)
+        if value is not None:
+            result[sensor_key] = value
+
+    return result
+
+
+def _finalize_stream_state(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Normalize mirrored fields and derive convenience sensor values."""
+    result = dict(parsed)
+
+    for key, value in list(result.items()):
+        if (
+            isinstance(value, float)
+            and isfinite(value)
+            and abs(value) < _FLOAT_ZERO_EPS
+        ):
+            result[key] = 0.0
+
+    # A single unit is its own system, so a frame that carries only the
+    # unit's BMS reading (field 242, or the precise figure of the auxiliary
+    # frame) should still feed the battery sensor - but not from here. This
+    # parser sees one frame at a time, and the coordinator merges frames: a
+    # BMS-only frame promoted here would overwrite the system figure the
+    # previous frame delivered, and the sensor would flap between the two
+    # exactly as #323 describes. The stand-in travels on a private key and
+    # `_resolve_soc` in the coordinator, which knows whether a system figure
+    # was ever reported, decides whether it becomes `soc_pct`.
+    if "soc_pct" not in result:
+        if "unit_soc_pct" in result:
+            result[SOC_FALLBACK_KEY] = result["unit_soc_pct"]
+        elif "soc_precise_pct" in result:
+            result[SOC_FALLBACK_KEY] = int(round(result["soc_precise_pct"]))
+
+    grid_state_raw = result.pop("_grid_connection_state_raw", None)
+    if isinstance(grid_state_raw, int):
+        result["grid_connection_state"] = _GRID_CONNECTION_STATE.get(grid_state_raw)
+
+    batt_voltage_mv = result.pop("_batt_voltage_mv", None)
+
+    if isinstance(batt_voltage_mv, (int, float)):
+        result["batt_voltage_v"] = float(batt_voltage_mv) / 1000.0
+
+    charge_capacity_mah = result.pop("_batt_charge_capacity_mah_total", None)
+    discharge_capacity_mah = result.pop("_batt_discharge_capacity_mah_total", None)
+    charge_capacity_rounded = result.pop("_batt_charge_capacity_ah_rounded", None)
+
+    # Lifetime capacity counters the BMS keeps itself. A zero is "nothing to
+    # report", not a reading: the protocol declares these fields with explicit
+    # presence, so a factory-new or reset BMS sends the 0 instead of omitting
+    # it, and publishing it on a total_increasing sensor would make Home
+    # Assistant book a meter reset and count the standing total twice.
+    if isinstance(charge_capacity_mah, (int, float)) and charge_capacity_mah > 0:
+        result["batt_charge_capacity_ah"] = float(charge_capacity_mah) / 1000.0
+    elif (
+        isinstance(charge_capacity_rounded, (int, float))
+        and charge_capacity_rounded > 0
+    ):
+        result["batt_charge_capacity_ah"] = float(charge_capacity_rounded)
+
+    if isinstance(discharge_capacity_mah, (int, float)) and discharge_capacity_mah > 0:
+        result["batt_discharge_capacity_ah"] = float(discharge_capacity_mah) / 1000.0
+
+    # A unit that does not compute the system block sends it as zeros. In a
+    # group of several units only one of them fills fields 515-518, 262, 992,
+    # 1003 and 1004; every other unit sends 0.0 in all of them, in every
+    # frame, while its own PV strings and grid connection (616) carry real
+    # power (#486: 3 x BK11, two followers; #323: the BK31 beside a BK61).
+    # Published as they come, a follower showed 0 W house load, 0 W solar and
+    # 0 W grid, and its AC grid connection power flapped between the 0.0 of
+    # 992 and its own 616 from one frame to the next. The tell is the one
+    # `_resolve_soc` uses for the state of charge (#336): a system figure of
+    # zero next to a unit figure above zero cannot be this system's charge.
+    # Such a frame clears the system readings (None, shown as unknown rather
+    # than as a false 0 W), and the grid connection falls back to the unit's
+    # own 616. A single unit, or the unit that computes the block, reports a
+    # system figure above zero and is untouched; so is an empty battery,
+    # where both figures read zero. The decision uses the one frame: unlike
+    # `_resolve_soc` it cannot see an earlier 242, and a follower frame whose
+    # 262 mirrors its own 242 (seen once, #486) is not told from an idle
+    # leader, so that update still reads 0 W.
+    unit_soc = result.get("unit_soc_pct")
+    if (
+        result.get("soc_pct") == 0
+        and isinstance(unit_soc, (int, float))
+        and unit_soc > 0
+    ):
+        for key in _SYSTEM_BLOCK_KEYS:
+            if key in result:
+                result[key] = None
+
+    grid_connection = result.get("sys_grid_connection_power_w")
+    if not isinstance(grid_connection, (int, float)):
+        grid_connection = result.get("grid_connection_power_w")
+    if isinstance(grid_connection, (int, float)):
+        result["ac_grid_connection_power_w"] = float(grid_connection)
+
+    # Per-unit battery power from the BMS frame. Only a frame that carries BOTH
+    # directions is a reading: each is sent explicitly with one of them 0, so
+    # one alone means a partial or foreign frame and publishing a half would
+    # fake a one-sided state.
+    charge_power = result.pop("_batt_charge_power_w", None)
+    discharge_power = result.pop("_batt_discharge_power_w", None)
+    if isinstance(charge_power, (int, float)) and isinstance(
+        discharge_power, (int, float)
+    ):
+        result["batt_charge_power_w"] = float(charge_power)
+        result["batt_discharge_power_w"] = float(discharge_power)
+        result["batt_w"] = float(charge_power) - float(discharge_power)
+        # batt_charge_discharge_state is intentionally NOT set here. The
+        # coordinator pops any parser-provided value and derives the state
+        # from a hysteresis window over batt_w (see _derive_battery_state,
+        # issue #50). Setting it from instantaneous sign would only be used
+        # by unit tests and never reaches the live entity.
+
+    return result
+
+
+def _pdata_candidates(header: dict[str, Any]) -> list[bytes]:
+    """Return the payload bytes to try for one header, most likely first.
+
+    A header with ``enc_type == 1`` carries its payload XOR-masked with the
+    low byte of its own sequence number. The mask is per header: a bundled
+    frame holds several headers with different sequence numbers, so applying
+    one header's key to another header's payload would corrupt it. The
+    untouched bytes stay in the list as a fallback for a device that sets the
+    flag without masking.
+
+    The fallback is only ever reached when the unmasked bytes are not valid
+    protobuf at all. An unmasked payload that parses but carries no mapped
+    field is a complete, successful read of a message we do not map - most of
+    what a Stream Micro sends looks like that - and retrying the masked bytes
+    on top of it would feed random values into live sensors.
+    """
+    pdata_hex = header.get("pdata")
+    if not isinstance(pdata_hex, str) or not pdata_hex:
+        return []
+    try:
+        pdata = bytes.fromhex(pdata_hex)
+    except ValueError:
+        return []
+    if not pdata:
+        return []
+
+    if header.get("enc_type") != 1:
+        return [pdata]
+
+    seq = header.get("seq")
+    if not isinstance(seq, int) or not seq & 0xFF:
+        return [pdata]
+
+    xor_key = seq & 0xFF
+    return [bytes(value ^ xor_key for value in pdata), pdata]
+
+
+def parse_stream_proto_message(payload: bytes) -> dict[str, Any] | None:
+    """Parse a Stream protobuf frame into flat sensor keys."""
+    try:
+        headers, _ = decode_header_message(payload)
+        if not headers:
+            return None
+
+        merged: dict[str, Any] = {}
+        for header in headers:
+            cmd_key = (int(header.get("cmd_func", -1)), int(header.get("cmd_id", -1)))
+            field_map = _STREAM_FIELD_MAP.get(cmd_key)
+            if field_map is None:
+                continue
+            for pdata in _pdata_candidates(header):
+                try:
+                    decoded = _decode_mapped_fields(pdata, field_map)
+                except (IndexError, ValueError):
+                    # Only a payload that is not valid protobuf falls through
+                    # to the next candidate. A clean decode ends the attempt,
+                    # empty or not (see _pdata_candidates).
+                    continue
+                merged.update(decoded)
+                break
+            # A decode error is contained to the message that caused it: the
+            # remaining headers of a bundle still contribute. Before the
+            # per-candidate guard the error reached the frame-level handler
+            # below and discarded the whole bundle.
+    except Exception:
+        return None
+    if not merged:
+        return None
+
+    finalized = _finalize_stream_state(merged)
+    return finalized or None

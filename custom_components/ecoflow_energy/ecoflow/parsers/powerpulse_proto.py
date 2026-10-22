@@ -1,0 +1,718 @@
+"""Protobuf telemetry parser for the EcoFlow PowerPulse 2 wallbox (C376, C374, C371).
+
+Derived from an 11-frame capture of a live PowerPulse 2 charging session
+(PLAN-132, issue #7), spanning an idle plug, a single-phase charge, a
+three-phase charge and a finished session. The device is a standalone
+wallbox with its own protocol envelope, not the PowerOcean-forwarded
+accessory the `ev_*` keys in `const.py` were first built for.
+
+The envelope is the same BK-series one every other parser in this package
+uses, so the unwrap is imported from `stream_proto.py`: the header decode,
+the per-header XOR mask keyed on the low byte of the sequence number, and
+the one-level field walk plus scalar decoder.
+
+Two message types carry readings, both under cmd_func 2:
+
+- `33` HeartBeat, the periodic telemetry frame. Every captured frame carries
+  one, either alone (`property` topic, XOR-masked, `enc_type == 1`) or as
+  one header inside a 15-header `get_reply` bundle (unmasked).
+- `34` ParamReport, seen inside the three `get_reply` bundles and, on the
+  seven writes of a maximum-current change, directly on the `property`
+  topic too (PLAN-146). Of its fields, `9` (the maximum charge current in
+  deci-amps, the same reading `2/33`'s field `18` reports) and `19` (the
+  cable-lock toggle) are mapped; the rest of its message is unrelated
+  configuration this integration does not read yet.
+- `241/44` EDevRunDataSync, on the wallbox's own property topic, about once
+  a second (PLAN-136). Two things nested inside it are read: the accessory
+  descriptor - the bus address and the wallbox's own serial, which exist to
+  build the start/stop command's addressing - and, from the settings block
+  behind it, the switch-bit field and the Solar minimum current (#480). No
+  entity is built from the descriptor fields; the two settings fields are
+  the read-back a later write is built on. The block's work mode (field
+  `2`) is named like the heartbeat's mode (`63.4` below), as
+  `ev_settings_work_mode`, and never as `ev_charge_mode`.
+
+HeartBeat's field `8` is a nested record carrying the live charge readings
+(power, the three phase voltages, the three phase currents); it is pulled
+out of the generic field loop the same way `wave3_proto.py` pulls out its
+own nested records, and decoded by `_decode_charge_readings`.
+
+Field notes:
+
+- `1` (device status: 1 available, 3 charging, 6 finished) and `101` (a
+  session-scoped status: 0 idle, 2 charging, 3 finished) track each other in
+  every captured frame - `101` changes exactly when `1` does - but they are
+  not the same number on the wire, so both are mapped as their own key
+  rather than collapsed into one.
+- `9`, `44` and the nested `8.2` are the same lifetime energy counter
+  (Wh), byte-identical in ten of the eleven captured frames and one Wh
+  apart in the eleventh (frame at 12:08, property topic). Only `44` is
+  read; `9` and `8.2` are left unmapped entirely, the same reasoning
+  `wave3_proto.py` applies to its own duplicate fields - two sources for
+  one entity disagree the moment a frame like that one arrives, and `44` is
+  the field the session identity below is defined against. The `C374`
+  recording (#7, 2026-09-11) confirms the choice from the other side: its
+  first frame carries `44` as 0 and `9` as 504, and the session that
+  follows starts from `43` = 504, so `9` is not a safe stand-in for `44`.
+- `42` and `46` read as the same session-energy counter on the `C376`
+  frames; on the `C374` frames `46` is a different, smaller number (0 to
+  190 Wh against 184 to 1147 Wh) whose meaning is not known. Only `42` is
+  read, and it is the one the `44 - 43 == 42` identity holds for on both.
+- `43` (the lifetime counter's value when the current session began) and
+  `44` (the lifetime counter now) always satisfy `44 - 43 == 42` in every
+  captured frame that carries a session. That identity is the test suite's
+  main correctness check.
+- `17` and `18` are two different current settings, both deci-amps on the
+  wire, and they are easy to confuse because on a charging wallbox they
+  often agree. `18` is the configured maximum current, the limit the vendor
+  app calls the maximum output current: in the second owner's idle-wallbox
+  recording (#7, 2026-09-10) it followed his setting step by step (110, 100,
+  60 for 11, 10, 6 A) while `17` sat at 60 throughout, and in the first
+  owner's charging capture it is a constant 160 for his 16 A limit. `17` is
+  the charging current setpoint of the session: 6, 8, 10 and 16 A in the
+  first capture, where it moved with what the app showed while charging.
+  The first pre-release published `17` as the maximum current; the second
+  owner's live test showed the sensor stuck at 6 A while he stepped the
+  limit, which is how the two were told apart.
+- `21` (phase mode) is 1 while only the first phase current in field `8`
+  carries a real reading and 0 while all three do - confirmed against
+  every captured frame, not inferred from the field name. It is the phase
+  mode in effect, not the app's phase selection: that setting has a third
+  value, automatic, which this field never carries (the second owner's
+  test on #7 confirmed the field reads 1 or 0 under automatic as well).
+- `20` (`input_phase`) is constant across the whole capture and is not
+  mapped. `29` and `30` do not walk as clean protobuf in this capture and
+  are left alone rather than guessed at.
+- Field `1` doubles as a gate for the four session-scoped fields (`40`
+  session start, `41` session duration, `42` session energy, `43` the
+  lifetime counter at session start): a plug that is available (status 1)
+  still has last session's numbers sitting in these fields on the wire, and
+  publishing them under an idle status would show a stale session as if it
+  were current. So they are only published while `1` reports something
+  other than "available" - matching what the vendor app itself shows on an
+  idle plug. `44`, the running lifetime counter, is not part of this gate;
+  it is valid regardless of session state and is only ever withheld if the
+  device reports it as exactly zero (never observed in this capture).
+- `63` (`POLinkageParameter`, `Cp307Sys.proto:147`) is a nested record whose
+  sub-field `4` (`work_mode`) is the wallbox's own charging-mode setting:
+  1 fast, 2 solar, 3 custom, 4 smart. Pulled out of the generic field loop
+  the same way field `8` is. Confirmed byte-for-byte against five mode
+  writes and their heartbeat echoes in @Xygen's capture of 2026-09-13
+  (issue #7, PLAN-147): every write to `EDevPileParamSet.work_mode` (the
+  PowerOcean's `241/102` `pdata` field 4) shows up in this field within
+  0.7-56 s. The message's other sub-fields (`bind_state`, `online_state`,
+  `po_sn`, `ctrl_mode`) are not read.
+"""
+
+from __future__ import annotations
+
+from math import isfinite
+from typing import Any
+
+from ..const import (
+    POWERPULSE2_DISPLAY_BLOCK_LEN_KEY,
+    POWERPULSE2_DISPLAY_BLOCK_LENGTHS,
+    POWERPULSE2_DISPLAY_KEYS,
+    POWERPULSE2_DISPLAY_SWITCH_KEYS,
+    powerpulse2_display_value_valid,
+)
+from ..proto.decoder import decode_header_message
+from .stream_proto import (
+    _FLOAT_ZERO_EPS,
+    _TYPE_FLOAT,
+    _TYPE_INT,
+    _decode_scalar,
+    _iter_fields,
+    _pdata_candidates,
+)
+
+# HeartBeat's nested charge-readings record. Pulled out of the generic field
+# loop in `_decode_heartbeat_fields`, the same way `wave3_proto.py` pulls its
+# own nested records out of its field loop.
+_CHARGE_READINGS_FIELD = 8
+
+# HeartBeat's nested PO-linkage record (PLAN-147). Only sub-field 4
+# (work_mode) is read; see the module docstring.
+_PO_LINKAGE_FIELD = 63
+
+# cmd_func 2, cmd_id 33 (HeartBeat) - top-level scalar fields only. Field 8
+# (nested) and field 9 (the `44` twin) are deliberately absent; see the
+# module docstring.
+_HEARTBEAT_FIELD_MAP: dict[int, tuple[str, str]] = {
+    1: ("_plug_status_raw", _TYPE_INT),
+    17: ("_charge_current_da_raw", _TYPE_INT),
+    18: ("_max_current_da_raw", _TYPE_INT),
+    21: ("_phase_mode_raw", _TYPE_INT),
+    40: ("_session_start_ts_raw", _TYPE_INT),
+    41: ("_session_duration_s_raw", _TYPE_INT),
+    42: ("_session_energy_wh_raw", _TYPE_INT),
+    43: ("_session_start_energy_wh_raw", _TYPE_INT),
+    44: ("_total_energy_wh_raw", _TYPE_INT),
+    101: ("_session_status_raw", _TYPE_INT),
+}
+
+# HeartBeat field 8's sub-fields. Sub-field 2 is the same lifetime counter
+# as top-level field 44 and is deliberately left unmapped (see docstring).
+_CHARGE_READINGS_FIELD_MAP: dict[int, tuple[str, str]] = {
+    4: ("ev_charge_power_w", _TYPE_FLOAT),
+    7: ("ev_voltage_l1_v", _TYPE_FLOAT),
+    8: ("ev_voltage_l2_v", _TYPE_FLOAT),
+    9: ("ev_voltage_l3_v", _TYPE_FLOAT),
+    10: ("ev_current_l1_a", _TYPE_FLOAT),
+    11: ("ev_current_l2_a", _TYPE_FLOAT),
+    12: ("ev_current_l3_a", _TYPE_FLOAT),
+}
+
+# HeartBeat field 63's sub-fields (PLAN-147). Only work_mode is read; the
+# other four (bind_state, online_state, po_sn, ctrl_mode) are left alone.
+_PO_LINKAGE_FIELD_MAP: dict[int, tuple[str, str]] = {
+    4: ("_charge_mode_raw", _TYPE_INT),
+}
+
+# cmd_func 2, cmd_id 34 (ParamReport) - the maximum current (field 9, the
+# same raw key HeartBeat's field 18 feeds) and the cable-lock toggle.
+_PARAM_REPORT_FIELD_MAP: dict[int, tuple[str, str]] = {
+    9: ("_max_current_da_raw", _TYPE_INT),
+    19: ("_cable_lock_raw", _TYPE_INT),
+}
+
+# Field 1 is the same enum the PowerOcean relay carried on `(241, 3)`: the
+# same numbers with the same meanings, which is why this parser writes the
+# existing `ev_charge_status` key rather than registering a synonym for a
+# value the tree already addresses (ADR-008 addendum 2026-09-09). The
+# spellings are the ones that entity already declares in its `options` list,
+# so value 6 is `finishing` and not `finished` - a state outside the declared
+# options is an error in Home Assistant, not a wording preference.
+_PLUG_STATUS_NAMES: dict[int, str] = {
+    1: "available",
+    # Cable attached, no charge running: the two frames on file (a `C374`,
+    # #7, 2026-09-11) sit before a session with power 0, currents 0.01 A and
+    # field 101 at idle, and a session follows minutes later. Without this
+    # entry the sensor kept its previous state through such a frame.
+    2: "preparing",
+    3: "charging",
+    # EV_CHG_STS_SUSPENDED_EVSE: the charger holds the session back, for
+    # example a Solar-mode start without PV surplus (#515). Same enum value
+    # and name the PowerOcean relay map already uses (`powerocean_proto.py`).
+    4: "suspended_charger",
+    # Shared EV_CHG_STS_SUSPENDED_EV, observed on a C371 at zero power.
+    5: "suspended_vehicle",
+    6: "finishing",
+}
+# Field 101 is a different number on the wire (0/2/3 where field 1 has
+# 1/3/6), so it keeps a key of its own.
+_SESSION_STATUS_NAMES: dict[int, str] = {0: "idle", 2: "charging", 3: "finished"}
+_PHASE_MODE_NAMES: dict[int, str] = {0: "three_phase", 1: "single_phase"}
+# PLAN-147: the app's own labels for `EDevPileParamSet.work_mode`, confirmed
+# against @Xygen's capture of 2026-09-13 (issue #7).
+_CHARGE_MODE_NAMES: dict[int, str] = {1: "fast", 2: "solar", 3: "custom", 4: "smart"}
+
+# The plug status value that means "no session in progress". Everything in
+# `_SESSION_SCOPED_RAW_KEYS` is withheld while field 1 reports this value.
+_PLUG_STATUS_NO_SESSION = 1
+
+# The four session-scoped raw keys and the final keys they become once a
+# session is in progress. Order matters: `zip` below pairs them positionally.
+_SESSION_SCOPED_RAW_KEYS: tuple[str, ...] = (
+    "_session_start_ts_raw",
+    "_session_duration_s_raw",
+    "_session_energy_wh_raw",
+    "_session_start_energy_wh_raw",
+)
+_SESSION_SCOPED_FINAL_KEYS: tuple[str, ...] = (
+    "ev_session_start_ts",
+    "ev_session_duration_s",
+    "ev_session_energy_wh",
+    "ev_session_start_energy_wh",
+)
+
+
+def _tidy_float(value: float) -> float:
+    """Round a float32 charge reading to two decimals.
+
+    The device sends single-precision floats, so a reading of 233.43 arrives
+    as 233.43051147460938. Two decimals keep everything the unit's own
+    display can show and drop the representation noise (PLAN-132; the same
+    reasoning `wave3_proto.py` applies to its own float readings).
+    """
+    return round(value, 2)
+
+
+def _decode_charge_readings(raw: bytes) -> dict[str, Any]:
+    """Decode HeartBeat's nested charge-readings record (field 8)."""
+    result: dict[str, Any] = {}
+    for sub_num, sub_wire, sub_raw in _iter_fields(raw):
+        mapping = _CHARGE_READINGS_FIELD_MAP.get(sub_num)
+        if mapping is None:
+            continue
+        key, scalar_type = mapping
+        value = _decode_scalar(sub_wire, sub_raw, scalar_type)
+        if value is None:
+            continue
+        result[key] = _tidy_float(value) if scalar_type is _TYPE_FLOAT else value
+    return result
+
+
+def _decode_po_linkage(raw: bytes) -> dict[str, Any]:
+    """Decode HeartBeat's nested PO-linkage record (field 63, PLAN-147)."""
+    result: dict[str, Any] = {}
+    for sub_num, sub_wire, sub_raw in _iter_fields(raw):
+        mapping = _PO_LINKAGE_FIELD_MAP.get(sub_num)
+        if mapping is None:
+            continue
+        key, scalar_type = mapping
+        value = _decode_scalar(sub_wire, sub_raw, scalar_type)
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _decode_heartbeat_fields(pdata: bytes) -> dict[str, Any]:
+    """Decode one HeartBeat (2/33) message: its scalars plus field 8."""
+    result: dict[str, Any] = {}
+    for field_num, wire_type, raw in _iter_fields(pdata):
+        if field_num == _CHARGE_READINGS_FIELD and wire_type == 2:
+            result.update(_decode_charge_readings(raw))
+            continue
+        if field_num == _PO_LINKAGE_FIELD and wire_type == 2:
+            result.update(_decode_po_linkage(raw))
+            continue
+
+        mapping = _HEARTBEAT_FIELD_MAP.get(field_num)
+        if mapping is None:
+            continue
+        sensor_key, scalar_type = mapping
+        value = _decode_scalar(wire_type, raw, scalar_type)
+        if value is not None:
+            result[sensor_key] = value
+    return result
+
+
+def _decode_param_report_fields(pdata: bytes) -> dict[str, Any]:
+    """Decode one ParamReport (2/34) message: the maximum current and the
+    cable lock."""
+    result: dict[str, Any] = {}
+    for field_num, wire_type, raw in _iter_fields(pdata):
+        mapping = _PARAM_REPORT_FIELD_MAP.get(field_num)
+        if mapping is None:
+            continue
+        sensor_key, scalar_type = mapping
+        value = _decode_scalar(wire_type, raw, scalar_type)
+        if value is not None:
+            result[sensor_key] = value
+    return result
+
+
+def _finalize(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Normalize near-zero floats and resolve the raw enum/gated fields."""
+    result = dict(parsed)
+
+    for key, value in list(result.items()):
+        if (
+            isinstance(value, float)
+            and isfinite(value)
+            and abs(value) < _FLOAT_ZERO_EPS
+        ):
+            result[key] = 0.0
+
+    status_raw = result.pop("_plug_status_raw", None)
+    if isinstance(status_raw, int):
+        status_name = _PLUG_STATUS_NAMES.get(status_raw)
+        # An unknown state would crash the enum sensor with "not in list of
+        # options", so it is dropped rather than passed through - the same
+        # reasoning powerocean_proto.py applies to the AC31 path that feeds
+        # this same ev_charge_status key.
+        if status_name is not None:
+            result["ev_charge_status"] = status_name
+
+    session_status_raw = result.pop("_session_status_raw", None)
+    if isinstance(session_status_raw, int):
+        session_status_name = _SESSION_STATUS_NAMES.get(session_status_raw)
+        if session_status_name is not None:  # same reasoning as above
+            result["ev_session_status"] = session_status_name
+
+    phase_mode_raw = result.pop("_phase_mode_raw", None)
+    if isinstance(phase_mode_raw, int):
+        phase_mode_name = _PHASE_MODE_NAMES.get(phase_mode_raw)
+        if phase_mode_name is not None:  # same reasoning as above
+            result["ev_phase_mode"] = phase_mode_name
+
+    charge_mode_raw = result.pop("_charge_mode_raw", None)
+    if isinstance(charge_mode_raw, int):
+        charge_mode_name = _CHARGE_MODE_NAMES.get(charge_mode_raw)
+        if charge_mode_name is not None:  # same reasoning as above
+            result["ev_charge_mode"] = charge_mode_name
+
+    # The settings report names its mode the same way the heartbeat does, but
+    # under its own key: this parser never publishes `ev_charge_mode` from the
+    # settings path, the coordinator decides which of the two readings shows.
+    settings_mode_raw = result.pop("_settings_work_mode_raw", None)
+    if isinstance(settings_mode_raw, int):
+        settings_mode_name = _CHARGE_MODE_NAMES.get(settings_mode_raw)
+        if settings_mode_name is not None:  # same reasoning as above
+            result["ev_settings_work_mode"] = settings_mode_name
+
+    max_current_raw = result.pop("_max_current_da_raw", None)
+    if isinstance(max_current_raw, int):
+        result["ev_max_current_a"] = round(max_current_raw / 10.0, 1)
+
+    charge_current_raw = result.pop("_charge_current_da_raw", None)
+    if isinstance(charge_current_raw, int):
+        result["ev_charge_current_a"] = round(charge_current_raw / 10.0, 1)
+
+    cable_lock_raw = result.pop("_cable_lock_raw", None)
+    if isinstance(cable_lock_raw, int):
+        result["ev_cable_lock_enabled"] = bool(cable_lock_raw)
+
+    # The lifetime counter is valid on its own, independent of session
+    # state. It is only withheld if the device ever reports it as exactly
+    # zero - never observed in this capture, but a 0 here would otherwise
+    # look like a meter reset to a total_increasing sensor (PLAN-132
+    # contract rule).
+    total_energy_raw = result.pop("_total_energy_wh_raw", None)
+    if isinstance(total_energy_raw, int) and total_energy_raw > 0:
+        result["ev_total_energy_wh"] = total_energy_raw
+
+    # See the module docstring: the four session-scoped fields are only
+    # published while a session exists (status is not "available").
+    if status_raw == _PLUG_STATUS_NO_SESSION:
+        for raw_key in _SESSION_SCOPED_RAW_KEYS:
+            result.pop(raw_key, None)
+    else:
+        for raw_key, final_key in zip(
+            _SESSION_SCOPED_RAW_KEYS, _SESSION_SCOPED_FINAL_KEYS, strict=True
+        ):
+            value = result.pop(raw_key, None)
+            if value is not None:
+                result[final_key] = value
+        # A start timestamp of 0 is "no session yet", not 1970-01-01: the
+        # first frame of the `C374` recording (status `preparing`, all four
+        # session fields 0) would otherwise put that date on the timestamp
+        # sensor. The other three are honest zeros and stay.
+        if result.get("ev_session_start_ts") == 0:
+            del result["ev_session_start_ts"]
+
+    return result
+
+
+def _decode_display_block(raw: bytes) -> dict[str, Any]:
+    """Decode the display block of the settings block (field 21, PLAN-188).
+
+    Six bytes, one per setting: `[LED on, Screen on, LED brightness %,
+    Screen brightness %, unnamed, unnamed]`. The first four are published as
+    `ev_led_enabled`, `ev_screen_enabled` (bool), `ev_led_brightness_pct` and
+    `ev_screen_brightness_pct` (int); the last two are device-side bytes this
+    integration neither reads nor publishes. Each byte is validated on its
+    own: a switch byte must be 0 or 1, a brightness byte one of
+    `POWERPULSE2_DISPLAY_BRIGHTNESS_STEPS`, and a byte that is not leaves only
+    its own key out - the others from the same block still come through.
+    A block that is not exactly six bytes is a layout this decoder has not
+    seen and yields nothing: no byte position is guessed on it.
+
+    The app and the PowerOcean's own `241/3` report (#553) use a second form,
+    32 bytes, with the same four settings at bytes 0-3 (byte 4 is a constant
+    `0x02` the app writes, the rest zeros). Both forms decode to the same
+    four keys. Besides them the result carries the internal key
+    `_display_block_len` (int, 6 or 32): the form the report used, so a write
+    can go back in the same form. It is present only when the block length is
+    valid and is not a sensor value: `_finalize` leaves it alone and the
+    coordinator drops it before anything is published. Any other length
+    yields `{}`.
+    """
+    if len(raw) not in POWERPULSE2_DISPLAY_BLOCK_LENGTHS:
+        return {}
+    result: dict[str, Any] = {}
+    for key, value in zip(POWERPULSE2_DISPLAY_KEYS, raw[:4], strict=True):
+        if not powerpulse2_display_value_valid(key, value):
+            continue
+        result[key] = bool(value) if key in POWERPULSE2_DISPLAY_SWITCH_KEYS else value
+    if result:
+        # No setting read, no form to report: a block whose four bytes are all
+        # unusable leaves nothing behind, as it did before the second form.
+        result[POWERPULSE2_DISPLAY_BLOCK_LEN_KEY] = len(raw)
+    return result
+
+
+def _decode_settings_block(block: bytes) -> dict[str, Any]:
+    """Decode the wallbox settings block of EDevRunDataSync (`f1.f4.f8`).
+
+    Five varint fields are read: `1` (the switch-bit field, kept raw because
+    its bits are individually owned - the cable lock and the continuous
+    charging flag among them), `2` (the work mode, raw wire value 1 Fast, 2
+    Solar, 3 Custom, 4 Smart; `_finalize` names it like the heartbeat's mode,
+    as `ev_settings_work_mode`), `6` (the Solar minimum current, in deci-amps
+    on the wire, published in amps), `7` (the phase setting, raw: 0 Auto, 1
+    one phase, 2 three phases) and `8` (the Custom charging current, deci-amps
+    on the wire, published in amps). The block's maximum current is not read
+    here. The one length-delimited field, `21` (the display block: LED and
+    screen on/off and brightness), is read by `_decode_display_block`.
+
+    A field that is not on the wire stays out of the result, the phase
+    setting included: a wallbox that omits its default `7: 0` yields no
+    `ev_phase_setting`, never a synthesized 0. proto3 omits zeros and a
+    missing field is not a measured 0, so nothing is guessed from absence,
+    and a write that needs a missing value is refused later instead of being
+    built on a made-up one.
+    """
+    result: dict[str, Any] = {}
+    for field_num, wire_type, raw in _iter_fields(block):
+        if field_num == 21 and wire_type == 2:
+            # The display block is the one length-delimited field read here.
+            result.update(_decode_display_block(raw))
+            continue
+        if wire_type != 0:
+            continue
+        value = _decode_scalar(wire_type, raw, _TYPE_INT)
+        if not isinstance(value, int):
+            continue
+        if field_num == 1:
+            result["ev_settings_switch_bits"] = value
+        elif field_num == 2:
+            result["_settings_work_mode_raw"] = value
+        elif field_num == 6:
+            result["ev_solar_min_current_a"] = value / 10
+        elif field_num == 7:
+            result["ev_phase_setting"] = value
+        elif field_num == 8:
+            result["ev_custom_current_a"] = value / 10
+    return result
+
+
+def _decode_dev_info(dev_info: bytes) -> dict[str, Any]:
+    """Decode the accessory descriptor (`dev_info`) of EDevRunDataSync."""
+    dev_addr: int | None = None
+    dev_sn: str | None = None
+    for leaf_num, leaf_wire, leaf_raw in _iter_fields(dev_info):
+        if leaf_num == 1 and leaf_wire == 0:
+            value = _decode_scalar(leaf_wire, leaf_raw, _TYPE_INT)
+            if isinstance(value, int):
+                dev_addr = value
+        elif leaf_num == 2 and leaf_wire == 2 and len(leaf_raw) == 16:
+            try:
+                decoded_sn = leaf_raw.decode("ascii")
+            except UnicodeDecodeError:
+                decoded_sn = None
+            dev_sn = (
+                decoded_sn if decoded_sn is not None and decoded_sn.isalnum() else None
+            )
+    if dev_addr is None or dev_sn is None:
+        return {}
+    return {"ev_charger_dev_addr": dev_addr, "ev_charger_sn": dev_sn}
+
+
+def _decode_run_data_sync_fields(pdata: bytes) -> dict[str, Any]:
+    """Decode EDevRunDataSync (241/44): the accessory descriptor and settings.
+
+    Walks `pdata` field 1 (the message body) -> field 1 (`dev_info`) ->
+    fields 1 (`dev_addr`, varint) and 2 (`dev_sn`, 16-byte serial). Field 3
+    of `dev_info` (present on every settings report, absent on every
+    captured write) is ignored - the descriptor measurement note of
+    PLAN-136 records why. The settings block, a sibling of `dev_info` under
+    the same body (`f4.f8`), is decoded by `_decode_settings_block`; nothing
+    else from this message is parsed here.
+
+    The descriptor keys are emitted only when `dev_addr` is present and
+    `dev_sn` is exactly 16 alphanumeric ASCII bytes (every EcoFlow serial on
+    file is); otherwise they are left out, which is a clean decode of a frame
+    this function does not read fully, not an error. The serial is never
+    logged. The settings keys are independent of the descriptor and appear
+    only when the frame carries the settings block. The first `dev_info` and
+    the first settings block of the first body win: no captured frame
+    carries two, and a bundle with two such headers would let the later one
+    overwrite the earlier in the caller's merge.
+    """
+    result: dict[str, Any] = {}
+    for field_num, wire_type, body in _iter_fields(pdata):
+        if field_num != 1 or wire_type != 2:
+            continue
+        seen_dev_info = False
+        seen_settings = False
+        for sub_num, sub_wire, sub_raw in _iter_fields(body):
+            if sub_wire != 2:
+                continue
+            if sub_num == 1 and not seen_dev_info:
+                seen_dev_info = True
+                result.update(_decode_dev_info(sub_raw))
+            elif sub_num == 4 and not seen_settings:
+                seen_settings = True
+                for block_num, block_wire, block in _iter_fields(sub_raw):
+                    if block_num == 8 and block_wire == 2:
+                        result.update(_decode_settings_block(block))
+                        break
+        break
+    return result
+
+
+# The key a PowerOcean frame carries the relayed wallbox settings under, from
+# the frame parse to `_resolve_relayed_wallbox_settings` in the coordinator,
+# which pops it before anything reaches the PowerOcean's own store (#553).
+RELAYED_WALLBOX_SETTINGS_KEY = "_relayed_wallbox_settings_by_sn"
+# `cmd_func = 241` and `cmd_id = 3` as they appear in a header (tag, varint).
+_RELAY_CMD_FUNC_BYTES = b"\x40\xf1\x01"
+_RELAY_CMD_ID_BYTES = b"\x48\x03"
+# The app is header source 32; the PowerOcean forwards the app's copy of the
+# settings with that source and `is_ack = 1`.
+_RELAY_ACK_COPY_SRC = 32
+
+# The PowerOcean's copy of a coupled wallbox's settings (#553). A PowerPulse 2
+# linked to the PowerOcean as a system component reports its settings to the
+# PowerOcean, which publishes them on its own topic as `241/3`; on such a
+# wallbox its own `241/44` can arrive without the settings block at all. The
+# message is `EDevParamReport`-shaped: `pdata` field 1 is the accessory
+# descriptor (`EdevBaseInfo`), field 4 an `EDevPileChargingParamReport` whose
+# field 1 is the `EDevPileParamSet` the PowerOcean's `241/102` write carries.
+# That message numbers the same settings differently from the wallbox's own
+# `PileRemoteParamSet` (`f1.f4.f8` of `241/44`), so it gets its own table:
+# 1 switch bits, 2 work mode, 4 Solar minimum current (deci-amps), 5 phase
+# setting, 6 Custom current (deci-amps), 21 the display block. Field 3 (the
+# maximum current) and the report's outer status and power are not read: the
+# wallbox reports those on its own channel. Measured on two installations:
+# @travel-and-cache's (#553, 2026-10-14) moved 4 from 60 to 90 and back and
+# 1 through 2, 18, 19 with the app's writes; @Xygen's (2026-10-05) carries
+# both copies and they agree field for field in the same second, the Custom
+# current (6 here, 8 on the wallbox) included.
+_RELAYED_SETTINGS_FIELD_MAP: dict[int, tuple[str, float | None]] = {
+    1: ("ev_settings_switch_bits", None),
+    2: ("_settings_work_mode_raw", None),
+    4: ("ev_solar_min_current_a", 10.0),
+    5: ("ev_phase_setting", None),
+    6: ("ev_custom_current_a", 10.0),
+}
+
+
+def _decode_relayed_settings_block(block: bytes) -> dict[str, Any]:
+    """Decode the `EDevPileParamSet` of the PowerOcean's `241/3` (#553).
+
+    Same output keys as `_decode_settings_block`, from the field numbers in
+    `_RELAYED_SETTINGS_FIELD_MAP`; the display block (field 21) goes through
+    the same `_decode_display_block`. A field not on the wire stays out.
+    """
+    result: dict[str, Any] = {}
+    for field_num, wire_type, raw in _iter_fields(block):
+        if field_num == 21 and wire_type == 2:
+            result.update(_decode_display_block(raw))
+            continue
+        mapping = _RELAYED_SETTINGS_FIELD_MAP.get(field_num)
+        if mapping is None or wire_type != 0:
+            continue
+        value = _decode_scalar(wire_type, raw, _TYPE_INT)
+        if not isinstance(value, int):
+            continue
+        key, divisor = mapping
+        result[key] = value if divisor is None else value / divisor
+    return result
+
+
+def _decode_relayed_settings_fields(pdata: bytes) -> tuple[str, dict[str, Any]] | None:
+    """Return `(wallbox serial, settings)` from one `241/3` pdata, or None."""
+    serial: str | None = None
+    settings: dict[str, Any] | None = None
+    for field_num, wire_type, raw in _iter_fields(pdata):
+        if wire_type != 2:
+            continue
+        if field_num == 1 and serial is None:
+            serial = _decode_dev_info(raw).get("ev_charger_sn")
+        elif field_num == 4 and settings is None:
+            for sub_num, sub_wire, sub_raw in _iter_fields(raw):
+                if sub_num == 1 and sub_wire == 2:
+                    settings = _decode_relayed_settings_block(sub_raw)
+                    break
+    if serial is None or not settings:
+        return None
+    return serial, settings
+
+
+def parse_relayed_wallbox_settings(payload: bytes) -> dict[str, dict[str, Any]]:
+    """Read every coupled wallbox's settings out of a PowerOcean frame (#553).
+
+    Returns `{wallbox serial: settings keys}` for each `241/3` header the
+    envelope carries, named exactly as the wallbox's own settings report
+    names them (`_finalize` turns the work mode into
+    `ev_settings_work_mode`). Only the PowerOcean's own reports count: a
+    header that is the app's ack copy (`src == 32` or `is_ack == 1`) is
+    skipped before the first-per-serial rule applies. The PowerOcean sends two
+    identical headers per frame; the first one per serial wins. A display
+    block also reports `_display_block_len` (6 or 32, see
+    `_decode_display_block`); it is an internal key for the write-back, not a
+    sensor value. Anything else in the envelope, and
+    an envelope that does not decode, yields an empty dict: this runs beside
+    the PowerOcean's own decode and must never cost it a key.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    # Header fields are never masked, so a frame without `cmd_func = 241`
+    # (field 8) and `cmd_id = 3` (field 9) on the wire cannot carry the block
+    # and is not decoded a second time. A frame that has both byte runs for
+    # another reason is decoded and simply yields nothing.
+    if _RELAY_CMD_FUNC_BYTES not in payload or _RELAY_CMD_ID_BYTES not in payload:
+        return found
+    try:
+        headers, _ = decode_header_message(payload)
+    except Exception:
+        return found
+    for header in headers or ():
+        try:
+            if (
+                int(header.get("cmd_func", -1)),
+                int(header.get("cmd_id", -1)),
+            ) != (241, 3):
+                continue
+            # The app's ack copy of the settings rides in the same frame
+            # (src 32, is_ack 1) with whatever the app last wrote and stale
+            # bits; it is skipped per header, before a serial is claimed, so
+            # it can never win one. A header that carries neither field (the
+            # older frames) is read as before.
+            if (
+                int(header.get("src", -1)) == _RELAY_ACK_COPY_SRC
+                or int(header.get("is_ack", 0)) == 1
+            ):
+                continue
+            for pdata in _pdata_candidates(header):
+                try:
+                    decoded = _decode_relayed_settings_fields(pdata)
+                except (IndexError, ValueError):
+                    continue
+                if decoded is not None:
+                    serial, settings = decoded
+                    found.setdefault(serial, _finalize(settings))
+                break
+        except Exception:
+            continue
+    return found
+
+
+def parse_powerpulse_message(payload: bytes) -> dict[str, Any] | None:
+    """Parse a PowerPulse 2 (C376) protobuf frame into flat sensor keys."""
+    try:
+        headers, _ = decode_header_message(payload)
+        if not headers:
+            return None
+
+        merged: dict[str, Any] = {}
+        for header in headers:
+            cmd_key = (int(header.get("cmd_func", -1)), int(header.get("cmd_id", -1)))
+            if cmd_key == (2, 33):
+                decoder = _decode_heartbeat_fields
+            elif cmd_key == (2, 34):
+                decoder = _decode_param_report_fields
+            elif cmd_key == (241, 44):
+                decoder = _decode_run_data_sync_fields
+            else:
+                continue
+
+            for pdata in _pdata_candidates(header):
+                try:
+                    decoded = decoder(pdata)
+                except (IndexError, ValueError):
+                    # Only a payload that is not valid protobuf falls through
+                    # to the next candidate; a clean decode ends the attempt,
+                    # empty or not (see _pdata_candidates).
+                    continue
+                merged.update(decoded)
+                break
+    except Exception:
+        return None
+    if not merged:
+        return None
+
+    finalized = _finalize(merged)
+    return finalized or None

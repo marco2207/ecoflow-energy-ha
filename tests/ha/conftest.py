@@ -1,0 +1,303 @@
+"""Shared fixtures for HA integration tests.
+
+These tests use pytest-homeassistant-custom-component which provides
+a real (in-memory) Home Assistant instance via the ``hass`` fixture.
+"""
+
+from __future__ import annotations
+
+import threading
+from collections.abc import AsyncGenerator, Iterable
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+
+def add_entities_collector(target: list[Any]) -> AddEntitiesCallback:
+    """Collect the entities a platform creates into `target`.
+
+    A platform's setup takes a callback with an optional second argument, so a
+    bare `list.extend` does not fit the signature Home Assistant declares even
+    though it works at runtime. This is that callback, in one place rather than
+    redefined in every file that sets a platform up.
+    """
+
+    def _add(new_entities: Iterable[Any], update_before_add: bool = False) -> None:
+        target.extend(new_entities)
+
+    return _add
+
+
+@pytest.fixture(autouse=True)
+def _record_threads_before_test():
+    """Record threads before test so the framework's leak-check only sees new ones.
+
+    pytest-homeassistant-custom-component checks that no non-DummyThread
+    outlives the test. HA Core's _run_safe_shutdown_loop daemon thread can
+    linger on slow CI runners. We join it in teardown before the framework check.
+    """
+    before = set(threading.enumerate())
+    yield
+    for thread in threading.enumerate():
+        if thread not in before and "_run_safe_shutdown_loop" in thread.name:
+            thread.join(timeout=5)
+
+
+from custom_components.ecoflow_energy.const import (  # noqa: E402
+    AUTH_METHOD_APP,
+    CONF_ACCESS_KEY,
+    CONF_AUTH_METHOD,
+    CONF_DEVICES,
+    CONF_EMAIL,
+    CONF_MODE,
+    CONF_PASSWORD,
+    CONF_SECRET_KEY,
+    CONF_USER_ID,
+    DEVICE_TYPE_DELTA,
+    DEVICE_TYPE_DELTA3,
+    DEVICE_TYPE_POWEROCEAN,
+    DEVICE_TYPE_SMARTPLUG,
+    DEVICE_TYPE_STREAM,
+    DOMAIN,
+    MODE_ENHANCED,
+    MODE_STANDARD,
+)
+
+# ---------------------------------------------------------------------------
+# Enable custom integration discovery (required by
+# pytest-homeassistant-custom-component)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(enable_custom_integrations):
+    """Enable HA to discover custom_components/ecoflow_energy."""
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Per-test config directory (PLAN-118)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def hass(hass: HomeAssistant, tmp_path: Path) -> AsyncGenerator[HomeAssistant]:
+    """Give every test its own config directory instead of the plugin's shared one.
+
+    ``hass.config.path()`` in this harness otherwise resolves to the plugin's
+    own package directory (``testing_config/``), which every test shares. The
+    energy integrator is the one thing in this integration that writes there
+    directly (``.storage/ecoflow_energy_<sn>.json``), so a total flushed by one
+    test was still on disk for the next run of any other test, in the same
+    session or a later one.
+
+    This overrides the plugin's ``hass`` fixture by name, asks for the original
+    as a parameter, and repoints the config directory at pytest's per-test
+    ``tmp_path``. ``Config.config_dir`` is a plain attribute and ``Config.path``
+    joins it at call time, so nothing else has to cooperate.
+
+    The first shape of this fixture used the plugin's ``hass_tmp_config_dir``
+    hook, which is the documented way to do it and works on the version
+    installed here. It does not exist on 0.13.316, which is what CI installs:
+    versions from 0.13.317 need Python 3.14 and CI runs 3.13, so the floor in
+    ``requirements_test.txt`` is a pin in practice. Eight tests went red there
+    while every one of them passed locally. ``./scripts/dev/run_tests.sh
+    --ci-env`` reproduces that environment, and this shape is measured green on
+    both.
+    """
+    hass.config.config_dir = str(tmp_path)
+    yield hass
+
+
+# ---------------------------------------------------------------------------
+# Device info fixtures
+# ---------------------------------------------------------------------------
+
+MOCK_DELTA_DEVICE: dict[str, Any] = {
+    "sn": "DAEBK5ZZ12340001",
+    "name": "Delta 2 Max",
+    "product_name": "Delta 2 Max",
+    "device_type": DEVICE_TYPE_DELTA,
+    "online": 1,
+}
+
+MOCK_POWEROCEAN_DEVICE: dict[str, Any] = {
+    "sn": "HW52ZAB412340001",
+    "name": "PowerOcean",
+    "product_name": "PowerOcean",
+    "device_type": DEVICE_TYPE_POWEROCEAN,
+    "online": 1,
+}
+
+MOCK_SMARTPLUG_DEVICE: dict[str, Any] = {
+    "sn": "PLUG1234SN000001",
+    "name": "Smart Plug",
+    "product_name": "Smart Plug",
+    "device_type": DEVICE_TYPE_SMARTPLUG,
+    "online": 1,
+}
+
+MOCK_STREAM_DEVICE: dict[str, Any] = {
+    "sn": "BK31_TEST_DEVICE",
+    "name": "Stream AC Pro",
+    "product_name": "Stream AC Pro",
+    "device_type": DEVICE_TYPE_STREAM,
+    "online": 1,
+}
+
+MOCK_DELTA3_DEVICE: dict[str, Any] = {
+    "sn": "D3M1TEST00000001",
+    "name": "Delta 3 Max Plus",
+    "product_name": "DELTA 3 Max Plus",
+    "device_type": DEVICE_TYPE_DELTA3,
+    "online": 1,
+}
+
+MOCK_MQTT_CREDENTIALS: dict[str, str] = {
+    "certificateAccount": "test_cert_account",
+    "certificatePassword": "test_cert_password",
+    "url": "mqtt-e.ecoflow.com",
+    "port": "8883",
+    "protocol": "mqtts",
+}
+
+
+# ---------------------------------------------------------------------------
+# Config entry factories
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def standard_config_entry() -> MockConfigEntry:
+    """Create a Standard Mode config entry for a Delta 2 Max."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="EcoFlow Energy",
+        data={
+            CONF_ACCESS_KEY: "test_access_key",
+            CONF_SECRET_KEY: "test_secret_key",
+            CONF_MODE: MODE_STANDARD,
+            CONF_DEVICES: [MOCK_DELTA_DEVICE],
+        },
+        unique_id="test_access_key",
+    )
+
+
+@pytest.fixture
+def enhanced_config_entry() -> MockConfigEntry:
+    """Create an Enhanced Mode (app-auth) config entry for a PowerOcean."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="EcoFlow Energy",
+        data={
+            CONF_AUTH_METHOD: AUTH_METHOD_APP,
+            CONF_MODE: MODE_ENHANCED,
+            CONF_EMAIL: "test@example.com",
+            CONF_PASSWORD: "test_password",
+            CONF_USER_ID: "user123",
+            CONF_DEVICES: [MOCK_POWEROCEAN_DEVICE],
+        },
+        unique_id="test@example.com",
+    )
+
+
+@pytest.fixture
+def app_auth_config_entry() -> MockConfigEntry:
+    """Create an App-Auth config entry for a PowerOcean."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="EcoFlow Energy",
+        data={
+            CONF_AUTH_METHOD: AUTH_METHOD_APP,
+            CONF_MODE: MODE_ENHANCED,
+            CONF_EMAIL: "test@example.com",
+            CONF_PASSWORD: "test_password",
+            CONF_USER_ID: "user123",
+            CONF_DEVICES: [MOCK_POWEROCEAN_DEVICE],
+        },
+        unique_id="test@example.com",
+    )
+
+
+@pytest.fixture
+def mock_iot_api():
+    """Patch IoTApiClient to return mock credentials and devices."""
+    with patch(
+        "custom_components.ecoflow_energy.coordinator.setup.IoTApiClient",
+    ) as cls:
+        instance = cls.return_value
+        instance.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+        instance.get_device_list = AsyncMock(return_value=[MOCK_DELTA_DEVICE])
+        instance.refresh_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+        yield instance
+
+
+@pytest.fixture
+def mock_mqtt_client():
+    """Patch EcoFlowMQTTClient to a no-op mock.
+
+    Both consumers are patched: the coordinator and the listen-only probe
+    that captures raw data of devices without a parser. A setup with a
+    skipped device would otherwise open a real socket.
+    """
+    with (
+        patch("custom_components.ecoflow_energy.device_probe.EcoFlowMQTTClient"),
+        patch(
+            "custom_components.ecoflow_energy.coordinator.setup.EcoFlowMQTTClient",
+        ) as cls,
+    ):
+        instance = cls.return_value
+        instance.create_client.return_value = True
+        instance.connect.return_value = True
+        instance.start_loop.return_value = None
+        instance.is_connected.return_value = True
+        instance.disconnect.return_value = None
+        instance.cert_account = "test_cert_account"
+        instance.wss_mode = False
+        # A string, because diagnostics serialises it, and False, because a
+        # credential refresh only forces a reconnect when the address
+        # actually moved. A MagicMock is truthy and would make every
+        # refresh look like a region change.
+        instance.broker = "mqtt-e.ecoflow.com:8883"
+        instance.update_broker.return_value = False
+        instance.last_connect_time = 0
+        instance.reconnect_attempts = 0
+        instance.publish.return_value = True
+        instance.send_energy_stream_switch.return_value = None
+        instance.try_reconnect.return_value = None
+        yield instance
+
+
+@pytest.fixture
+def mock_http_client():
+    """Patch EcoFlowHTTPQuota to return mock data."""
+    with patch(
+        "custom_components.ecoflow_energy.coordinator.setup.EcoFlowHTTPQuota",
+    ) as cls:
+        instance = cls.return_value
+        instance.get_quota_all = AsyncMock(
+            return_value={
+                "pd.soc": 75,
+                "pd.wattsInSum": 200,
+                "pd.wattsOutSum": 100,
+            }
+        )
+        yield instance
+
+
+@pytest.fixture
+def mock_enhanced_auth():
+    """Patch AppApiClient to return mock login/credentials for app-auth setup."""
+    with patch(
+        "custom_components.ecoflow_energy.ecoflow.app_api.AppApiClient",
+    ) as cls:
+        instance = cls.return_value
+        instance.login = AsyncMock(return_value=True)
+        instance.user_id = "user123"
+        instance.get_mqtt_credentials = AsyncMock(return_value=MOCK_MQTT_CREDENTIALS)
+        yield instance

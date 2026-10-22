@@ -1,0 +1,1024 @@
+syntax = "proto3";
+
+// ecocharge - Canonical Protobuf schema for EcoFlow PowerOcean telemetry.
+// Envelope (HeaderMessage/Header) + JT-S1 PowerOcean messages in one file.
+// Source: Protocol analysis of EcoFlow Portal web client, validated against live MQTT.
+
+package ecoflow;
+
+// --- Envelope ---
+
+message Header {
+  bytes pdata = 1;
+  uint32 src = 2;
+  uint32 dest = 3;
+  uint32 d_src = 4;
+  uint32 d_dest = 5;
+  uint32 check_type = 7;
+  uint32 cmd_func = 8;
+  uint32 cmd_id = 9;
+  uint32 data_len = 10;
+  uint32 seq = 14;
+  uint32 product_id = 15;
+  uint32 payload_ver = 16;
+  string device_sn = 24;
+}
+
+message HeaderMessage {
+  repeated Header header = 1;
+}
+
+// --- Sub-messages ---
+
+message JTS1PhaseInfo {
+  float vol = 1;
+  float amp = 2;
+  float act_pwr = 3;
+  float react_pwr = 4;
+  float apparent_pwr = 5;
+}
+
+message JTS1MpptPVInfo {
+  float vol = 1;
+  float amp = 2;
+  float pwr = 3;
+  bool light_sta = 4;
+}
+
+message JTS1MpptStaReport {
+  repeated JTS1MpptPVInfo mppt_pv = 1;
+  float mppt_ins_resist = 2;
+  repeated float mppt_temp_val = 3;
+}
+
+message JTS1MeterStaReport {
+  uint32 meter_type = 1;
+  uint32 meter_addr = 2;
+  repeated float meter_data = 3;
+}
+
+message JTS1LoadInfo {
+  float vol = 1;
+  float amp = 2;
+  float freq = 3;
+  float pwr = 4;
+}
+
+// --- Energy Stream Report (cmd_func=96, cmd_id=33) ---
+message JTS1EnergyStreamReport {
+  float sys_load_pwr = 1;
+  float sys_grid_pwr = 2;
+  float mppt_pwr = 3;
+  float bp_pwr = 4;
+  uint32 bp_soc = 5;
+  // Per-string PV power, alongside the mppt_pwr total above. Confirmed on a
+  // PowerOcean with two strings: pv1_pwr + pv2_pwr matched mppt_pwr in 37 of
+  // 37 pushes, largest deviation 10 W. Declared with explicit presence
+  // because a string produces a real 0 W whenever it is dark or unwired, and
+  // an omitted zero would read as a string that is not there.
+  //
+  // No entity comes from these. Per-string power is already published from
+  // the richer mppt_heart_beat container on cmd_id=1, which also carries
+  // voltage and current. They are declared so they stop being reported as
+  // undecoded field numbers on every PowerOcean download.
+  //
+  // The command family also lists pv_inv_pwr at 8, pv3_pwr at 9 and
+  // other_pv_pwr at 10. Those stay undeclared on purpose. None appears in
+  // any of the 44 recorded frames of this command, and the first would be a
+  // third source for a quantity two commands already feed: cmd_id=39 carries
+  // it under a rename to pv_inverter_power_w, and the heartbeat's
+  // ems_pv_inv_pwr maps to that same key. Declaring it here would add the
+  // value a third time, under a fourth name, with no rename to reconcile it.
+  optional float pv1_pwr = 6;
+  optional float pv2_pwr = 7;
+}
+
+// --- Parallel Energy Stream Report (cmd_func=96, cmd_id=50) ---
+//
+// A PowerOcean that runs as a parallel pair does not send cmd_id=33 at all.
+// Its energy stream is this list instead: one row per unit, each stamped with
+// that unit's serial in dev_sn, plus one row with no dev_sn that carries the
+// system totals (#347, the reporter's diagnostics of 2026-09-05: 625 lists in
+// 54 minutes, no cmd_id=33 anywhere in the download; the unit rows' bp_pwr
+// sum to the total row's to 0.001 W in every decoded frame). The five
+// readings share their numbering with JTS1EnergyStreamReport, so the total
+// row maps onto the same sensor keys. Fields 9 and 10 (both float) appear
+// on the wire and stay undeclared: on the pair field 9 equals mppt_pwr, on a
+// J329 it does not, and nothing reads either.
+//
+// sys_grid_pwr on a unit row is the flow between the two units, not the
+// meter: the two unit rows are near-equal and opposite while the total row
+// sits near zero. A per-unit grid sensor must not come from it.
+message JTS1ParallelEnergyStream {
+  float sys_load_pwr = 1;
+  float sys_grid_pwr = 2;
+  float mppt_pwr = 3;
+  float bp_pwr = 4;
+  uint32 bp_soc = 5;
+  string dev_sn = 6;
+}
+
+message JTS1ParallelEnergyStreamReport {
+  repeated JTS1ParallelEnergyStream para_energy_stream = 1;
+}
+
+// --- PV Inverter Energy Stream Report (cmd_func=96, cmd_id=39) ---
+message JTS1EmsPVInvEnergyStreamReport {
+  float pv_inv_pwr = 1;
+}
+
+// --- Energy Stream Detail (cmd_func=96, cmd_id=34) ---
+message JTS1EnergyStreamItem {
+  float load_pwr = 1;
+  float grid_pwr = 2;
+  float mppt_pwr = 3;
+  float bp_pwr = 4;
+  uint32 timestamp = 5;
+  sint32 timezone = 6;
+  uint32 bp_soc = 7;
+}
+
+message JTS1EnergyStreamDetail {
+  repeated JTS1EnergyStreamItem sys_energy_stream = 1;
+  uint32 sys_seq = 2;
+}
+
+// --- EMS Heartbeat (cmd_func=96, cmd_id=1) ---
+message JTS1EmsHeartbeat {
+  float bp_remain_watth = 1;
+  uint32 bp_dsg_time = 2;
+  bool rate_ctrl_swtich = 3;
+  uint32 sys_rate_ctrl_time = 4;
+  uint32 dura_time = 5;
+  float pcs_act_pwr = 10;
+  float pcs_ac_freq = 11;
+  JTS1PhaseInfo pcs_a_phase = 12;
+  JTS1PhaseInfo pcs_b_phase = 13;
+  JTS1PhaseInfo pcs_c_phase = 14;
+  repeated JTS1LoadInfo pcs_load_info = 15;
+  float pcs_bus_volt = 16;
+  float pcs_leak_amp = 17;
+  float pcs_dci = 18;
+  float pcs_dcv = 19;
+  repeated JTS1MeterStaReport meter_heart_beat = 30;
+  repeated JTS1MpptStaReport mppt_heart_beat = 31;
+  float pcs_vbus_ref = 32;
+  float pcs_active_power_ref = 33;
+  float pcs_active_power_limit_up = 34;
+  float pcs_active_power_limit_dn = 35;
+  float pcs_bp_power = 36;
+  float pcs_bp_power_chg_limit = 37;
+  uint32 pcs_relay_state_show = 38;
+  uint32 pcs_grid_safety_func_record = 39;
+  uint32 pcs_grid_safety_state_record = 40;
+  float pcs_grid_inv_error_rms = 41;
+  float pcs_pfc_cur_real = 42;
+  float pcs_pfc_cur_ref = 43;
+  float pcs_reactive_power_ref = 44;
+  float pcs_meter_power = 45;
+  uint32 pcs_comm_interface_state = 46;
+  float pcs_average_voltage = 47;
+  float pcs_vgrid_thd = 48;
+  float pcs_interrupt_occupancy_rate = 49;
+  uint32 ems_mppt_selfcheck_state = 50;
+  uint32 ems_mppt_startup_state = 51;
+  uint32 ems_bp_selfcheck_state = 52;
+  uint32 ems_bp_startup_state = 53;
+  uint32 ems_pcs_selfcheck_state = 54;
+  uint32 ems_pcs_startup_state = 55;
+  float ems_bus_volt = 56;
+  uint32 ems_active_off_grid_cmd = 57;
+  uint32 ems_bp_alive_num = 58;
+  float ems_bp_power = 59;
+  float ems_bp_chg = 60;
+  float ems_bp_dsg = 61;
+  uint32 ems_bp_chg_request = 62;
+  uint32 ems_self_used_cnt = 63;
+  uint32 ems_ac_makeup_triggle_soc = 64;
+  uint32 ems_ac_makeup_exit_soc = 65;
+  uint32 ems_ac_makeup_min_soc = 66;
+  uint32 ems_ac_makeup_cnt = 67;
+  uint32 ems_start_fsm_state = 68;
+  uint32 ems_mppt_run_state = 69;
+  uint32 ems_mppt_mod_stat = 70;
+  uint32 ems_stop_cmd = 71;
+  uint32 ems_sys_cfg = 72;
+  uint32 ems_lp_state = 73;
+  uint32 ems_lp_type = 74;
+  uint32 ems_lp_mppt_cnt = 75;
+  uint32 ems_lp_bp_cnt = 76;
+  uint32 ems_lp_state_flag = 77;
+  uint32 ems_soc_calib_state = 78;
+  uint32 ems_soc_calib_request = 79;
+  uint32 ems_mppt_hb_state = 80;
+  float ems_ntc_temp_max = 81;
+  float ems_bus_volt_err_slid_filter = 82;
+  float ems_bus_volt_ripple = 83;
+  float ems_pv_inv_pwr = 84;
+  float mppt_bus_vol_ref = 100;
+  float dcdc_bus_vol_ref = 101;
+  float dcdc_bp_vol = 102;
+  float dcdc_inductance_curr = 103;
+  float inner_temperature = 104;
+  uint32 power_limit_mode = 105;
+  uint32 inv_rated_power = 106;
+  uint32 dcdc_state_record = 107;
+  uint32 ems_work_mode = 108;
+  float pcs_backup_pwr = 109;
+}
+
+// --- Battery Heartbeat (cmd_func=96, cmd_id=7) ---
+message JTS1BpStaReport {
+  float bp_pwr = 1;
+  uint32 bp_soc = 2;
+  uint32 bp_soh = 3;
+  uint32 bp_sop = 4;
+  repeated float bp_temp = 5;
+  float bp_cell_max_vol = 6;
+  float bp_cell_min_vol = 7;
+  uint32 bp_run_sta = 8;
+  float bp_vol = 9;
+  float bp_amp = 10;
+  float bp_bus_vol = 11;
+  float bp_bus_amp = 12;
+  uint32 bp_err_code = 13;
+  repeated float bp_cell_vol = 14;
+  uint32 bp_dsrc = 15;
+  bytes bp_sn = 16;
+  uint32 bp_cycles = 17;
+  uint32 bp_balance_state = 18;
+  float bp_hv_mos_temp = 19;
+  float bp_lv_mos_temp = 20;
+  float bp_ptc_temp = 21;
+  float bp_hts_temp = 22;
+  float bp_bus_neg_temp = 23;
+  float bp_bus_pos_temp = 24;
+  float bp_env_temp = 25;
+  uint32 bp_accu_chg_cap = 26;
+  uint32 bp_accu_dsg_cap = 27;
+  uint32 bp_design_cap = 28;
+  uint32 bp_full_cap = 29;
+  float bp_max_cell_temp = 30;
+  float bp_min_cell_temp = 31;
+  float bp_max_mos_temp = 32;
+  float bp_min_mos_temp = 33;
+  uint32 bp_bms_fault = 34;
+  uint32 bp_eclound_soc = 35;
+  uint32 bp_heartbeat_ver = 36;
+  uint32 bp_timestamp = 37;
+  float bp_real_soc = 38;
+  float bp_real_soh = 39;
+  uint32 bp_global_protect = 40;
+  uint32 bp_down_limit_soc = 41;
+  uint32 bp_up_limit_soc = 42;
+  uint32 bp_active_cal_req_stat = 43;
+  uint32 bp_active_cal_run_stat = 44;
+  uint32 module_product_info = 45;
+  uint32 module_program_sta = 46;
+  uint32 module_apl_sw_ver = 47;
+  uint32 module_loader_sw_ver = 48;
+  uint32 bms_run_sta = 49;
+  uint32 bms_chg_dsg_sta = 50;
+  uint32 dab_mod_sta = 51;
+  uint32 bp_chg_sop = 52;
+  uint32 bp_dsg_sop = 53;
+  float bp_remain_watth = 54;
+  float bp_target_soc = 55;
+  float bp_diff_soc = 56;
+  float bp_max_soc = 57;
+  float bp_min_soc = 58;
+  float bp_limit_soc = 59;
+  float bp_calendar_soh = 60;
+  float bp_cycle_soh = 61;
+  bool bp_ac_recharge_flag = 62;
+  bool bp_ptc_heat_flag = 63;
+  uint32 bp_ptc_exit_event = 64;
+  uint32 bp_accu_chg_energy = 65;
+  uint32 bp_accu_dsg_energy = 66;
+  float bp_ptc_temp2 = 67;
+  uint32 bp_sys_state = 68;
+}
+
+message JTS1BpHeartbeatReport {
+  repeated JTS1BpStaReport bp_heart_beat = 1;
+}
+
+// --- Module inventory / error change report (cmd_func=96, cmd_id=3) ---
+//
+// The command family calls this an error change report, and every entry can
+// carry an error code. On live hardware it reads as an inventory instead:
+// one entry for the EMS module, which is the unit's own serial, one for the
+// PCS module, and one per battery pack. Four recordings of the same HJ31
+// taken across three days carry the identical 80 byte payload, byte for
+// byte, with all four serials present.
+//
+// No entity comes from this message, and in particular no error entity. Not
+// one of the observed entries sets an error code, so a fault sensor here
+// would be built on a field nobody has yet seen carry a value.
+//
+// It is decoded so that a fault, if one ever arrives, is readable at all.
+// An unregistered command reaches a diagnostics download as raw bytes and
+// nothing else, so a module reporting an error today would say so in a file
+// nobody can read. The serials it carries are masked out of diagnostics as
+// device identifiers, so they are not the reason this is here.
+//
+// The pack order it also establishes was measured and buys nothing. Numbering
+// is assigned in arrival order of the battery heartbeats, and the get-all
+// bundle at connect carries a heartbeat listing every pack at once - one
+// millisecond after this message, on the hardware it was measured on. See
+// PLAN-076.
+message JTS1ErrorCode {
+  // The command family declares these two as alternatives, one entry
+  // carrying either a serial or a code. Every observed entry carried a
+  // serial and not one carried a code, so what a reporting module looks
+  // like is unknown here and nothing downstream reads the code. Both carry
+  // explicit presence so that a zero, whenever one first arrives, is
+  // distinguishable from an absent field rather than silently dropped by
+  // proto3.
+  optional bytes module_sn = 1;
+  optional uint32 err_code = 2;
+}
+
+message JTS1ErrorChangeReport {
+  optional JTS1ErrorCode ems_err_code = 1;
+  optional JTS1ErrorCode pcs_err_code = 2;
+  // Repeated, although the command family declares this field inside a oneof
+  // together with field 1. That declaration cannot describe the wire: every
+  // observed payload carries field 3 twice in one message, once per battery
+  // pack, and a oneof member may appear at most once. Read as repeated, the
+  // payload decodes cleanly and the pack order survives; read as declared,
+  // the second pack would overwrite the first and the order would be lost.
+  repeated JTS1ErrorCode bp_err_code = 3;
+}
+
+// --- EMS Change Report (cmd_func=96, cmd_id=8) ---
+// All fields use oneof wrappers to preserve proto3 zero-values.
+// Without oneof, proto3 omits fields with value 0 during serialization,
+// which causes connectivity status (0=disconnected) and feed_mode
+// (0=self_use) to silently disappear from MessageToDict output.
+message JTS1EmsChangeReport {
+  oneof _sys_work_sta { uint32 sys_work_sta = 1; }
+  oneof _sys_grid_sta { uint32 sys_grid_sta = 2; }
+  oneof _ems_word_mode { uint32 ems_word_mode = 3; }
+  oneof _ems_backup_event { uint32 ems_backup_event = 4; }
+  oneof _bp_chg_dsg_sta { uint32 bp_chg_dsg_sta = 5; }
+  oneof _ems_keep_soc { uint32 ems_keep_soc = 6; }
+  oneof _bp_soc { uint32 bp_soc = 7; }
+  oneof _ems_sys_self_check_stat { uint32 ems_sys_self_check_stat = 8; }
+  oneof _bp_online_sum { uint32 bp_online_sum = 9; }
+  oneof _sys_on_off_machine_stat { uint32 sys_on_off_machine_stat = 10; }
+  oneof _sys_bat_chg_up_limit { uint32 sys_bat_chg_up_limit = 11; }
+  oneof _sys_bat_dsg_down_limit { uint32 sys_bat_dsg_down_limit = 12; }
+  oneof _bp_total_chg_energy { uint32 bp_total_chg_energy = 13; }
+  oneof _bp_total_dsg_energy { uint32 bp_total_dsg_energy = 14; }
+  oneof _sys_bat_backup_ratio { uint32 sys_bat_backup_ratio = 15; }
+  oneof _ems_feed_mode { uint32 ems_feed_mode = 16; }
+  oneof _ems_feed_ratio { uint32 ems_feed_ratio = 17; }
+  oneof _ems_feed_pwr { uint32 ems_feed_pwr = 18; }
+  oneof _sys_meter_cfg { uint32 sys_meter_cfg = 19; }
+  oneof _sys_type_cfg { uint32 sys_type_cfg = 20; }
+  oneof _pcs_run_sta { uint32 pcs_run_sta = 21; }
+  oneof _pcs_ac_err_code { uint32 pcs_ac_err_code = 22; }
+  oneof _pcs_dc_err_code { uint32 pcs_dc_err_code = 23; }
+  oneof _pcs_ac_warning_code { uint32 pcs_ac_warning_code = 191; }
+  oneof _mppt1_fault_code { uint32 mppt1_fault_code = 194; }
+  oneof _mppt2_fault_code { uint32 mppt2_fault_code = 195; }
+  oneof _ems_ctrl_led_bright { uint32 ems_ctrl_led_bright = 152; }
+  oneof _ems_work_state { uint32 ems_work_state = 205; }
+  oneof _iot_4g_sta { sint32 iot_4g_sta = 187; }
+  oneof _eth_wan_stat { uint32 eth_wan_stat = 224; }
+  oneof _wifi_sta_stat { uint32 wifi_sta_stat = 225; }
+  oneof _grid_is_energized { bool grid_is_energized = 752; }
+  // Fields below appear in cmd_id=17 only. The two command ids carry
+  // disjoint field sets on the same message: cmd 8 reports configuration
+  // and mode, cmd 17 reports run state, fault flags and the arc-fault
+  // detector. A device that sends both fills this message from both.
+  oneof _sys_heat_stat { uint32 sys_heat_stat = 190; }
+  oneof _mppt1_warning_code { uint32 mppt1_warning_code = 196; }
+  oneof _mppt2_warning_code { uint32 mppt2_warning_code = 197; }
+  oneof _bp_line_off_flag { uint32 bp_line_off_flag = 198; }
+  oneof _bat_relay_close_fail_flag { uint32 bat_relay_close_fail_flag = 201; }
+  oneof _afci_fault_flag_ch1 { uint32 afci_fault_flag_ch1 = 211; }
+  oneof _afci_fault_flag_ch2 { uint32 afci_fault_flag_ch2 = 216; }
+  oneof _afci_sellf_test_result { uint32 afci_sellf_test_result = 220; }
+  oneof _sys_cal_stat { uint32 sys_cal_stat = 223; }
+  oneof _parallel_type { uint32 parallel_type = 233; }
+  // cmd_id=8 only, but absent from the earlier field selection.
+  oneof _ems_sg_ready_en { bool ems_sg_ready_en = 183; }
+  oneof _ems_sg_run_stat { uint32 ems_sg_run_stat = 184; }
+  oneof _battery_limit_reason { uint32 battery_limit_reason = 600; }
+
+  // Grid-protection thresholds and their trip times, as commissioned in the
+  // inverter. Read off a live single-phase unit: 253.0 / 287.5 V over-voltage
+  // against 207.0 / 103.5 V under-voltage, 50.5 Hz over against 48.0 Hz under,
+  // trip times of 500 and 1000 ms. Installer configuration that does not move,
+  // so none of it becomes an entity. Declared because a device that sends them
+  // otherwise reports forty undecoded field numbers on every download, which
+  // buries the numbers that are genuinely unknown.
+  oneof _meter_connect_stat { uint32 meter_connect_stat = 30; }
+  oneof _pcs_over_vol1 { float pcs_over_vol1 = 31; }
+  oneof _pcs_over_vol2 { float pcs_over_vol2 = 32; }
+  oneof _pcs_over_vol3 { float pcs_over_vol3 = 33; }
+  oneof _pcs_over_vol_time1 { uint32 pcs_over_vol_time1 = 34; }
+  oneof _pcs_over_vol_time2 { uint32 pcs_over_vol_time2 = 35; }
+  oneof _pcs_over_vol_time3 { uint32 pcs_over_vol_time3 = 36; }
+  oneof _pcs_low_vol1 { float pcs_low_vol1 = 37; }
+  oneof _pcs_low_vol2 { float pcs_low_vol2 = 38; }
+  oneof _pcs_low_vol3 { float pcs_low_vol3 = 39; }
+  oneof _pcs_low_vol_time1 { uint32 pcs_low_vol_time1 = 40; }
+  oneof _pcs_low_vol_time2 { uint32 pcs_low_vol_time2 = 41; }
+  oneof _pcs_low_vol_time3 { uint32 pcs_low_vol_time3 = 42; }
+  oneof _pcs_over_vol_recover { float pcs_over_vol_recover = 43; }
+  oneof _pcs_low_vol_recover { float pcs_low_vol_recover = 44; }
+  oneof _pcs_vol_recover_time { uint32 pcs_vol_recover_time = 45; }
+  oneof _pcs_10min_over_vol { float pcs_10min_over_vol = 46; }
+  oneof _pcs_10min_over_vol_time { uint32 pcs_10min_over_vol_time = 47; }
+  oneof _pcs_over_freq1 { float pcs_over_freq1 = 48; }
+  oneof _pcs_over_freq2 { float pcs_over_freq2 = 49; }
+  oneof _pcs_over_freq_time1 { uint32 pcs_over_freq_time1 = 50; }
+  oneof _pcs_over_freq_time2 { uint32 pcs_over_freq_time2 = 51; }
+  oneof _pcs_low_freq1 { float pcs_low_freq1 = 52; }
+  oneof _pcs_low_freq2 { float pcs_low_freq2 = 53; }
+  oneof _pcs_low_freq_time1 { uint32 pcs_low_freq_time1 = 54; }
+  oneof _pcs_low_freq_time2 { uint32 pcs_low_freq_time2 = 55; }
+  oneof _pcs_over_freq_recover { float pcs_over_freq_recover = 56; }
+  oneof _pcs_low_freq_recover { float pcs_low_freq_recover = 57; }
+  oneof _pcs_freq_recover_time { uint32 pcs_freq_recover_time = 58; }
+  oneof _pcs_hvrt_lvrt_switch { uint32 pcs_hvrt_lvrt_switch = 59; }
+  oneof _pcs_over_vol_ride_through_start1 { float pcs_over_vol_ride_through_start1 = 60; }
+  oneof _pcs_over_vol_ride_through_start2 { float pcs_over_vol_ride_through_start2 = 61; }
+  oneof _pcs_over_vol_ride_through_protect_time1 { uint32 pcs_over_vol_ride_through_protect_time1 = 62; }
+  oneof _pcs_over_vol_ride_through_protect_time2 { uint32 pcs_over_vol_ride_through_protect_time2 = 63; }
+  oneof _pcs_low_vol_ride_through_start1 { float pcs_low_vol_ride_through_start1 = 64; }
+  oneof _pcs_low_vol_ride_through_start2 { float pcs_low_vol_ride_through_start2 = 65; }
+  oneof _pcs_low_vol_ride_through_start3 { float pcs_low_vol_ride_through_start3 = 66; }
+  oneof _pcs_low_vol_ride_through_protect_time1 { uint32 pcs_low_vol_ride_through_protect_time1 = 67; }
+  oneof _pcs_low_vol_ride_through_protect_time2 { uint32 pcs_low_vol_ride_through_protect_time2 = 68; }
+  oneof _pcs_low_vol_ride_through_protect_time3 { uint32 pcs_low_vol_ride_through_protect_time3 = 69; }
+
+  // IEEE 2030.5 is the utility-to-inverter control standard. A unit enrolled
+  // in a network operator's scheme reports the state of that control link,
+  // and one single-phase inverter sends these two fields five times a second
+  // and nothing else on this command. Until they were declared, its most
+  // frequent message parsed clean and empty.
+  //
+  // No entity yet: the entity list is static per device type, so every
+  // PowerOcean owner would get a sensor only an enrolled unit can populate.
+  // Declaring them first means the next download from any unit shows whether
+  // this is one installation or a whole region.
+  oneof _ieee20305_connect_stat { uint32 ieee20305_connect_stat = 612; }
+  oneof _ieee20305_ctrl_stat { uint32 ieee20305_ctrl_stat = 613; }
+  oneof _ieee20305_last_ctrl_timestamp { uint32 ieee20305_last_ctrl_timestamp = 614; }
+}
+
+// JTS1EmsParamChangeReport (cmd_id=13). Carries the user-tunable parameter
+// state that the EcoFlow app reads on dashboard open. Field 10 is the
+// surplus-slider mirror that the app writes via cmd_id=112 wire field 4
+// (`dev_soc`); the device echoes it here so other clients can observe
+// what the app set, even though the EMS-side `sys_bat_backup_ratio` (in
+// JTS1EmsChangeReport) is not updated by the app's truncated SET.
+//
+// Only `dev_soc` is decoded for now; other fields are documented for
+// future use but not parsed.
+// Peak shaving state, carried inside the parameter change report at field 14.
+// Decoded from a 27 byte block on a live PowerOcean: every field present,
+// every value zero, which is what a system with peak shaving switched off
+// reports. The status is an enum in the command family
+// (0 no task, 1 task exists, 2 task active) and is read as its number here,
+// for the same reason as the other enums in this file.
+message JTS1EmsPeakShavingReport {
+  optional uint32 peak_shaving_status = 1;
+  optional float peak_shaving_max_power = 2;
+  optional float peak_shaving_energy = 3;
+  optional float peak_shaving_soc = 4;
+  optional float peak_shaving_times = 5;
+  optional float peak_shaving_control_energy = 6;
+}
+
+message JTS1EmsParamChangeReport {
+  // The user-tunable parameters this report actually carries. All observed
+  // on live hardware: field 7 reads 35 on one unit and 63 on another, which
+  // is the main breaker rating in amps and the evidence that these are per
+  // installation rather than a constant decoded twice. The rest read zero on
+  // a system with none of the features configured.
+  //
+  // No entity comes from any of them. The breaker rating is a commissioning
+  // value that does not move, and everything else is zero until somebody
+  // switches a feature on. They are declared so a download names them instead
+  // of listing bare field numbers.
+  oneof _smart_ctrl { bool smart_ctrl = 1; }
+  oneof _energy_efficient_enable { bool energy_efficient_enable = 2; }
+  oneof _sys_zone { uint32 sys_zone = 3; }
+  oneof _sys_time_tab { uint32 sys_time_tab = 4; }
+  oneof _bp_burst { bool bp_burst = 5; }
+  oneof _lower_power_stat { bool lower_power_stat = 6; }
+  oneof _breaker_capacity_max { uint32 breaker_capacity_max = 7; }
+  oneof _breaker_enable_state { bool breaker_enable_state = 8; }
+  oneof _dev_soc { uint32 dev_soc = 10; }
+  oneof _sys_switch_bit { uint32 sys_switch_bit = 11; }
+  oneof _tou_offset { float tou_offset = 13; }
+  oneof _ems_peak_shaving_report {
+    JTS1EmsPeakShavingReport ems_peak_shaving_report = 14;
+  }
+  oneof _kraken_register_status { uint32 kraken_register_status = 18; }
+  oneof _kraken_switch { uint32 kraken_switch = 19; }
+
+  // Deliberately absent, and each for its own reason.
+  //
+  // 9 `timer_task` and 22 `timer_heating_task` are the scheduled tasks, and
+  // they are the reason this message is interesting at all. Neither appears
+  // in any recording held here: this is a *change* report, it fires when a
+  // parameter moves, and no unit recorded so far had a schedule changed while
+  // listening. Declaring their nested tree from zero observations would mean
+  // a future frame decoding into a plausible shape nobody has checked.
+  //
+  // 15 `ems_all_peak_task_report` and 17 `solar_Array` are the same risk one
+  // step milder: both were seen, both as empty submessages. Zero bytes prove
+  // the field exists, not what is inside it. Protobuf does not reject a wrong
+  // submessage shape - it fills what matches and hides the rest as unknown -
+  // so a guess here fails silently and convincingly.
+  //
+  // 12 `modbus_online_status` and 16 `alarm_reset_count` were never observed.
+  //
+  // Fields 20 and 21 arrive on one unit carrying 2500.0 and 3300.0, and the
+  // command family names no field at either number on this message. Power
+  // limits by magnitude, unidentified, left alone.
+}
+
+// --- PowerOcean scheduled charge tasks (cmd_func 96) ---
+//
+// One entry of the device's scheduled-task list. The task holds a window, a
+// charge power and an armed flag, and it carries no state of charge at all -
+// the reporter capture on #328 holds the whole ten-field message and none of
+// its fields is a SoC.
+//
+// Two deliberate departures from the command family's own declaration, both
+// forced by the frames on the wire:
+//
+// 1. `time_table` is length-delimited, not a varint. Every frame carrying it
+//    uses tag byte 0x52, which is field 10 wire type 2, followed by a length
+//    of 4. Declared as a varint it would not match the wire type, and
+//    protobuf would file the field as unknown and drop it without a word.
+//    The four bytes hold one varint; whether the block is a `bytes` blob or a
+//    packed repeated field cannot be told apart from a single element, so the
+//    safer of the two is declared: an unexpected content costs the field, not
+//    the whole message.
+// 2. The command family groups fields 1, 2, 3, 4, 5 and 10 into one `oneof`,
+//    which cannot be literal. Six of the seven captured writes carry two or
+//    more of those at once and the device acts on them; the create carries
+//    four of them in one message. Every field is therefore independently
+//    optional, which is also what the read path needs: an absent field 4 is
+//    how both sides of the wire express "not armed", so absence has to stay
+//    distinguishable from zero.
+
+message EmsTimerTaskCfg {
+  oneof _role { uint32 role = 1; }
+  oneof _is_cfg { uint32 is_cfg = 2; }
+  oneof _task_index { uint32 task_index = 3; }
+  oneof _is_enable { bool is_enable = 4; }
+  oneof _is_effect { bool is_effect = 5; }
+  oneof _type { uint32 type = 6; }
+  oneof _sys_chg_dsg_pwr { uint32 sys_chg_dsg_pwr = 7; }
+  oneof _time_mode { uint32 time_mode = 8; }
+  oneof _time_param { uint32 time_param = 9; }
+  oneof _time_table { bytes time_table = 10; }
+}
+
+// The whole task list, reported on cmd_id 10 inside the get-all reply the
+// device already answers. An empty list is an empty message: a system with no
+// schedule sends this header with a zero-length payload, which is what the
+// reporter's first four bundles carry.
+message EmsAllTimerTaskReport {
+  repeated EmsTimerTaskCfg time_task_cfg = 1;
+}
+
+// --- PowerOcean feed-to-grid schedule tasks (cmd_func 96, cmd_id 14/143/145) ---
+//
+// The same task-list shape as `EmsAllTimerTaskReport` above, on a different
+// header and with a different field layout. Evidence is the reporter capture
+// on #381 (J327, account sign-in): nine writes against slot 4 (create,
+// disable, enable, a power change, a window change, three repeat changes, a
+// delete) and
+// nine list pushes on cmd_id 14, all decoded byte for byte against this
+// declaration before it was written.
+//
+// The layout is not a copy of the timer family's numbering. `type` sits at
+// field 5, the timer task's `sys_chg_dsg_pwr` is `sys_meter_dsg_pwr` here and sits at
+// field 6, `is_effect` moves to field 7, and fields 8, 9 and 10 of the timer
+// task (`time_mode`, `time_param`, `time_table`) are replaced by one field 8
+// holding them as a nested message. Every write in the capture carries tag
+// byte 0x42, field 8 wire type 2, confirming the nesting rather than three
+// flat fields.
+//
+// `time_table` is declared `repeated uint32`, not `bytes` as the timer
+// family declares it. The timer family's single window fits in one
+// four-byte varint and the declaration keeps the block opaque on purpose
+// (see the comment above `EmsTimerTaskCfg`). This family's window can hold
+// two entries - every capture with two active windows shows an eight-byte
+// block, two packed varints back to back - so the field is declared as the
+// packed repeated type it is on the wire and protobuf unpacks it directly;
+// there is no second, opaque encoding to guess at, because there is nothing
+// left to guess: `MessageToDict` hands back the list of ints as they arrived.
+message EmsTouSubTimerTaskInfo {
+  oneof _time_mode { uint32 time_mode = 1; }
+  oneof _time_param { uint32 time_param = 2; }
+  repeated uint32 time_table = 3;
+}
+
+message EmsTouTaskCfg {
+  oneof _role { uint32 role = 1; }
+  oneof _is_cfg { uint32 is_cfg = 2; }
+  oneof _task_index { uint32 task_index = 3; }
+  oneof _is_enable { bool is_enable = 4; }
+  oneof _type { uint32 type = 5; }
+  oneof _sys_meter_dsg_pwr { uint32 sys_meter_dsg_pwr = 6; }
+  oneof _is_effect { bool is_effect = 7; }
+  oneof _tou_sub_info { EmsTouSubTimerTaskInfo tou_sub_info = 8; }
+}
+
+// The whole feed-to-grid schedule, reported on cmd_id 14. Field 2,
+// `pou_task_cfg`, is the device's declared name for a second list on the
+// same message and is never populated in any capture held here - declared so
+// a future frame that does carry it is not filed as unknown, never read
+// because there is nothing yet to read it against.
+message EmsAllTouTaskReport {
+  repeated EmsTouTaskCfg tou_task_cfg = 1;
+  repeated EmsTouTaskCfg pou_task_cfg = 2;
+}
+
+// --- Delta 3 generation (portable power stations) ---
+//
+// The Delta 3 generation publishes protobuf only - it never answers the
+// JSON `latestQuotas` request that the other device families use. The
+// main status frame (cmd_func=254, cmd_id=21) carries the same field
+// names as the HTTP quota response, so both transports feed the same
+// sensor keys.
+//
+// Every field is wrapped in its own `oneof` (the proto3 `optional`
+// form). This is presence tracking and it is mandatory: without it a
+// legitimate 0 (for example AC input power while the grid is
+// disconnected) would be indistinguishable from "not sent" and the
+// sensor would silently keep the previous value.
+//
+// This is a deliberate subset of the device's status message - protobuf
+// ignores field numbers it does not know, so unlisted fields are simply
+// skipped during parsing.
+
+message Delta3PowGetAcOutList {
+  repeated float pow_get_ac_out_item = 1;
+}
+
+message Delta3PowGet12VList {
+  repeated float pow_get_12v_item = 1;
+}
+
+// Main status frame (cmd_func=254, cmd_id=21). Sent in full every 120 s
+// and incrementally (changed fields only) about every 2 s under load.
+message Delta3DisplayProperty {
+  // --- Power totals (W) ---
+  oneof _pow_in_sum_w { float pow_in_sum_w = 3; }
+  oneof _pow_out_sum_w { float pow_out_sum_w = 4; }
+
+  // --- Inputs (W) ---
+  oneof _pow_get_ac_in { float pow_get_ac_in = 54; }
+  oneof _pow_get_pv { float pow_get_pv = 361; }
+  oneof _pow_get_pv2 { float pow_get_pv2 = 70; }
+
+  // --- Outputs (W) ---
+  oneof _pow_get_12v { float pow_get_12v = 37; }
+  oneof _pow_get_typec1 { float pow_get_typec1 = 11; }
+  oneof _pow_get_typec2 { float pow_get_typec2 = 12; }
+  oneof _pow_get_typec3 { float pow_get_typec3 = 100; }
+  oneof _pow_get_qcusb1 { float pow_get_qcusb1 = 9; }
+  oneof _pow_get_qcusb2 { float pow_get_qcusb2 = 10; }
+
+  // Per-outlet arrays: AC item[0] = AC1, item[2] = AC2 (signed, negative
+  // while the outlet delivers power). The 12 V list is the Anderson port.
+  oneof _pow_get_ac_out_list { Delta3PowGetAcOutList pow_get_ac_out_list = 972; }
+  oneof _pow_get_12v_list { Delta3PowGet12VList pow_get_12v_list = 969; }
+
+  // --- Port flow states (4 = inactive, other values = active) ---
+  oneof _flow_info_ac_out { uint32 flow_info_ac_out = 367; }
+  oneof _flow_info_ac2_out { uint32 flow_info_ac2_out = 971; }
+  oneof _flow_info_12v { uint32 flow_info_12v = 33; }
+
+  // --- Battery state ---
+  oneof _cms_batt_soc { float cms_batt_soc = 262; }
+  oneof _cms_chg_dsg_state { uint32 cms_chg_dsg_state = 282; }
+  oneof _cms_dsg_rem_time { uint32 cms_dsg_rem_time = 268; }
+  oneof _cms_chg_rem_time { uint32 cms_chg_rem_time = 269; }
+
+  // --- SoC limits / backup reserve (%) ---
+  oneof _cms_max_chg_soc { uint32 cms_max_chg_soc = 270; }
+  oneof _cms_min_dsg_soc { uint32 cms_min_dsg_soc = 271; }
+  oneof _backup_reverse_soc { uint32 backup_reverse_soc = 461; }
+
+  // AC charge power limit in watts, the value behind the app's charge speed
+  // slider (#181). Identified by direct manipulation rather than from a
+  // single snapshot: a reporter moved the slider from 1000 W to 1200 W and
+  // this field followed exactly, while every other field in the frame stayed
+  // put. App slider range is 200 W to 2400 W.
+  oneof _ac_in_chg_pow_max { uint32 ac_in_chg_pow_max = 209; }
+
+  // AC charge mode: 0 = custom power, 1 = battery-optimised, 2 = silent.
+  // The read-back for the charge speed slider above: the slider only takes
+  // effect in custom mode, so the two belong together. Observed at 0 on a
+  // DELTA 3 Max Plus whose app sat in custom mode with an active slider.
+  oneof _ac_in_chg_mode { uint32 ac_in_chg_mode = 124; }
+
+  // LCD backlight timeout in seconds, the app's "LCD screen timeout" under
+  // automatic shutdown. Six fixed steps: 10, 30, 60, 300, 1800 and 0, where 0
+  // is the app's "Never" and means the screen stays lit - not the reverse.
+  // That reading is not an assumption: a screenshot of the app's own settings
+  // page was held against a capture taken minutes earlier on the same D3M1,
+  // and all five rows of that page matched their fields, three of them
+  // reading "Never" against a wire value of 0. There is no field anywhere in
+  // this family that switches the panel off outright, and the app offers no
+  // such control either.
+  oneof _screen_off_time { uint32 screen_off_time = 18; }
+
+  // The four idle shutdowns from the same app page, in minutes. Each one powers
+  // its output - or the whole unit - down after the configured span with no load
+  // connected and no activity, which is the app's own wording and the reason
+  // these are not plain timers.
+  //
+  // All four offer the same eight steps: 30, 60, 120, 240, 360, 720, 1440 and 0,
+  // where 0 is "Never". The unit is settled rather than inferred: a screenshot
+  // of the 12 V DC page with "2 h" ticked was held against a capture in which
+  // field 20 read 120, and two hours is 120 minutes.
+  //
+  // Note the unit differs from screen_off_time above, which is seconds, inside
+  // this one message.
+  oneof _dev_standby_time { uint32 dev_standby_time = 17; }
+  oneof _ac_standby_time { uint32 ac_standby_time = 19; }
+  oneof _dc_standby_time { uint32 dc_standby_time = 20; }
+  oneof _ac2_standby_time { uint32 ac2_standby_time = 1460; }
+
+  // --- Switch / flag state ---
+  oneof _energy_backup_en { bool energy_backup_en = 7; }
+  oneof _en_beep { bool en_beep = 195; }
+  oneof _xboost_en { bool xboost_en = 25; }
+  oneof _bypass_out_disable { bool bypass_out_disable = 146; }
+
+  // Port priority. Each output port can be marked non-essential, in which case
+  // it stops being powered once the battery falls to its own threshold. The
+  // read-back always carries all three ports even when one changed; the write
+  // carries exactly one. `port_enable` true means non-essential - the port has
+  // a cutoff - and false means essential, which is the proto3 default and so
+  // arrives as an absent field.
+  oneof _power_outages_list { Delta3PowerOutagesList power_outages_list = 968; }
+
+  // 1 means port priority is currently in effect, any other value means it is
+  // not. It engages when there is no AC or grid input and no smart generator
+  // or microinverter is connected, so 2 is the everyday value. Confirmed in
+  // both directions by cutting mains ahead of a D3M1: it arrives as a change
+  // push within a second, not only in the two-minute full upload.
+  oneof _power_outages_active_flag { uint32 power_outages_active_flag = 1279; }
+}
+
+// Port priority payload, shared by the read-back (field 968) and the write
+// (ConfigWrite field 376). Port type: 1 = DC, 2 = AC 1, 3 = AC 2.
+message Delta3PowerOutageItem {
+  oneof _power_outage_port_enable { bool power_outage_port_enable = 1; }
+  oneof _power_outage_port_type { uint32 power_outage_port_type = 2; }
+  oneof _power_outage_min_soc { uint32 power_outage_min_soc = 3; }
+}
+
+message Delta3PowerOutagesList {
+  repeated Delta3PowerOutageItem power_outage_item = 1;
+}
+
+// Battery-side heartbeat (cmd_func=32, cmd_id=2), sent every 10 s. Two
+// nested version packs; only the v1p0 pack carries values we surface.
+message Delta3EmsHeartbeatV1P0 {
+  oneof _max_charge_soc { uint32 max_charge_soc = 7; }
+  oneof _lcd_show_soc { uint32 lcd_show_soc = 9; }
+  oneof _chg_remain_time { uint32 chg_remain_time = 12; }
+  oneof _dsg_remain_time { uint32 dsg_remain_time = 13; }
+  oneof _f32_lcd_show_soc { float f32_lcd_show_soc = 15; }
+  oneof _min_dsg_soc { uint32 min_dsg_soc = 21; }
+}
+
+message Delta3EmsHeartbeatV1P3 {
+  oneof _sys_chg_dsg_state { uint32 sys_chg_dsg_state = 4; }
+}
+
+message Delta3CmsHeartbeat {
+  optional Delta3EmsHeartbeatV1P0 v1p0 = 1;
+  optional Delta3EmsHeartbeatV1P3 v1p3 = 2;
+}
+
+// BMS heartbeat (cmd_func=32, cmd_id=50), sent about every 10 s alongside
+// the CMS heartbeat. This is the only frame that carries battery health:
+// state of health, cycle count and the lifetime charge/discharge energy
+// counters the device keeps itself. None of it exists in the HTTP quota,
+// so these keys have no Standard Mode counterpart - see the note in
+// `parsers/delta3_proto.py`.
+//
+// The pack-level arrays (cell_vol, cell_temp, mos_temp) are deliberately
+// left out: they are per-cell debug data, they would add sixteen entities
+// per device, and the min/max pairs below already carry the health signal.
+message Delta3BmsHeartbeat {
+  // Which battery pack this report is about. 0 is the built-in one and every
+  // extra battery counts up from 1. Undeclared until 2026-08-27, which is how
+  // two packs came to write the same flat sensor keys: a reporter's DELTA 3
+  // Plus with a 1024 Wh extra battery sent both packs inside one get-all reply
+  // one second apart, so three total_increasing sensors saw the second pack's
+  // lower lifetime totals as a meter reset. The command family calls it `num`.
+  oneof _num { uint32 num = 1; }
+  oneof _soc { uint32 soc = 6; }
+  oneof _vol { uint32 vol = 7; }
+  oneof _amp { int32 amp = 8; }
+  oneof _temp { int32 temp = 9; }
+  oneof _design_cap { uint32 design_cap = 11; }
+  oneof _remain_cap { uint32 remain_cap = 12; }
+  oneof _full_cap { uint32 full_cap = 13; }
+  oneof _cycles { uint32 cycles = 14; }
+  oneof _soh { uint32 soh = 15; }
+  oneof _max_cell_vol { uint32 max_cell_vol = 16; }
+  oneof _min_cell_vol { uint32 min_cell_vol = 17; }
+  oneof _max_cell_temp { int32 max_cell_temp = 18; }
+  oneof _min_cell_temp { int32 min_cell_temp = 19; }
+  oneof _max_mos_temp { int32 max_mos_temp = 20; }
+  oneof _min_mos_temp { int32 min_mos_temp = 21; }
+  oneof _max_vol_diff { uint32 max_vol_diff = 31; }
+  oneof _cell_series_num { uint32 cell_series_num = 32; }
+  oneof _all_err_code { uint32 all_err_code = 48; }
+  oneof _accu_chg_cap { uint32 accu_chg_cap = 50; }
+  oneof _accu_dsg_cap { uint32 accu_dsg_cap = 51; }
+  oneof _real_soh { float real_soh = 52; }
+  oneof _calendar_soh { float calendar_soh = 53; }
+  oneof _cycle_soh { float cycle_soh = 54; }
+  oneof _accu_chg_energy { uint32 accu_chg_energy = 79; }
+  oneof _accu_dsg_energy { uint32 accu_dsg_energy = 80; }
+}
+
+// --- PowerPulse wallbox, reported by the PowerOcean on cmd_func 209 ---
+//
+// The PowerOcean forwards the charging session of an attached PowerPulse. Only
+// the fields two reporter captures actually carry are declared here; the
+// message definition has more, and undeclared numbers are reported as unknown
+// fields rather than guessed at.
+//
+// Verified against a session recorded on 2026-08-12 (issue #245): field 11
+// equals field 16 minus field 15 in every frame, and the energy in field 9
+// divided by the elapsed time matches field 8 to within one percent across two
+// independent windows.
+
+enum EVChgSts {
+  EV_CHG_STS_NONE = 0;
+  EV_CHG_STS_AVAILABLE = 1;
+  EV_CHG_STS_PREPARING = 2;
+  EV_CHG_STS_CHARGING = 3;
+  EV_CHG_STS_SUSPENDED_EVSE = 4;
+  EV_CHG_STS_SUSPENDED_EV = 5;
+  EV_CHG_STS_FINISHING = 6;
+  EV_CHG_STS_FAULTED = 9;
+}
+
+message EVChargingParamReport {
+  oneof _ev_sn { string ev_sn = 1; }
+  oneof _ev_plug_and_play { uint32 ev_plug_and_play = 5; }
+  oneof _charging_status { EVChgSts charging_status = 6; }
+  oneof _ev_pwr { float ev_pwr = 8; }
+  oneof _ev_charging_energy { float ev_charging_energy = 9; }
+  oneof _work_mode { uint32 work_mode = 10; }
+  oneof _order_time { uint32 order_time = 11; }
+  oneof _order_state { uint32 order_state = 12; }
+  oneof _default_vehicle_id { string default_vehicle_id = 13; }
+  oneof _charge_vehicle_id { string charge_vehicle_id = 14; }
+  oneof _order_start_timestamp { fixed32 order_start_timestamp = 15; }
+  oneof _order_end_timestamp { fixed32 order_end_timestamp = 16; }
+  oneof _use_grid_first { uint32 use_grid_first = 17; }
+  oneof _switch_bits { uint32 switch_bits = 18; }
+}
+
+// --- PowerGlow heating rod, reported by the PowerOcean on cmd_func 212 ---
+//
+// The PowerOcean forwards the state of an attached PowerGlow. All twelve fields
+// below are present in all six report messages of a reporter capture recorded
+// on 2026-08-22 (issue #7), so none of them is inferred from a neighbour.
+//
+// The capture settles the scales for fields 4, 6 and 7: one message carries
+// 2159 drawn on field 4 at 69 on field 6 of a requested 80 on field 7, which is
+// watts and degrees exactly as sent. Field 5 rests on that one message too - it
+// reads 2160 there beside the 2159 - and elsewhere in the capture it reads 6510
+// while field 4 is zero, which is above any rating this rod has. Whether that
+// is a setpoint or an allowance is not settled here; the command family names
+// it target_power and the quota path already publishes its own targetPower to
+// the same sensor unscaled, so both modes at least agree with each other.
+//
+// The oneof wrappers matter: an idle rod reports field 4 as a real zero, which
+// a bare proto3 scalar would drop.
+//
+// The rod also appears on cmd_id 33 and 34. The command family gives those a
+// power, a temperature and a three-way split of where the energy came from,
+// and in this capture they carry neither power nor temperature - every 33 is
+// the bare serial and every 34 item omits the power. Only this report is
+// registered: it is the one message carrying the reading and both setpoints
+// together, so the four values cannot drift apart. The source split is the
+// reason someone will come back to 33 and 34, and it is not on this report.
+
+// Every name carries the rod's own hr_ prefix. The command family calls field
+// 6 plainly "temp", and a PowerOcean message already uses that name at field 9;
+// since each command's output merges into one flat dict per device, the shared
+// name would silently overwrite. The prefix is ours, the field numbers are the
+// device's.
+
+message HRChargingParamReport {
+  oneof _hr_sn { string hr_sn = 1; }
+  oneof _hr_mode { uint32 hr_mode = 2; }
+  oneof _hr_online_bits { uint32 hr_online_bits = 3; }
+  oneof _hr_heating_power { uint32 hr_heating_power = 4; }
+  oneof _hr_target_power { uint32 hr_target_power = 5; }
+  oneof _hr_temp { float hr_temp = 6; }
+  oneof _hr_target_temp { float hr_target_temp = 7; }
+  oneof _hr_run_stat { uint32 hr_run_stat = 8; }
+  oneof _hr_error_code { uint32 hr_error_code = 9; }
+  oneof _hr_water_tank_volume { uint32 hr_water_tank_volume = 10; }
+  oneof _hr_selfcheck_percent { uint32 hr_selfcheck_percent = 11; }
+  oneof _hr_run_flag { uint32 hr_run_flag = 12; }
+}
+
+// --- Accessories on the PowerOcean's cmd_func 241 (the EDEV relay) ---
+//
+// A PowerOcean relays its coupled accessories on command family 241 as well.
+// Every message opens with EdevBaseInfo naming the accessory by a bus address
+// (dev_addr) or its serial. The PowerPulse 2 wallbox (C376) reports here and
+// never on 209: three reporter captures (24.08., 27.08. and 28.08.2026, #247)
+// hold its whole charging session on cmd_id 3 - 1355 W at a 6 A setting,
+// energy and duration counting up within one order and resetting together
+// when a new order id appears - and not one 209/8 frame beside it. The
+// heating rod on the same relay reports on cmd_id 3 too, at its own address
+// and in field 3; a report without field 4 is therefore not a wallbox.
+//
+// Field names follow the command family the PowerOcean web client uses for
+// this relay; only the fields the captures carry are read (see the remap).
+
+message EdevBaseInfo {
+  oneof _dev_sn {
+    uint32 dev_addr = 1;
+    string dev_sn = 2;
+  }
+  oneof _sub_addr { uint32 sub_addr = 3; }
+}
+
+message EDevPileVehicleSet {
+  oneof _default_vehicle_id { string default_vehicle_id = 1; }
+  oneof _charge_vehicle_id { string charge_vehicle_id = 2; }
+  oneof _default_vehicle_comsumption { uint32 default_vehicle_comsumption = 3; }
+  oneof _current_vehicle_comsumption { uint32 current_vehicle_comsumption = 4; }
+}
+
+// The wallbox settings as the PowerOcean holds them. Currents are tenths of an
+// ampere: 60 and 160 in every capture for a 6 to 16 A charger, and a write of
+// 110 answered by the app's 11 A. Reported inside EDevPileChargingParamReport
+// and written back through EDevParamSet on cmd_id 102.
+message EDevPileParamSet {
+  oneof _switch_bits { uint32 switch_bits = 1; }
+  oneof _work_mode { uint32 work_mode = 2; }
+  oneof _current_ouput_max { uint32 current_ouput_max = 3; }
+  oneof _solar_current_min { uint32 solar_current_min = 4; }
+  oneof _phase_specified { uint32 phase_specified = 5; }
+  oneof _user_current_set { uint32 user_current_set = 6; }
+}
+
+// One charging order: energy in Wh and duration in seconds, both zero when
+// the order opens (captured on 27.08.: 364 Wh / 1080 s, then a new order id
+// with 0 / 0, then 51 / 240).
+message EDevPileOrderRealStatus {
+  oneof _order_id { uint32 order_id = 1; }
+  oneof _order_state { uint32 order_state = 2; }
+  oneof _order_start_timestamp { fixed32 order_start_timestamp = 3; }
+  oneof _order_end_timestamp { fixed32 order_end_timestamp = 4; }
+  oneof _order_charging_energy { uint32 order_charging_energy = 5; }
+  oneof _order_time { uint32 order_time = 6; }
+}
+
+// The wallbox report. charging_status carries the same numbering as EVChgSts
+// (1 available, 3 charging in the captures), charging_pwr is whole watts.
+message EDevPileChargingParamReport {
+  oneof _param_set { EDevPileParamSet param_set = 1; }
+  oneof _flag_state { uint32 flag_state = 2; }
+  oneof _online_bits { uint32 online_bits = 3; }
+  oneof _charging_status { uint32 charging_status = 4; }
+  oneof _error_code { bytes error_code = 5; }
+  oneof _charging_pwr { uint32 charging_pwr = 6; }
+  oneof _vehicle_info { EDevPileVehicleSet vehicle_info = 7; }
+  oneof _order_real_status { EDevPileOrderRealStatus order_real_status = 8; }
+  oneof _grid_phase_input { uint32 grid_phase_input = 10; }
+  oneof _ocpp_ctrl { uint32 ocpp_ctrl = 12; }
+}
+
+// cmd_id 3 on family 241. Fields 2 and 3 belong to other accessory kinds
+// (smart plugs; the heating rod reports in field 3 at its own address) and
+// are carried as opaque bytes: declared so a rod-only report does not show up
+// in the diagnostics as an undeclared field on every system with a rod, and
+// opaque because nothing reads them. Such a report decodes to no wallbox part
+// and maps to nothing - not to 0 W.
+message EDevParamReport {
+  oneof _dev_info { EdevBaseInfo dev_info = 1; }
+  oneof _plug_param { bytes plug_param = 2; }
+  oneof _third_plug_param_report { bytes third_plug_param_report = 3; }
+  oneof _pile_charging_param_report { EDevPileChargingParamReport pile_charging_param_report = 4; }
+}

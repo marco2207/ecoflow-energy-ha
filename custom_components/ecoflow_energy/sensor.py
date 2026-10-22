@@ -1,0 +1,516 @@
+"""Sensor platform for EcoFlow Energy."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import cast
+
+import homeassistant.util.dt as dt_util
+from homeassistant.components.sensor import (
+    RestoreSensor,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from .const import (
+    AUTH_METHOD_APP,
+    CONF_AUTH_METHOD,
+    CONF_VEHICLE_ENERGY,
+    DELTA2MAX_SENSORS,
+    DELTA3_SENSORS,
+    DELTAPROULTRA_SENSORS,
+    DEVICE_TYPE_DELTA,
+    DEVICE_TYPE_DELTA3,
+    DEVICE_TYPE_DELTA_PRO_ULTRA,
+    DEVICE_TYPE_OCEAN2,
+    DEVICE_TYPE_POWEROCEAN,
+    DEVICE_TYPE_POWERPULSE2,
+    DEVICE_TYPE_POWERSTREAM,
+    DEVICE_TYPE_SMART_HOME_PANEL_2,
+    DEVICE_TYPE_SMART_METER,
+    DEVICE_TYPE_SMART_PANEL_40,
+    DEVICE_TYPE_SMARTPLUG,
+    DEVICE_TYPE_SOLAR_TRACKER,
+    DEVICE_TYPE_STREAM,
+    DEVICE_TYPE_STREAM_AC5000,
+    DEVICE_TYPE_WAVE3,
+    DOMAIN,
+    OCEAN2_SENSORS,
+    POWEROCEAN_LOCAL_SENSOR_DEFS,
+    POWEROCEAN_SENSORS,
+    POWERPULSE2_SENSORS,
+    POWERSTREAM_SENSORS,
+    SMARTHOMEPANEL2_SENSORS,
+    SMARTMETER_SENSORS,
+    SMARTPANEL40_SENSORS,
+    SMARTPLUG_SENSORS,
+    SOLARTRACKER_SENSORS,
+    STREAM_SENSORS,
+    STREAMAC5000_SENSORS,
+    WAVE3_SENSORS,
+    EcoFlowSensorDef,
+    filter_defs_for_serial,
+)
+from .coordinator import EcoFlowDeviceCoordinator
+from .coordinator.local_modbus import EcoFlowLocalModbusCoordinator
+from .ecoflow.const import device_log_tag
+from .entity import (
+    EcoFlowWriteGateMixin,
+    accessory_ready,
+    label_placeholders,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Map string → HA enum
+_STATE_CLASS_MAP = {
+    "measurement": SensorStateClass.MEASUREMENT,
+    "total_increasing": SensorStateClass.TOTAL_INCREASING,
+    "total": SensorStateClass.TOTAL,
+}
+
+_ENTITY_CATEGORY_MAP = {
+    "diagnostic": EntityCategory.DIAGNOSTIC,
+    "config": EntityCategory.CONFIG,
+}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up EcoFlow sensors from a config entry."""
+    coordinators: dict[
+        str, EcoFlowDeviceCoordinator | EcoFlowLocalModbusCoordinator
+    ] = hass.data[DOMAIN][entry.entry_id]
+    registry = er.async_get(hass)
+    entities: list[SensorEntity] = []
+
+    for source in coordinators.values():
+        is_local = isinstance(source, EcoFlowLocalModbusCoordinator)
+        # The local coordinator offers every attribute the sensors read from
+        # the cloud one (device_sn, data, device_available, device_info,
+        # seed_energy_total, connection_mode); mqtt_status is skipped below.
+        coordinator = cast(EcoFlowDeviceCoordinator, source)
+        sensor_defs = filter_defs_for_serial(
+            [
+                sensor_def
+                for sensor_def in POWEROCEAN_LOCAL_SENSOR_DEFS
+                if sensor_def.key in source.published_keys
+            ]
+            if isinstance(source, EcoFlowLocalModbusCoordinator)
+            else _get_sensor_defs(coordinator.device_type),
+            coordinator.device_sn,
+        )
+        pending: list[EcoFlowSensorDef] = []
+        for sensor_def in sensor_defs:
+            if sensor_def.enhanced_only and not coordinator.enhanced_mode:
+                continue
+            if sensor_def.accessory and not accessory_ready(
+                coordinator,
+                sensor_def.key,
+                sensor_def.label_key,
+                sensor_def.accessory_needs_nonzero,
+            ):
+                if sensor_def.accessory_needs_nonzero and _owner_already_has_accessory(
+                    registry, coordinator, sensor_def
+                ):
+                    entities.append(EcoFlowSensor(coordinator, sensor_def))
+                    continue
+                pending.append(sensor_def)
+                continue
+            entities.append(EcoFlowSensor(coordinator, sensor_def))
+
+        # Diagnostic sensors (coordinator properties, not data-driven)
+        if not is_local:
+            entities.append(EcoFlowDiagnosticSensor(coordinator, "mqtt_status"))
+        entities.append(EcoFlowDiagnosticSensor(coordinator, "connection_mode"))
+
+        if pending:
+            _watch_for_accessory(
+                entry, registry, coordinator, pending, async_add_entities
+            )
+
+    async_add_entities(entities)
+
+    if (
+        entry.data.get(CONF_VEHICLE_ENERGY)
+        and entry.data.get(CONF_AUTH_METHOD) == AUTH_METHOD_APP
+    ):
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+        from .charging_history import (
+            async_register_history_stores,
+            async_setup_charging_history,
+            history_limits_store,
+        )
+        from .const import CONF_EMAIL, CONF_PASSWORD
+        from .ecoflow.app_api import AppApiClient
+
+        chargers = [
+            source
+            for source in coordinators.values()
+            if source.device_type == DEVICE_TYPE_POWERPULSE2
+        ]
+        if chargers:
+            api = AppApiClient(
+                async_get_clientsession(hass),
+                entry.data[CONF_EMAIL],
+                entry.data[CONF_PASSWORD],
+                history_store=history_limits_store(hass, entry),
+            )
+            try:
+                await async_register_history_stores(
+                    hass, entry, [source.device_sn for source in chargers]
+                )
+            except (OSError, ValueError, HomeAssistantError) as err:
+                # The history feature is optional: without a confirmed index
+                # its ledgers could outlive the entry, so skip only the
+                # history sensors and leave every live entity of the entry
+                # set up. The next reload retries.
+                _LOGGER.warning(
+                    "Charging history is off for %s: the saved index could "
+                    "not be confirmed (%s)",
+                    ", ".join(device_log_tag(source.device_sn) for source in chargers),
+                    err,
+                )
+                return
+            for charger in chargers:
+                await async_setup_charging_history(
+                    hass,
+                    entry,
+                    charger.device_sn,
+                    charger.device_info,
+                    async_add_entities,
+                    api,
+                )
+
+
+@callback
+def _owner_already_has_accessory(
+    registry: er.EntityRegistry,
+    coordinator: EcoFlowDeviceCoordinator,
+    definition: EcoFlowSensorDef,
+) -> bool:
+    """Whether a live registry entry for this accessory already exists.
+
+    Scope is deliberately `accessory_needs_nonzero` only, checked by the
+    caller. A reading that is zero-filled on every frame (the ES22's
+    Third-Party Solar Power overnight, or for good on a unit with no meter
+    feeding it) has already been discovered once if an earlier run left a
+    registry entry nobody, including the integration, disabled. Waiting for
+    a second non-zero frame before recreating it only produces
+    `unavailable` for as long as the reading happens to sit at zero. A
+    plain accessory's key never arrives at all when the accessory itself is
+    absent, so applying this to those would leave an entity stuck forever
+    on its restored value; the gate keeps deciding their first appearance.
+    """
+    unique_id = f"{coordinator.device_sn}_{definition.key}"
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+    if entity_id is None:
+        return False
+    entry = registry.async_get(entity_id)
+    if entry is None:
+        return False
+    return entry.disabled_by is not er.RegistryEntryDisabler.INTEGRATION
+
+
+@callback
+def _drop_stale_accessory_entity(
+    registry: er.EntityRegistry,
+    coordinator: EcoFlowDeviceCoordinator,
+    definition: EcoFlowSensorDef,
+) -> None:
+    """Remove a leftover registry entry of an accessory the device lacks.
+
+    Earlier releases created these entities on every device, so skipping
+    creation alone would leave the entry behind and it would still show up
+    in the device's entity list. Removal is limited to entries the
+    integration itself disabled and nobody ever touched: such an entity
+    never wrote a state, so nothing recorded is lost. An owner who enabled
+    the reading keeps entity and history, and so does one who enabled it and
+    later switched it off again, because that history exists either way.
+    """
+    unique_id = f"{coordinator.device_sn}_{definition.key}"
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+    if entity_id is None:
+        return
+    entry = registry.async_get(entity_id)
+    if entry is None or entry.disabled_by is not er.RegistryEntryDisabler.INTEGRATION:
+        return
+    registry.async_remove(entity_id)
+
+
+@callback
+def _watch_for_accessory(
+    config_entry: ConfigEntry,
+    registry: er.EntityRegistry,
+    coordinator: EcoFlowDeviceCoordinator,
+    pending: list[EcoFlowSensorDef],
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Add accessory sensors as soon as the device first reports them.
+
+    An accessory can be attached while Home Assistant is running, and the
+    first report may also arrive after setup. Both cases add the entities
+    without a reload. The first update that carries device data without the
+    accessory is also the point where a leftover entry from an earlier
+    release can be cleaned up: before that update, "not reported" and "not
+    connected yet" look the same.
+    """
+    cleaned = False
+
+    @callback
+    def _check_for_accessory() -> None:
+        nonlocal cleaned
+        ready = [
+            definition
+            for definition in pending
+            if accessory_ready(
+                coordinator,
+                definition.key,
+                definition.label_key,
+                definition.accessory_needs_nonzero,
+            )
+        ]
+        for definition in ready:
+            pending.remove(definition)
+        if ready:
+            async_add_entities(
+                [EcoFlowSensor(coordinator, definition) for definition in ready]
+            )
+        if not cleaned and coordinator.device_data:
+            cleaned = True
+            for definition in pending:
+                # A labelled per-slot reading (a panel circuit) never had an
+                # unconditional entity to clean up, and the first frame of an
+                # incremental device is often a push that names only a few
+                # slots: dropping here would remove entries the owner set up.
+                if definition.label_key is None:
+                    _drop_stale_accessory_entity(registry, coordinator, definition)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_check_for_accessory))
+
+
+class EcoFlowSensor(
+    EcoFlowWriteGateMixin, CoordinatorEntity[EcoFlowDeviceCoordinator], RestoreSensor
+):
+    """An EcoFlow sensor entity with state restore across reloads."""
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: EcoFlowDeviceCoordinator,
+        definition: EcoFlowSensorDef,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._definition = definition
+        self._attr_unique_id = f"{coordinator.device_sn}_{definition.key}"
+        # The key is the identity, the translation key only the label. They are
+        # the same for almost every sensor; a definition sets them apart where
+        # one reading needs a different name on a different device.
+        self._attr_translation_key = definition.translation_key or definition.key
+        self._attr_native_unit_of_measurement = definition.unit
+        placeholders = label_placeholders(
+            coordinator, definition.label, definition.label_key
+        )
+        if placeholders:
+            self._attr_translation_placeholders = placeholders
+        self._attr_icon = definition.icon
+        self._restored_value: datetime | float | int | str | None = None
+        self._last_written_value: datetime | float | int | str | None = None
+
+        if definition.device_class:
+            self._attr_device_class = SensorDeviceClass(definition.device_class)
+        if definition.state_class:
+            self._attr_state_class = _STATE_CLASS_MAP.get(definition.state_class)
+        if definition.entity_category:
+            self._attr_entity_category = _ENTITY_CATEGORY_MAP.get(
+                definition.entity_category
+            )
+        if definition.suggested_display_precision is not None:
+            self._attr_suggested_display_precision = (
+                definition.suggested_display_precision
+            )
+        if definition.disabled_by_default:
+            self._attr_entity_registry_enabled_default = False
+        if definition.options:
+            self._attr_options = definition.options
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return self.coordinator.device_available and super().available
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known value when entity is added."""
+        await super().async_added_to_hass()
+        if (
+            last := await self.async_get_last_sensor_data()
+        ) and last.native_value is not None:
+            # Enum sensors: discard restored values not in options list.
+            # After migrating from numeric to enum, old values like "0"
+            # or "WORKMODE_SELFUSE" are invalid and would block entity setup.
+            if (
+                self._definition.options
+                and str(last.native_value) not in self._definition.options
+            ):
+                return
+            # Home Assistant's stored type also allows a date or Decimal;
+            # only datetime is reachable here, from the one `timestamp`
+            # device class sensor (`ev_session_start_ts`), stored as the
+            # datetime `native_value` below already returns. The guard
+            # covers both assignments below rather than only the first, and
+            # the value is bound to a local because a property access is not
+            # narrowed by the check itself.
+            restored = last.native_value
+            if not isinstance(restored, (str, int, float, datetime)):
+                return
+            self._restored_value = restored
+            self._last_written_value = restored
+            # Seed the energy integrator so a lost or corrupt state file
+            # does not reset totals to zero. A restored value above the
+            # stored total is taken at once (ADR-010 addendum A1); a stale
+            # restored value at or below it can never lower a live total.
+            if self._definition.state_class == "total_increasing" and isinstance(
+                last.native_value, (int, float)
+            ):
+                self.coordinator.seed_energy_total(
+                    self._definition.key, float(last.native_value)
+                )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device info from coordinator."""
+        return self.coordinator.device_info
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._write_state_if_changed(self.native_value)
+
+    @property
+    def native_value(self) -> datetime | float | int | str | None:
+        """Return the sensor value, falling back to restored state.
+
+        A key PRESENT with value None is an explicit clear from the parser
+        (e.g. the inactive Delta 3 remain-time direction) and shows as
+        unknown. Only a MISSING key falls back to the restored value.
+        """
+        data = self.coordinator.data
+        if data is not None and self._definition.key in data:
+            val = data[self._definition.key]
+            if val is None:
+                return None
+            # Enum sensors: a live value outside the options list would make
+            # HA raise ValueError on every state write. Fall back to the
+            # restored value, mirroring the restore-path guard in
+            # async_added_to_hass.
+            if self._definition.options and str(val) not in self._definition.options:
+                return self._restored_value
+            # `timestamp` device class needs a timezone-aware datetime, but
+            # the parser hands over the raw Unix-seconds value straight off
+            # the wire (e.g. `ev_session_start_ts`) - HA would otherwise log
+            # a warning on every write and show the entity as unknown.
+            if self._definition.device_class == "timestamp":
+                if isinstance(val, (int, float)):
+                    return dt_util.utc_from_timestamp(val)
+                return None
+            return self._round_value(val)
+        return self._restored_value
+
+    def _round_value(self, val: float | int | str) -> float | int | str:
+        """Round numeric values based on suggested_display_precision."""
+        precision = self._definition.suggested_display_precision
+        if precision is None or not isinstance(val, (int, float)):
+            return val
+        return round(val, precision) if precision > 0 else int(round(val, 0))
+
+
+class EcoFlowDiagnosticSensor(
+    EcoFlowWriteGateMixin, CoordinatorEntity[EcoFlowDeviceCoordinator], SensorEntity
+):
+    """Diagnostic sensor that reads coordinator properties directly."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(
+        self,
+        coordinator: EcoFlowDeviceCoordinator,
+        key: str,
+    ) -> None:
+        """Initialize the diagnostic sensor."""
+        super().__init__(coordinator)
+        self._key = key
+        self._attr_unique_id = f"{coordinator.device_sn}_{key}"
+        self._attr_translation_key = key
+        self._last_written_value: str | None = None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device info from coordinator."""
+        return self.coordinator.device_info
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._write_state_if_changed(self.native_value)
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the diagnostic sensor value from coordinator property."""
+        if self._key == "mqtt_status":
+            return self.coordinator.mqtt_status
+        if self._key == "connection_mode":
+            return self.coordinator.connection_mode
+        return None
+
+
+def _get_sensor_defs(device_type: str) -> list[EcoFlowSensorDef]:
+    """Return sensor definitions based on device type."""
+    if device_type == DEVICE_TYPE_DELTA:
+        return DELTA2MAX_SENSORS
+    if device_type == DEVICE_TYPE_DELTA3:
+        return DELTA3_SENSORS
+    if device_type == DEVICE_TYPE_POWEROCEAN:
+        return POWEROCEAN_SENSORS
+    if device_type == DEVICE_TYPE_SMARTPLUG:
+        return SMARTPLUG_SENSORS
+    if device_type == DEVICE_TYPE_STREAM:
+        return STREAM_SENSORS
+    if device_type == DEVICE_TYPE_STREAM_AC5000:
+        return STREAMAC5000_SENSORS
+    if device_type == DEVICE_TYPE_POWERSTREAM:
+        return POWERSTREAM_SENSORS
+    if device_type == DEVICE_TYPE_SMART_METER:
+        return SMARTMETER_SENSORS
+    if device_type == DEVICE_TYPE_SOLAR_TRACKER:
+        return SOLARTRACKER_SENSORS
+    if device_type == DEVICE_TYPE_WAVE3:
+        return WAVE3_SENSORS
+    if device_type == DEVICE_TYPE_POWERPULSE2:
+        return POWERPULSE2_SENSORS
+    if device_type == DEVICE_TYPE_OCEAN2:
+        return OCEAN2_SENSORS
+    if device_type == DEVICE_TYPE_SMART_PANEL_40:
+        return SMARTPANEL40_SENSORS
+    if device_type == DEVICE_TYPE_DELTA_PRO_ULTRA:
+        return DELTAPROULTRA_SENSORS
+    if device_type == DEVICE_TYPE_SMART_HOME_PANEL_2:
+        return SMARTHOMEPANEL2_SENSORS
+    return []

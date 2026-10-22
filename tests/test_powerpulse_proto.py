@@ -1,0 +1,1389 @@
+"""Tests for the EcoFlow PowerPulse 2 (C376) protobuf parser.
+
+Every expectation below is a number the captured wallbox put on the wire
+during a 10-frame, 7-hour charging session (PLAN-132, issue #7): an idle
+plug, a single-phase charge, a three-phase charge and a finished session.
+Values are written out per frame rather than recomputed from the parser,
+because a test that derives its expectation from the code under test holds
+for any field map.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from ecoflow_energy.ecoflow.parsers.powerpulse_proto import (
+    _decode_settings_block,
+    _finalize,
+    parse_powerpulse_message,
+    parse_relayed_wallbox_settings,
+)
+from ecoflow_energy.ecoflow.proto_encoding import (
+    encode_field_bytes,
+    encode_field_varint,
+)
+
+FIXTURE = Path(__file__).parent / "fixtures" / "powerpulse" / "c376_frames_plan132.json"
+IDLE_LIMIT_FIXTURE = FIXTURE.with_name("c376_idle_limit_steps_20260910.json")
+PARAM_SET_ECHO_FIXTURE = FIXTURE.with_name("c376_param_set_echo_20260824.json")
+PARAM_SET_ECHO_SWEEP_FIXTURE = FIXTURE.with_name("c376_param_set_echo_20260910.json")
+CHARGE_MODE_ECHO_FIXTURE = FIXTURE.with_name("c376_charging_mode_echo_20260913.json")
+
+
+def _frames() -> list[dict[str, Any]]:
+    return json.loads(FIXTURE.read_text())["frames"]
+
+
+def _parse(ts_iso: str) -> dict[str, Any] | None:
+    """Parse the frame captured at this instant.
+
+    Frames are addressed by their timestamp, never by their position. The
+    fixture builder drops a frame whose masked bytes read as an identifier
+    run, so a position is not stable across a rebuild - and an index-addressed
+    test then silently asserts one frame's numbers against another's.
+    """
+    for frame in _frames():
+        if frame["ts_iso"].startswith(ts_iso):
+            return parse_powerpulse_message(bytes.fromhex(frame["hex"]))
+    raise AssertionError(f"no frame captured at {ts_iso}")
+
+
+def test_masked_property_frame_reports_charging_session() -> None:
+    """The 13:11 push (property topic, XOR-masked) is a three-phase charge."""
+    result = _parse("2026-09-07T13:11:27")
+    assert result is not None
+    assert result["ev_charge_status"] == "charging"
+    assert result["ev_session_status"] == "charging"
+    assert result["ev_charge_power_w"] == 6599.2
+    assert result["ev_voltage_l1_v"] == 233.7
+    assert result["ev_voltage_l2_v"] == 232.69
+    assert result["ev_voltage_l3_v"] == 231.65
+    assert result["ev_current_l1_a"] == 9.66
+    assert result["ev_current_l2_a"] == 9.66
+    assert result["ev_current_l3_a"] == 9.71
+    assert result["ev_max_current_a"] == 16.0
+    assert result["ev_charge_current_a"] == 10.0
+    assert result["ev_phase_mode"] == "three_phase"
+    assert result["ev_session_start_ts"] == 1788786565
+    assert result["ev_session_duration_s"] == 120
+    assert result["ev_session_energy_wh"] == 199
+    assert result["ev_session_start_energy_wh"] == 102067
+    assert result["ev_total_energy_wh"] == 102266
+
+
+def test_unmasked_get_reply_bundle_reports_finished_session() -> None:
+    """The 12:23 bundle (get_reply, unmasked) is the session that just ended."""
+    result = _parse("2026-09-07T12:23:58")
+    assert result is not None
+    assert result["ev_charge_status"] == "finishing"
+    assert result["ev_session_status"] == "finished"
+    assert result["ev_charge_power_w"] == 0.0
+    assert result["ev_voltage_l1_v"] == 233.12
+    assert result["ev_voltage_l2_v"] == 231.84
+    assert result["ev_voltage_l3_v"] == 232.0
+    assert result["ev_current_l1_a"] == 0.0
+    assert result["ev_current_l2_a"] == 0.0
+    assert result["ev_current_l3_a"] == 0.0
+    assert result["ev_max_current_a"] == 16.0
+    assert result["ev_charge_current_a"] == 16.0
+    assert result["ev_phase_mode"] == "three_phase"
+    assert result["ev_session_start_ts"] == 1788782107
+    assert result["ev_session_duration_s"] == 1648
+    assert result["ev_session_energy_wh"] == 4911
+    assert result["ev_session_start_energy_wh"] == 90626
+    assert result["ev_total_energy_wh"] == 95537
+
+
+def test_lifetime_counter_minus_session_start_equals_session_energy() -> None:
+    """`44 - 43 == 42` holds in every frame that reports all three keys.
+
+    Two of the ten captured frames withhold the session-scoped keys
+    entirely (the plug is idle, see
+    ``test_idle_frame_omits_session_energy_key`` below), so ``checked``
+    only counts the eight frames where the identity is actually exercised -
+    and the floor is that exact count, not 1, so a parser that only gets
+    the identity right on a single lucky frame cannot pass.
+    """
+    checked = 0
+    for frame in _frames():
+        result = _parse(frame["ts_iso"])
+        assert result is not None
+        if (
+            "ev_total_energy_wh" in result
+            and "ev_session_start_energy_wh" in result
+            and "ev_session_energy_wh" in result
+        ):
+            assert (
+                result["ev_total_energy_wh"] - result["ev_session_start_energy_wh"]
+                == result["ev_session_energy_wh"]
+            )
+            checked += 1
+    assert checked == 8
+
+
+def test_reported_power_is_below_and_near_the_per_phase_sum() -> None:
+    """Reported power sits just under ``sum(V * I)`` per phase.
+
+    Idle frames and the finished-session frame report currents at the
+    device's own noise floor (~0.004 A); the 0.5 A cutoff below excludes
+    those so the comparison only runs on frames with a real reading.
+    ``checked`` counts the frames that clear that floor, and the assertion
+    floor is that exact count - not 1 - so a parser that only gets the
+    ratio right on one frame cannot pass.
+    """
+    checked = 0
+    for frame in _frames():
+        result = _parse(frame["ts_iso"])
+        assert result is not None
+        currents = (
+            result["ev_current_l1_a"],
+            result["ev_current_l2_a"],
+            result["ev_current_l3_a"],
+        )
+        if max(currents) <= 0.5:
+            continue
+        voltages = (
+            result["ev_voltage_l1_v"],
+            result["ev_voltage_l2_v"],
+            result["ev_voltage_l3_v"],
+        )
+        phase_sum = sum(v * i for v, i in zip(voltages, currents, strict=True))
+        power = result["ev_charge_power_w"]
+        assert power < phase_sum
+        assert power > 0.9 * phase_sum
+        checked += 1
+    assert checked == 7
+
+
+def test_idle_frame_omits_session_energy_key() -> None:
+    """A plug with no session in progress (status 1) reports no session
+    total at all - not even 0.0 (PLAN-132 contract: absence, not zero).
+    """
+    result = _parse("2026-09-07T06:46:45")
+    assert result is not None
+    assert result["ev_charge_status"] == "available"
+    assert "ev_session_energy_wh" not in result
+    assert "ev_session_start_energy_wh" not in result
+    assert "ev_session_start_ts" not in result
+    assert "ev_session_duration_s" not in result
+    # The lifetime counter is not session-scoped and stays reported.
+    assert result["ev_total_energy_wh"] == 84944
+
+
+def test_cable_lock_reported_from_every_get_reply_bundle() -> None:
+    """gun_lock_keep_locking_en (2/34 field 19) is 1 in all three bundles."""
+    for ts_iso in ("2026-09-07T11:54:46", "2026-09-07T12:23:58", "2026-09-07T13:07:48"):
+        result = _parse(ts_iso)
+        assert result is not None
+        assert result["ev_cable_lock_enabled"] is True
+
+
+def test_zero_lifetime_counter_is_withheld_not_published() -> None:
+    """Field 44 == 0 must not surface as `ev_total_energy_wh` == 0.0.
+
+    No frame in this corpus ever reports the lifetime counter as zero, so
+    the guard that withholds it is exercised directly against the mapping
+    step's input rather than a captured frame - a `total_increasing` sensor
+    reads a published 0.0 as a meter reset, and this is the only such
+    sensor this parser feeds.
+    """
+    result = _finalize({"_total_energy_wh_raw": 0})
+    assert "ev_total_energy_wh" not in result
+
+
+def test_cable_lock_false_value_reported() -> None:
+    """The cable lock's False path, built by hand.
+
+    A second capture on 2026-09-09 measured field 19 as 0 before the lock
+    engaged and 1 afterwards; that capture is not part of this corpus, so
+    the False path is exercised against the mapping step's input directly.
+    """
+    result = _finalize({"_cable_lock_raw": 0})
+    assert result["ev_cable_lock_enabled"] is False
+
+
+def test_param_report_carries_the_configured_maximum_current() -> None:
+    """`2/34` field 9 becomes `ev_max_current_a` (PLAN-146).
+
+    The 2026-08-24 recording's seven `ParamReport` frames: the first echoes
+    the 11 A write that triggered it, the remaining six echo a later 16 A
+    write. The 2026-09-10 sweep gives four more values end to end.
+    """
+    frames = json.loads(PARAM_SET_ECHO_FIXTURE.read_text())["frames"]
+    expected_by_index = {0: 11.0, 1: 16.0, 2: 16.0, 4: 16.0, 6: 16.0, 8: 16.0, 9: 16.0}
+    for index, value in expected_by_index.items():
+        result = parse_powerpulse_message(bytes.fromhex(frames[index]["hex"]))
+        assert result is not None
+        assert result["ev_max_current_a"] == value
+
+    sweep_frames = json.loads(PARAM_SET_ECHO_SWEEP_FIXTURE.read_text())["frames"]
+    for index, value in enumerate((6.0, 7.0, 14.0, 7.0)):
+        result = parse_powerpulse_message(bytes.fromhex(sweep_frames[index]["hex"]))
+        assert result is not None
+        assert result["ev_max_current_a"] == value
+
+
+def test_heartbeat_and_param_report_agree_on_the_key() -> None:
+    """The three `2/33` HeartBeat frames of the same recording feed the same
+    `ev_max_current_a` key as the `2/34` ParamReport frames (PLAN-146)."""
+    frames = json.loads(PARAM_SET_ECHO_FIXTURE.read_text())["frames"]
+    for index in (3, 5, 7):
+        result = parse_powerpulse_message(bytes.fromhex(frames[index]["hex"]))
+        assert result is not None
+        assert result["ev_max_current_a"] == 16.0
+
+
+def test_unmapped_enum_numbers_drop_the_key_instead_of_writing_none() -> None:
+    """An unrecognised enum number must drop its key, not publish `None`.
+
+    The sibling PowerOcean parser drops the same shape for the same key
+    (`ev_charge_status`) because an unmapped value would crash the enum
+    sensor with "not in list of options"; the same reasoning applies to
+    all three enum fields this parser resolves.
+    """
+    assert "ev_charge_status" not in _finalize({"_plug_status_raw": 99})
+    assert "ev_session_status" not in _finalize({"_session_status_raw": 99})
+    assert "ev_phase_mode" not in _finalize({"_phase_mode_raw": 99})
+
+
+def test_heartbeat_plug_status_4_is_suspended_charger() -> None:
+    """A heartbeat whose field 1 is 4 (`EV_CHG_STS_SUSPENDED_EVSE`) reports
+    `suspended_charger`, the paused state a Start in Solar mode without
+    surplus ends in (#515).
+
+    The frame is built on the wire and goes through the whole header decode,
+    so the test reaches `_PLUG_STATUS_NAMES` and not a hand-set string. The
+    operands 2 and 3 are the control that the builder itself works. Mutations
+    this catches: dropping key 4 from `_PLUG_STATUS_NAMES` (the parse returns
+    None and the status never reaches the coordinator), or naming 4 like its
+    neighbour 5 (`suspended_vehicle`).
+    """
+    for plug_status, expected in (
+        (2, "preparing"),
+        (3, "charging"),
+        (4, "suspended_charger"),
+    ):
+        header = (
+            encode_field_bytes(1, encode_field_varint(1, plug_status))
+            + encode_field_varint(8, 2)
+            + encode_field_varint(9, 33)
+        )
+        result = parse_powerpulse_message(encode_field_bytes(1, header))
+        assert result == {"ev_charge_status": expected}, plug_status
+
+
+def test_phase_mode_and_session_status_counts_over_the_fixture() -> None:
+    """Exact counts over the fixture, not just "at least one".
+
+    Six of the ten frames report a single-phase charge and two report an
+    idle session; a mapping that silently swapped or dropped one of the two
+    enum values would still leave the suite green without this check.
+    """
+    single_phase = 0
+    idle = 0
+    for frame in _frames():
+        result = _parse(frame["ts_iso"])
+        assert result is not None
+        if result.get("ev_phase_mode") == "single_phase":
+            single_phase += 1
+        if result.get("ev_session_status") == "idle":
+            idle += 1
+    assert single_phase == 6
+    assert idle == 2
+
+
+def test_session_start_plus_duration_tracks_capture_time_on_property_frames() -> None:
+    """Field 40 is a unix timestamp, field 41 is a small seconds counter,
+    and their sum tracks the capture time within 0-3 s on live pushes.
+
+    Checked on the `property`-topic frames only: the three `get_reply`
+    bundles are a config read-back taken well after their own capture
+    timestamp (23-83 s in this corpus, not a live push), so the identity
+    does not hold for them and they are excluded rather than asserted on.
+    The ordering check below (`duration < start`) is what actually tells
+    the two fields apart - the sum used for the drift check is symmetric
+    in both operands and would not notice them being swapped.
+    """
+    checked = 0
+    for frame in _frames():
+        if frame["topic"] != "property":
+            continue
+        result = _parse(frame["ts_iso"])
+        assert result is not None
+        if "ev_session_start_ts" not in result:
+            continue
+        start = result["ev_session_start_ts"]
+        duration = result["ev_session_duration_s"]
+        # A 2026 unix timestamp is on the order of 1.7e9; no session in this
+        # corpus runs anywhere near that many seconds. If the two fields
+        # were swapped, this ordering would flip.
+        assert start > 1_700_000_000
+        assert 0 <= duration < start
+        capture_epoch = int(datetime.fromisoformat(frame["ts_iso"]).timestamp())
+        drift = capture_epoch - start - duration
+        assert 0 <= drift <= 3
+        checked += 1
+    assert checked == 5
+
+
+def test_maximum_current_follows_the_configured_limit_on_an_idle_wallbox() -> None:
+    """Field 18 is the limit; field 17 is the session setpoint (#7, 2026-09-10).
+
+    The second owner stepped his limit from 16 A down to 6 A on an idle
+    wallbox and the first pre-release's sensor stayed at 6 A throughout. In
+    his download the field the sensor read (17) is 60 in every heartbeat
+    while the field beside it (18) is 100 and then 60 at the minutes he
+    chose 10 A and 6 A. Both frames pin both keys, so swapping the two
+    fields back fails on the first frame and not only on the second.
+    """
+    frames = json.loads(IDLE_LIMIT_FIXTURE.read_text())["frames"]
+    assert len(frames) == 2
+    for frame in frames:
+        result = parse_powerpulse_message(bytes.fromhex(frame["hex"]))
+        assert result is not None, frame["ts_iso"]
+        assert result["ev_max_current_a"] == float(frame["configured_max_current_a"])
+        assert result["ev_charge_current_a"] == 6.0
+        assert result["ev_charge_status"] == "available"
+        assert result["ev_phase_mode"] == "single_phase"
+        assert "ev_session_energy_wh" not in result
+
+
+# --- The second prefix, C374 (#7, recording of 2026-09-11) ---------------
+#
+# Six of the eight HeartBeats kept from a 30-minute recording of several
+# short charging sessions (four session starts in the kept frames: one drawing
+# 16 A per phase from the grid, the others solar-controlled at 9.5 to 12.4 A
+# setpoints) on a wallbox that reports under `C374`. The two frames the
+# builder leaves out read as an identifier run in their masked bytes; the one
+# at 13:14:40, status `preparing` with every session field at 0, is covered
+# by the `_finalize` test below instead.
+
+C374_FIXTURE = FIXTURE.with_name("c374_frames_20260911.json")
+
+
+def _c374_results() -> list[tuple[str, dict[str, Any]]]:
+    out = []
+    for frame in json.loads(C374_FIXTURE.read_text())["frames"]:
+        result = parse_powerpulse_message(bytes.fromhex(frame["hex"]))
+        assert result is not None, frame["ts_iso"]
+        out.append((frame["ts_iso"], result))
+    return out
+
+
+def test_c374_frames_decode_with_the_c376_field_map() -> None:
+    """Same envelope, same fields, same scaling: every C374 HeartBeat parses
+    and the lifetime identity `44 - 43 == 42` holds on all of them.
+
+    The floor is the fixture's own frame count, so a fixture rebuilt with
+    fewer frames fails here rather than passing on a smaller set.
+    """
+    results = _c374_results()
+    assert len(results) == 6
+    for ts_iso, result in results:
+        assert result["ev_max_current_a"] == 20.0, ts_iso
+        assert result["ev_phase_mode"] == "three_phase", ts_iso
+        assert (
+            result["ev_total_energy_wh"] - result["ev_session_start_energy_wh"]
+            == result["ev_session_energy_wh"]
+        ), ts_iso
+    totals = [r["ev_total_energy_wh"] for _, r in results]
+    assert totals == [688, 1651, 2273, 2882, 3432, 3629]
+
+
+def test_c374_power_is_below_and_near_the_per_phase_sum() -> None:
+    """The three charging frames: 11.4 kW at 15.9 A, 8.7 kW at 12.1 A and
+    6.6 kW at 9.2 A, each just under the sum of the three phase products.
+    """
+    checked = 0
+    for ts_iso, result in _c374_results():
+        currents = (
+            result["ev_current_l1_a"],
+            result["ev_current_l2_a"],
+            result["ev_current_l3_a"],
+        )
+        if max(currents) <= 0.5:
+            continue
+        voltages = (
+            result["ev_voltage_l1_v"],
+            result["ev_voltage_l2_v"],
+            result["ev_voltage_l3_v"],
+        )
+        phase_sum = sum(v * i for v, i in zip(voltages, currents, strict=True))
+        assert 0.9 * phase_sum < result["ev_charge_power_w"] < phase_sum, ts_iso
+        assert result["ev_charge_status"] == "charging", ts_iso
+        checked += 1
+    assert checked == 3
+
+
+def test_c374_reports_preparing_between_sessions() -> None:
+    """Plug status 2 is `preparing`: cable attached, nothing flowing.
+
+    Neither C376 recording ever showed it. In the C374 recording it sits
+    between two sessions at 13:37:00 with power 0, currents at the noise
+    floor and the session status at idle, and the next session starts six
+    minutes later. Before the entry the parser dropped the value and the
+    sensor kept reading `finishing` from the session before.
+    """
+    by_ts = {ts[11:19]: r for ts, r in _c374_results()}
+    result = by_ts["13:37:00"]
+    assert result["ev_charge_status"] == "preparing"
+    assert result["ev_session_status"] == "idle"
+    assert result["ev_charge_power_w"] == 0.0
+    # The session fields still describe the session that just ended, the
+    # same way they do in `finishing`; only `available` withholds them.
+    assert result["ev_session_energy_wh"] == 916
+    assert result["ev_session_start_ts"] == 1789133366
+    statuses = [r["ev_charge_status"] for _, r in _c374_results()]
+    assert statuses.count("preparing") == 1
+    assert statuses.count("charging") == 3
+    assert statuses.count("finishing") == 2
+
+
+def test_zero_session_start_timestamp_is_withheld_not_published() -> None:
+    """A start timestamp of 0 never reaches the timestamp sensor.
+
+    The first C374 frame (13:14:40, left out of the fixture by the
+    identifier-run gate) carries status `preparing` with fields 40 to 43
+    all 0. Status 2 does not withhold the session fields, so without the
+    guard the sensor would show 1970-01-01. The other three zeros are real
+    readings and stay.
+    """
+    result = _finalize(
+        {
+            "_plug_status_raw": 2,
+            "_session_start_ts_raw": 0,
+            "_session_duration_s_raw": 0,
+            "_session_energy_wh_raw": 0,
+            "_session_start_energy_wh_raw": 0,
+        }
+    )
+    assert result["ev_charge_status"] == "preparing"
+    assert "ev_session_start_ts" not in result
+    assert result["ev_session_duration_s"] == 0
+    assert result["ev_session_energy_wh"] == 0
+    assert result["ev_session_start_energy_wh"] == 0
+
+
+# --- Charging mode, field 63 sub-field 4 (PLAN-147, #7, capture of
+# 2026-09-13) ---------------------------------------------------------------
+
+
+def _charge_mode_echo_frames() -> list[dict[str, Any]]:
+    return json.loads(CHARGE_MODE_ECHO_FIXTURE.read_text())["frames"]
+
+
+def _parse_charge_mode_echo(ts_iso: str) -> dict[str, Any] | None:
+    for frame in _charge_mode_echo_frames():
+        if frame["ts_iso"].startswith(ts_iso):
+            return parse_powerpulse_message(bytes.fromhex(frame["hex"]))
+    raise AssertionError(f"no frame captured at {ts_iso}")
+
+
+def test_charge_mode_echo_reports_solar_then_smart_then_solar() -> None:
+    """The three mode-write echoes actually kept in the fixture: the
+    identifier gate dropped the heartbeat that would have carried the
+    Custom write's echo (`3`, see the fixture note in PLAN-147), so only
+    the Solar and Smart transitions are checked here."""
+    result = _parse_charge_mode_echo("2026-09-13T22:49:14.763")
+    assert result is not None
+    assert result["ev_charge_mode"] == "solar"
+
+    result = _parse_charge_mode_echo("2026-09-13T22:50:12.810")
+    assert result is not None
+    assert result["ev_charge_mode"] == "smart"
+
+    result = _parse_charge_mode_echo("2026-09-13T22:51:13.907")
+    assert result is not None
+    assert result["ev_charge_mode"] == "solar"
+
+
+def test_charge_mode_baseline_heartbeats_report_solar() -> None:
+    """The three heartbeats captured before any write in the recording all
+    report Solar - the mode the wallbox was already in."""
+    for ts_iso in (
+        "2026-09-13T22:37:13",
+        "2026-09-13T22:39:13",
+        "2026-09-13T22:42:14",
+    ):
+        result = _parse_charge_mode_echo(ts_iso)
+        assert result is not None
+        assert result["ev_charge_mode"] == "solar", ts_iso
+
+
+def test_charge_mode_param_report_frames_carry_no_mode() -> None:
+    """Field 63 lives on the HeartBeat (2/33) only - the three `2/34`
+    ParamReport frames in the same fixture report no charging mode at all."""
+    for frame in _charge_mode_echo_frames():
+        if frame["cmds"][0]["cmd_id"] != 34:
+            continue
+        result = parse_powerpulse_message(bytes.fromhex(frame["hex"]))
+        assert result is not None
+        assert "ev_charge_mode" not in result
+
+
+def _synthetic_heartbeat_with_charge_mode(work_mode: int) -> bytes:
+    """A synthetic, unmasked `2/33` heartbeat carrying only field 63
+    (`po_linkage_param`) sub-field 4 (`work_mode`) - built by hand because
+    Fast (1) and Custom (3) fell to the fixture's identifier gate and are
+    not decodable from the capture (PLAN-147 evidence table)."""
+    po_linkage = (
+        encode_field_varint(1, 1)
+        + encode_field_varint(2, 1)
+        + encode_field_bytes(3, b"X" * 16)
+        + encode_field_varint(4, work_mode)
+        + encode_field_varint(5, 1)
+    )
+    pdata = encode_field_bytes(63, po_linkage)
+    header = (
+        encode_field_bytes(1, pdata)
+        + encode_field_varint(8, 2)
+        + encode_field_varint(9, 33)
+    )
+    return encode_field_bytes(1, header)
+
+
+def test_charge_mode_synthetic_fast_and_custom() -> None:
+    """Fast (1) and Custom (3), the two wire values absent from the fixture,
+    decode correctly from a hand-built frame using the same field layout."""
+    for work_mode, expected in ((1, "fast"), (3, "custom")):
+        result = parse_powerpulse_message(
+            _synthetic_heartbeat_with_charge_mode(work_mode)
+        )
+        assert result is not None
+        assert result["ev_charge_mode"] == expected
+
+
+def test_charge_mode_unmapped_number_drops_the_key() -> None:
+    """Same reasoning as the other three enum fields this parser resolves:
+    an unrecognised `work_mode` must drop the key, not publish `None`."""
+    assert "ev_charge_mode" not in _finalize({"_charge_mode_raw": 9})
+
+
+def test_charge_mode_reported_on_every_plan132_frame() -> None:
+    """Field 63 is a genuine HeartBeat field, not one this recording happens
+    to omit: all ten PLAN-132 frames (a different session, issue #7,
+    2026-09-07) carry it, every one reporting Custom - the mode that
+    session's wallbox was set to throughout."""
+    checked = 0
+    for frame in _frames():
+        result = _parse(frame["ts_iso"])
+        assert result is not None
+        assert result["ev_charge_mode"] == "custom"
+        checked += 1
+    assert checked == 10
+
+
+def test_charge_mode_on_every_heartbeat_in_the_corpus() -> None:
+    """Every `2/33` in every powerpulse fixture carries the linkage record
+    with a mapped mode: 46 heartbeats in seven fixtures from six recordings
+    on 2026-09-14, with and without a PowerOcean on the account. The floor
+    sits at that count rather than at 1, so a parser that quietly stopped
+    reading the field on most frames, or a fixture that lost its heartbeats,
+    is caught (`verify-the-checker`, shape 3)."""
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    heartbeats = 0
+    modes: set[str] = set()
+    for path in sorted(FIXTURE.parent.glob("*.json")):
+        payload = json.loads(path.read_text())
+        frames = payload.get("frames") or payload.get("pushes") or []
+        for frame in frames:
+            raw = bytes.fromhex(frame.get("hex") or frame.get("frame_hex") or "")
+            headers, _ = decode_header_message(raw)
+            if not any(
+                h.get("cmd_func") == 2 and h.get("cmd_id") == 33 for h in headers
+            ):
+                continue
+            result = parse_powerpulse_message(raw)
+            assert result is not None, (path.name, frame.get("ts_iso"))
+            assert "ev_charge_mode" in result, (path.name, frame.get("ts_iso"))
+            heartbeats += 1
+            modes.add(result["ev_charge_mode"])
+    assert heartbeats >= 46
+    assert modes == {"fast", "solar", "custom", "smart"}
+
+
+def test_charge_mode_c374_frames_report_fast_then_solar() -> None:
+    """The one real-frame source for `fast`: the `C374` recording (#7,
+    2026-09-11) carries mode 1 on its first two heartbeats and mode 2 on the
+    four that follow. Its owner described the sessions as "from the grid at
+    the full rate" and then "solar-controlled at lower currents", which is
+    the same order - an independent reading of 1 and 2 from a second owner
+    and a second wallbox, without a write to line them up against."""
+    modes = [(ts[11:19], result["ev_charge_mode"]) for ts, result in _c374_results()]
+    assert modes == [
+        ("13:19:18", "fast"),
+        ("13:24:21", "fast"),
+        ("13:32:28", "solar"),
+        ("13:37:00", "solar"),
+        ("13:42:03", "solar"),
+        ("13:44:51", "solar"),
+    ]
+
+
+def test_charge_mode_absent_from_a_message_with_no_field_63() -> None:
+    """Positive control the other way: `EDevRunDataSync` (241/44) is a
+    different message entirely and never carries field 63, so every frame
+    of that fixture reports no charging mode - the key is genuinely
+    conditional on the field being present, not defaulted from elsewhere."""
+    run_data_sync_fixture = FIXTURE.with_name("c376_run_data_sync_20260824.json")
+    frames = json.loads(run_data_sync_fixture.read_text())["frames"]
+    assert len(frames) > 0
+    for frame in frames:
+        result = parse_powerpulse_message(bytes.fromhex(frame["hex"]))
+        if result is None:
+            continue
+        assert "ev_charge_mode" not in result
+
+
+def test_charge_mode_field_does_not_disturb_existing_keys() -> None:
+    """Adding field 63 to the HeartBeat field loop must not change any of
+    the values already asserted for this frame elsewhere in this file."""
+    result = _parse("2026-09-07T13:11:27")
+    assert result is not None
+    assert result["ev_charge_status"] == "charging"
+    assert result["ev_max_current_a"] == 16.0
+    assert result["ev_charge_current_a"] == 10.0
+    assert result["ev_phase_mode"] == "three_phase"
+    assert result["ev_charge_power_w"] == 6599.2
+
+
+# --- 241/44 settings block: switch bits and Solar minimum current (#480) ---
+#
+# Two recordings of the same wallbox taken on 2026-10-04, one per fixture. The
+# Solar minimum current moves between 6 A and 7 A in both, and the afternoon
+# one also shows the switch-bit field dropping from 18 to 2 and returning to
+# 18. Frames are addressed by timestamp, as everywhere in this file.
+
+SETTINGS_MORNING_FIXTURE = FIXTURE.with_name("c376_settings_480_morning_20261004.json")
+SETTINGS_AFTERNOON_FIXTURE = FIXTURE.with_name(
+    "c376_settings_480_afternoon_20261004.json"
+)
+SETTINGS_481_482_FIXTURE = FIXTURE.with_name("c376_settings_481_482_20261004.json")
+RUN_DATA_SYNC_FIXTURE = FIXTURE.with_name("c376_run_data_sync_20260824.json")
+
+# The Continuous charging flag inside the switch-bit field: set in the real
+# value 18 (0b10010), clear in the real value 2 (0b00010).
+_CONTINUOUS_BIT = 0x10
+
+
+def _parse_in(fixture: Path, ts_iso: str) -> dict[str, Any]:
+    """Parse the one frame of `fixture` captured at this instant."""
+    frames = json.loads(fixture.read_text())["frames"]
+    matches = [f for f in frames if f["ts_iso"].startswith(ts_iso)]
+    assert len(matches) == 1, f"{len(matches)} frames captured at {ts_iso}"
+    result = parse_powerpulse_message(bytes.fromhex(matches[0]["hex"]))
+    assert result is not None
+    return result
+
+
+def test_settings_morning_frames_report_switch_bits_and_solar_minimum() -> None:
+    """Switch bits stay 18 across the morning; the Solar minimum reads 6 A,
+    then 7 A in one frame, then 6 A again."""
+    expected = [
+        ("2026-10-04T06:56:52", 18, 6.0),
+        ("2026-10-04T07:09:41", 18, 7.0),
+        ("2026-10-04T07:16:27", 18, 6.0),
+    ]
+    for ts_iso, switch_bits, solar_min_a in expected:
+        result = _parse_in(SETTINGS_MORNING_FIXTURE, ts_iso)
+        assert result["ev_settings_switch_bits"] == switch_bits, ts_iso
+        assert result["ev_solar_min_current_a"] == solar_min_a, ts_iso
+
+
+def test_settings_afternoon_frames_report_continuous_off_then_on() -> None:
+    """The 7 A frame carries switch bits 2 (Continuous off); a later frame
+    carries 18 again, with the minimum back at 6 A."""
+    off = _parse_in(SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:38:36")
+    assert off["ev_settings_switch_bits"] == 2
+    assert off["ev_solar_min_current_a"] == 7.0
+
+    on = _parse_in(SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:43:57")
+    assert on["ev_settings_switch_bits"] == 18
+    assert on["ev_solar_min_current_a"] == 6.0
+
+
+def test_settings_frames_still_report_the_descriptor() -> None:
+    """The settings walk sits beside the descriptor walk in one decoder; the
+    descriptor keys the start/stop command is addressed with must come out of
+    the same frames unchanged."""
+    for fixture, ts_iso in (
+        (SETTINGS_MORNING_FIXTURE, "2026-10-04T07:09:41"),
+        (SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:38:36"),
+    ):
+        result = _parse_in(fixture, ts_iso)
+        assert result["ev_charger_dev_addr"] == 215, ts_iso
+        assert result["ev_charger_sn"] == "X" * 16, ts_iso
+
+
+def test_switch_bits_read_modify_write_keeps_unrelated_bits() -> None:
+    """Real values show why a Continuous toggle must start from the reported
+    field: clearing bit 0x10 of 18 gives exactly the 2 the wallbox reported
+    with Continuous off, so the other set bit (0x02) is not ours to drop."""
+    bits_on = _parse_in(SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:43:57")[
+        "ev_settings_switch_bits"
+    ]
+    bits_off = _parse_in(SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:38:36")[
+        "ev_settings_switch_bits"
+    ]
+    assert bits_on & _CONTINUOUS_BIT == _CONTINUOUS_BIT
+    assert bits_off & _CONTINUOUS_BIT == 0
+    assert bits_on & ~_CONTINUOUS_BIT == bits_off
+
+
+def test_frame_without_a_settings_block_reports_neither_settings_key() -> None:
+    """The 13:45:41 frame of the 2026-08-24 recording carries the descriptor
+    but no settings block: absence is not published as 0 or as a default.
+    The frame before it carries the block, so the fixture path is live."""
+    bare = _parse_in(RUN_DATA_SYNC_FIXTURE, "2026-08-24T13:45:41")
+    assert bare["ev_charger_dev_addr"] == 215
+    assert "ev_settings_switch_bits" not in bare
+    assert "ev_solar_min_current_a" not in bare
+    assert "ev_settings_work_mode" not in bare
+    assert "ev_phase_setting" not in bare
+    assert "ev_custom_current_a" not in bare
+
+    with_block = _parse_in(RUN_DATA_SYNC_FIXTURE, "2026-08-24T13:43:30")
+    assert with_block["ev_settings_switch_bits"] == 16
+    assert with_block["ev_solar_min_current_a"] == 6.0
+
+
+# --- 241/44 settings block: work mode, phase and Custom current (#480-#482) ---
+#
+# The same wallbox on 2026-10-04: the app changed the Custom current to 10 A
+# and switched to Custom mode (07:18:12), set one phase (07:22:29), set the
+# Custom current to 10 A in Solar mode (09:47:30) and set three phases
+# (09:54:37). Every report on file carries field 7 explicitly, 0 included.
+
+
+def test_settings_custom_mode_frame_reports_work_mode_and_custom_current() -> None:
+    """07:18:12 is the frame with work mode 3 (Custom) and a 10 A Custom current."""
+    result = _parse_in(SETTINGS_481_482_FIXTURE, "2026-10-04T07:18:12")
+    assert result["ev_settings_work_mode"] == "custom"
+    assert result["ev_custom_current_a"] == 10.0
+    assert isinstance(result["ev_custom_current_a"], float)
+    # The Solar minimum is a different field and keeps its own value.
+    assert result["ev_solar_min_current_a"] == 6.0
+
+
+def test_settings_custom_current_changes_independent_of_work_mode() -> None:
+    """09:47:30 carries Custom current 10 A while the mode is still Solar (2);
+    the frame before it (09:43:57 of the afternoon recording) reads 6 A."""
+    changed = _parse_in(SETTINGS_481_482_FIXTURE, "2026-10-04T09:47:30")
+    assert changed["ev_custom_current_a"] == 10.0
+    assert changed["ev_settings_work_mode"] == "solar"
+
+    before = _parse_in(SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:43:57")
+    assert before["ev_custom_current_a"] == 6.0
+    assert before["ev_settings_work_mode"] == "solar"
+
+
+def test_settings_phase_setting_one_phase_frame() -> None:
+    """07:22:29 carries phase setting 1 (one phase)."""
+    result = _parse_in(SETTINGS_481_482_FIXTURE, "2026-10-04T07:22:29")
+    assert result["ev_phase_setting"] == 1
+
+
+def test_settings_phase_setting_three_phases_frame() -> None:
+    """09:54:37 carries phase setting 2 (three phases)."""
+    result = _parse_in(SETTINGS_481_482_FIXTURE, "2026-10-04T09:54:37")
+    assert result["ev_phase_setting"] == 2
+
+
+def test_settings_phase_auto_is_reported_when_the_wire_carries_it() -> None:
+    """Auto is 0, the proto3 default, but real reports carry `7: 0` explicitly
+    and it is published as 0, in every mode the afternoon recording passes
+    through (Solar 2 at 09:38:36, Fast 1 at 09:42:10)."""
+    for ts_iso, mode in (
+        ("2026-10-04T09:38:36", "solar"),
+        ("2026-10-04T09:42:10", "fast"),
+    ):
+        result = _parse_in(SETTINGS_AFTERNOON_FIXTURE, ts_iso)
+        assert result["ev_settings_work_mode"] == mode, ts_iso
+        assert result["ev_phase_setting"] == 0, ts_iso
+        assert result["ev_custom_current_a"] == 6.0, ts_iso
+
+
+def test_settings_block_without_phase_field_publishes_no_phase_setting() -> None:
+    """A wallbox may omit its default `7: 0` (proto3): the key stays out
+    instead of being synthesized as 0. The block is built with the values of
+    the real 09:38:36 report minus field 7 - the decoder entry point is the
+    block itself, so no enclosing lengths need rewriting."""
+    block = (
+        encode_field_varint(1, 2)
+        + encode_field_varint(2, 2)
+        + encode_field_varint(6, 70)
+        + encode_field_varint(8, 60)
+    )
+    result = _finalize(_decode_settings_block(block))
+    assert "ev_phase_setting" not in result
+    assert result == {
+        "ev_settings_switch_bits": 2,
+        "ev_settings_work_mode": "solar",
+        "ev_solar_min_current_a": 7.0,
+        "ev_custom_current_a": 6.0,
+    }
+
+    with_phase = _decode_settings_block(block + encode_field_varint(7, 0))
+    assert with_phase["ev_phase_setting"] == 0
+
+
+# --- 241/44 work mode: named like the heartbeat's mode, under its own key ---
+#
+# The settings report and the heartbeat both carry the charging mode. The parser
+# names the settings reading `ev_settings_work_mode` with the same 1-4 table the
+# heartbeat uses and never writes `ev_charge_mode` from the settings path: the
+# coordinator decides which of the two readings is published. Frames below are
+# addressed by timestamp, as everywhere in this file.
+
+
+def test_settings_work_mode_is_named_like_the_heartbeat_mode() -> None:
+    """One real settings report per mode: Solar and Fast on the afternoon
+    recording, Custom on the Custom-current recording, Smart on the 2026-08-24
+    recording (the only report on file that carries mode 4)."""
+    expected = [
+        (SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:33:16.603", "solar"),
+        (SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:42:10", "fast"),
+        (SETTINGS_481_482_FIXTURE, "2026-10-04T07:18:12", "custom"),
+        (RUN_DATA_SYNC_FIXTURE, "2026-08-24T13:50:01", "smart"),
+    ]
+    for fixture, ts_iso, mode in expected:
+        result = _parse_in(fixture, ts_iso)
+        assert result["ev_settings_work_mode"] == mode, ts_iso
+
+
+def test_settings_only_frame_yields_no_published_mode_key() -> None:
+    """13:50:01 of the 2026-08-24 recording is a 241/44 frame alone, no
+    heartbeat: its mode is the settings reading and nothing is published
+    under the heartbeat's key from it."""
+    result = _parse_in(RUN_DATA_SYNC_FIXTURE, "2026-08-24T13:50:01")
+    assert result["ev_settings_work_mode"] == "smart"
+    assert "ev_charge_mode" not in result
+
+
+def test_bundle_frame_keeps_heartbeat_and_settings_modes_apart() -> None:
+    """09:33:16.219 is one frame carrying a heartbeat (2/33) and a settings
+    report (241/44): both name their mode, each under its own key."""
+    result = _parse_in(SETTINGS_AFTERNOON_FIXTURE, "2026-10-04T09:33:16.219")
+    assert result["ev_charge_mode"] == "solar"
+    assert result["ev_settings_work_mode"] == "solar"
+
+
+def _settings_frame_with_mode(switch_bits: int, work_mode: int) -> bytes:
+    """A synthetic, unmasked `241/44` frame carrying only the settings block
+    `f1 { f4 { f8 { 1: switch_bits, 2: work_mode } } }`, no `dev_info`."""
+    block = encode_field_varint(1, switch_bits) + encode_field_varint(2, work_mode)
+    body = encode_field_bytes(4, encode_field_bytes(8, block))
+    pdata = encode_field_bytes(1, body)
+    header = (
+        encode_field_bytes(1, pdata)
+        + encode_field_varint(8, 241)
+        + encode_field_varint(9, 44)
+    )
+    return encode_field_bytes(1, header)
+
+
+def test_settings_unmapped_work_mode_drops_the_key() -> None:
+    """A mode number outside 1-4 is dropped, not passed through, and the rest
+    of the block still decodes. The 7 here is deliberately off the table, and
+    a frame with a mapped mode on the same builder keeps its name."""
+    unmapped = parse_powerpulse_message(_settings_frame_with_mode(18, 7))
+    assert unmapped is not None
+    assert "ev_settings_work_mode" not in unmapped
+    assert unmapped["ev_settings_switch_bits"] == 18
+
+    mapped = parse_powerpulse_message(_settings_frame_with_mode(18, 2))
+    assert mapped is not None
+    assert mapped["ev_settings_work_mode"] == "solar"
+
+
+# --- 241/44 settings block: the display block, field 21 (PLAN-188, #495) ---
+#
+# Six bytes `[LED on, Screen on, LED brightness %, Screen brightness %, x, x]`.
+# Every captured settings report of the 2026-10-04 recordings carries
+# `aa01 06 01 01 19 19 02 00`: LED and screen on, both at 25 %.
+
+
+def _settings_frame_with_display(block: bytes) -> bytes:
+    """A synthetic, unmasked `241/44` frame whose settings block carries the
+    switch bits and the given display block (`f8 { 1: 18, 21: block }`)."""
+    inner = encode_field_varint(1, 18) + encode_field_bytes(21, block)
+    body = encode_field_bytes(4, encode_field_bytes(8, inner))
+    header = (
+        encode_field_bytes(1, encode_field_bytes(1, body))
+        + encode_field_varint(8, 241)
+        + encode_field_varint(9, 44)
+    )
+    return encode_field_bytes(1, header)
+
+
+def test_settings_display_block_reports_four_keys_and_validates_each_byte() -> None:
+    """The recorded frame 0 of the 481/482 recording reads LED on, screen on,
+    25 % and 25 %; its two trailing bytes (2 and 0) are published as nothing.
+    A synthetic block with an LED brightness of 30 (not a step) drops only that
+    key, a screen byte of 2 drops only that key, and a block of seven bytes is
+    a layout nobody has seen and yields none of the four.
+
+    Mutation probes: dropping the range check on the LED brightness byte fails
+    the 30 case (the key appears); decoding bytes 2 and 3 into each other's key
+    fails the 75 against 25 case (the recorded frame reads 25 twice and could
+    not tell them apart).
+    """
+    frames = json.loads(SETTINGS_481_482_FIXTURE.read_text())["frames"]
+    recorded = parse_powerpulse_message(bytes.fromhex(frames[0]["hex"]))
+    assert recorded is not None
+    assert recorded["ev_led_enabled"] is True
+    assert recorded["ev_screen_enabled"] is True
+    assert recorded["ev_led_brightness_pct"] == 25
+    assert recorded["ev_screen_brightness_pct"] == 25
+
+    distinct = parse_powerpulse_message(
+        _settings_frame_with_display(bytes([1, 0, 75, 25, 2, 0]))
+    )
+    assert distinct is not None
+    assert distinct["ev_led_enabled"] is True
+    assert distinct["ev_screen_enabled"] is False
+    assert distinct["ev_led_brightness_pct"] == 75
+    assert distinct["ev_screen_brightness_pct"] == 25
+
+    bad_brightness = parse_powerpulse_message(
+        _settings_frame_with_display(bytes([1, 0, 30, 75, 2, 0]))
+    )
+    assert bad_brightness is not None
+    assert "ev_led_brightness_pct" not in bad_brightness
+    assert bad_brightness["ev_screen_brightness_pct"] == 75
+    assert bad_brightness["ev_led_enabled"] is True
+    assert bad_brightness["ev_screen_enabled"] is False
+
+    bad_switch = parse_powerpulse_message(
+        _settings_frame_with_display(bytes([1, 2, 50, 75, 2, 0]))
+    )
+    assert bad_switch is not None
+    assert "ev_screen_enabled" not in bad_switch
+    assert bad_switch["ev_led_enabled"] is True
+    assert bad_switch["ev_led_brightness_pct"] == 50
+    assert bad_switch["ev_screen_brightness_pct"] == 75
+
+    odd_length = parse_powerpulse_message(
+        _settings_frame_with_display(bytes([1, 1, 25, 25, 2, 0, 0]))
+    )
+    assert odd_length is not None
+    assert odd_length["ev_settings_switch_bits"] == 18
+    for key in (
+        "ev_led_enabled",
+        "ev_screen_enabled",
+        "ev_led_brightness_pct",
+        "ev_screen_brightness_pct",
+    ):
+        assert key not in odd_length
+
+
+RELAYED_FIXTURE = FIXTURE.with_name("c376_relayed_settings_553_20261014.json")
+
+
+def _relayed_frame(label: str) -> bytes:
+    data = json.loads(RELAYED_FIXTURE.read_text())
+    return next(
+        bytes.fromhex(frame["hex"])
+        for frame in data["frames"]
+        if frame["label"] == label
+    )
+
+
+def test_relayed_settings_read_the_powerocean_field_numbers() -> None:
+    """The PowerOcean's `241/3` (#553) numbers the settings as
+    `EDevPileParamSet` does (4 Solar minimum, 5 phase, 6 Custom current), not
+    as the wallbox's own block (6, 7, 8). The values are checked against the
+    protobuf bindings reading the same pdata, so the parser's field table is
+    not the only witness.
+
+    Mutation probe: decoding the block with `_decode_settings_block` instead
+    reads phase and Custom current from the wrong fields and fails here.
+    """
+    from ecoflow_energy.ecoflow.proto import ecocharge_pb2
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    frame = _relayed_frame("baseline")
+    found = parse_relayed_wallbox_settings(frame)
+    assert list(found) == ["C376TEST00000007"]
+    settings = found["C376TEST00000007"]
+
+    report = ecocharge_pb2.EDevParamReport()
+    report.ParseFromString(bytes.fromhex(decode_header_message(frame)[0][0]["pdata"]))
+    param_set = report.pile_charging_param_report.param_set
+    assert settings["ev_settings_switch_bits"] == param_set.switch_bits == 2
+    assert settings["ev_settings_work_mode"] == "solar"
+    assert param_set.work_mode == 2
+    assert settings["ev_solar_min_current_a"] == param_set.solar_current_min / 10
+    assert settings["ev_phase_setting"] == param_set.phase_specified == 2
+    assert settings["ev_custom_current_a"] == param_set.user_current_set / 10
+    assert settings["ev_led_brightness_pct"] == 75
+    assert settings["ev_screen_brightness_pct"] == 75
+    assert settings["ev_led_enabled"] is True
+    assert settings["ev_screen_enabled"] is True
+    # The maximum current and the report's status and power are the
+    # wallbox's own readings; the relay does not carry them over.
+    for key in ("ev_max_current_a", "ev_charge_status", "ev_charge_power_w"):
+        assert key not in settings
+
+
+def test_relayed_settings_ignore_frames_without_a_wallbox_block() -> None:
+    """A wallbox frame, a `241/3` without the pile report (a heating rod
+    reports on the same command) and garbage all yield nothing."""
+    # A valid descriptor (address and a 16-character serial), so it is the
+    # missing pile report (field 4) that leaves the frame empty.
+    descriptor = encode_field_bytes(
+        1,
+        encode_field_varint(1, 7) + encode_field_bytes(2, b"C376TEST00000007"),
+    )
+
+    def relay_frame(body: bytes) -> bytes:
+        header = (
+            encode_field_bytes(1, descriptor + body)
+            + encode_field_varint(8, 241)
+            + encode_field_varint(9, 3)
+        )
+        return encode_field_bytes(1, header)
+
+    rod_only = relay_frame(encode_field_bytes(3, encode_field_varint(1, 1)))
+    assert parse_relayed_wallbox_settings(rod_only) == {}
+    # The same frame with a pile report decodes, so the empty result above
+    # is the missing field 4 and not the envelope.
+    with_pile = relay_frame(
+        encode_field_bytes(4, encode_field_bytes(1, encode_field_varint(1, 2)))
+    )
+    assert parse_relayed_wallbox_settings(with_pile) == {
+        "C376TEST00000007": {"ev_settings_switch_bits": 2}
+    }
+    assert parse_relayed_wallbox_settings(b"\xff\xff\xff") == {}
+    own = bytes.fromhex(json.loads(FIXTURE.read_text())["frames"][0]["hex"])
+    assert parse_relayed_wallbox_settings(own) == {}
+
+
+DISPLAY_553_FIXTURE = FIXTURE.with_name("c376_display_block_553_20261014.json")
+
+
+def _display_553_frames() -> list[bytes]:
+    data = json.loads(DISPLAY_553_FIXTURE.read_text())
+    return [bytes.fromhex(frame["hex"]) for frame in data["frames"]]
+
+
+def _raw_display_block(pdata_hex: str) -> bytes | None:
+    """Walk `pdata` f4 -> f1 -> f21 by hand: the witness is independent of the
+    parser's display decoder and of its ack filter."""
+    from ecoflow_energy.ecoflow.parsers.powerpulse_proto import _iter_fields
+
+    for num, wire, raw in _iter_fields(bytes.fromhex(pdata_hex)):
+        if num != 4 or wire != 2:
+            continue
+        for sub_num, sub_wire, sub_raw in _iter_fields(raw):
+            if sub_num != 1 or sub_wire != 2:
+                continue
+            for leaf_num, leaf_wire, leaf_raw in _iter_fields(sub_raw):
+                if leaf_num == 21 and leaf_wire == 2:
+                    return bytes(leaf_raw)
+    return None
+
+
+def _report_blocks(frame: bytes) -> list[tuple[bool, bytes | None]]:
+    """For each `241/3` header: (is the PowerOcean's own report, display block)."""
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    out: list[tuple[bool, bytes | None]] = []
+    for header in decode_header_message(frame)[0]:
+        if (header.get("cmd_func"), header.get("cmd_id")) != (241, 3):
+            continue
+        own = header.get("src") == 96 and header.get("is_ack") != 1
+        out.append((own, _raw_display_block(header["pdata"])))
+    return out
+
+
+def test_display_block_decodes_the_six_and_the_thirty_two_byte_form() -> None:
+    """T1 (#553). The app and the PowerOcean's `241/3` carry a 32-byte display
+    block: bytes 0-3 sit where the 6-byte block has them. The decoder says
+    which form it saw, so the write goes back in the same form. Any other
+    length is a layout nobody has seen and yields nothing.
+
+    Mutation probes: accepting only `len == 6` fails the 32 case; reading the
+    32-byte form from the wrong offsets (e.g. `raw[1:5]`) fails the values;
+    dropping the length key fails the `_display_block_len` asserts; accepting
+    every length >= 6 fails the 7 and 33 cases.
+    """
+    from ecoflow_energy.ecoflow.parsers.powerpulse_proto import _decode_display_block
+
+    frame_31 = _display_553_frames()[31]
+    (own, block), *_ = _report_blocks(frame_31)
+    assert own is True
+    assert block is not None
+    # Recorded: LED off, Screen on, LED 25 %, Screen 100 %, then 0x02 + 27 zeros.
+    assert block == bytes([0, 1, 25, 100, 2]) + bytes(27)
+    assert _decode_display_block(block) == {
+        "ev_led_enabled": False,
+        "ev_screen_enabled": True,
+        "ev_led_brightness_pct": 25,
+        "ev_screen_brightness_pct": 100,
+        "_display_block_len": 32,
+    }
+    assert _decode_display_block(bytes([1, 0, 75, 25, 2, 0])) == {
+        "ev_led_enabled": True,
+        "ev_screen_enabled": False,
+        "ev_led_brightness_pct": 75,
+        "ev_screen_brightness_pct": 25,
+        "_display_block_len": 6,
+    }
+
+
+def test_display_block_length_key_only_for_a_valid_length() -> None:
+    """A block of an unseen length yields no keys at all, the length key
+    included, even when its first four bytes would be valid."""
+    from ecoflow_energy.ecoflow.parsers.powerpulse_proto import _decode_display_block
+
+    for length in (5, 7, 31, 33):
+        block = bytes([1, 1, 50, 50]) + bytes(length - 4)
+        assert len(block) == length
+        assert _decode_display_block(block) == {}, length
+
+
+def test_display_block_with_four_unusable_bytes_leaves_nothing_behind() -> None:
+    """A six- or 32-byte block whose four bytes are all invalid yields `{}`,
+    not a lone length key."""
+    from ecoflow_energy.ecoflow.parsers.powerpulse_proto import _decode_display_block
+
+    for length in (6, 32):
+        assert _decode_display_block(bytes([2, 2, 0, 0]) + bytes(length - 4)) == {}
+
+
+def test_an_ack_copy_of_the_settings_is_not_the_wallbox_state() -> None:
+    """T2 (#553). The PowerOcean forwards the app's ack copy of the settings
+    (header src 32, is_ack 1) next to its own report; the copy carries stale
+    bits and the 100/100 display of the last app write. Only the PowerOcean's
+    own `241/3` (src 96) is read, so the copy cannot win a serial.
+
+    Mutation probes: removing the ack filter fails frame 32 (bits 3, phase 0
+    read from the copy) and the all-frames loop; filtering on `src == 32` alone
+    or on `is_ack == 1` alone fails the synthetic cases below.
+    """
+    frames = _display_553_frames()
+    # Frame 32: an ack copy beside an unrelated 96/7 header, nothing of its own.
+    assert [own for own, _ in _report_blocks(frames[32])] == [False]
+    assert parse_relayed_wallbox_settings(frames[32]) == {}
+    # Frame 31: the PowerOcean's own report.
+    found_31 = parse_relayed_wallbox_settings(frames[31])
+    assert list(found_31) == ["XXXXXXXXXXXXXXXX"]
+    assert found_31["XXXXXXXXXXXXXXXX"]["ev_settings_switch_bits"] == 19
+    assert found_31["XXXXXXXXXXXXXXXX"]["ev_phase_setting"] == 2
+    assert found_31["XXXXXXXXXXXXXXXX"]["ev_led_enabled"] is False
+    assert found_31["XXXXXXXXXXXXXXXX"]["ev_screen_brightness_pct"] == 100
+    assert found_31["XXXXXXXXXXXXXXXX"]["_display_block_len"] == 32
+
+    display_keys = (
+        "ev_led_enabled",
+        "ev_screen_enabled",
+        "ev_led_brightness_pct",
+        "ev_screen_brightness_pct",
+    )
+    compared = 0
+    own_frames = 0
+    ack_only_frames = 0
+    for index, frame in enumerate(frames):
+        blocks = _report_blocks(frame)
+        found = parse_relayed_wallbox_settings(frame)
+        own_blocks = [block for own, block in blocks if own and block is not None]
+        if not own_blocks:
+            if blocks:
+                ack_only_frames += 1
+            assert found == {}, index
+            continue
+        own_frames += 1
+        settings = found["XXXXXXXXXXXXXXXX"]
+        expected = own_blocks[0]
+        assert bool(settings["ev_led_enabled"]) == bool(expected[0]), index
+        assert bool(settings["ev_screen_enabled"]) == bool(expected[1]), index
+        assert settings["ev_led_brightness_pct"] == expected[2], index
+        assert settings["ev_screen_brightness_pct"] == expected[3], index
+        assert settings["_display_block_len"] == len(expected), index
+        assert all(key in settings for key in display_keys)
+        compared += 1
+    assert compared > 0
+    # The fixture's own count of PowerOcean reports and of frames that hold
+    # only an ack copy.
+    assert own_frames == 17
+    assert ack_only_frames == 13
+
+
+def test_the_ack_filter_reads_src_and_is_ack_separately() -> None:
+    """T2/T4 (#553). A header with neither field (the synthetic frame, the
+    older fixture's src 96 without `is_ack`) decodes; `src == 32` alone and
+    `is_ack == 1` alone are each an ack copy.
+
+    Mutation probes: keeping only the `src == 32` clause fails the is_ack
+    case, keeping only `is_ack == 1` fails the src case, requiring `src == 96`
+    fails the header-less synthetic case.
+    """
+    descriptor = encode_field_bytes(
+        1,
+        encode_field_varint(1, 7) + encode_field_bytes(2, b"C376TEST00000007"),
+    )
+    pdata = descriptor + encode_field_bytes(
+        4, encode_field_bytes(1, encode_field_varint(1, 2))
+    )
+
+    def frame(*extra: bytes) -> bytes:
+        header = (
+            encode_field_bytes(1, pdata)
+            + b"".join(extra)
+            + encode_field_varint(8, 241)
+            + encode_field_varint(9, 3)
+        )
+        return encode_field_bytes(1, header)
+
+    expected = {"C376TEST00000007": {"ev_settings_switch_bits": 2}}
+    assert parse_relayed_wallbox_settings(frame()) == expected
+    assert parse_relayed_wallbox_settings(frame(encode_field_varint(2, 96))) == expected
+    assert parse_relayed_wallbox_settings(frame(encode_field_varint(2, 32))) == {}
+    assert parse_relayed_wallbox_settings(frame(encode_field_varint(12, 1))) == {}
+    # Order does not matter: an ack copy ahead of the report must not win.
+    ack_first = frame(encode_field_varint(2, 32), encode_field_varint(12, 1)) + frame(
+        encode_field_varint(2, 96)
+    )
+    assert parse_relayed_wallbox_settings(ack_first) == expected
+
+    # The older fixture's header: src 96, no is_ack, still decoded.
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    older = _relayed_frame("baseline")
+    header = decode_header_message(older)[0][0]
+    assert header["src"] == 96
+    assert "is_ack" not in header
+    assert list(parse_relayed_wallbox_settings(older)) == ["C376TEST00000007"]
+
+
+def test_display_builder_writes_either_form_and_matches_the_app_write() -> None:
+    """T3 (#553). The 32-byte form is `[led, screen, led %, screen %, 0x02]`
+    plus 27 zero bytes; with the addressing and sequence of the app's write
+    (fixture frame 35, 116 bytes) it reproduces that frame byte for byte. The
+    6-byte form stays what it was. Another length is refused.
+
+    Mutation probes: padding the 32-byte form with the wrong constant (0x00
+    instead of 0x02 at byte 4) or with 26 zeros fails the frame comparison;
+    building the 6-byte form with the 32-byte tail fails the 6-byte case.
+    """
+    import pytest
+    from ecoflow_energy.ecoflow.energy_stream import (
+        build_powerpulse_param_set_display_payload,
+    )
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    app_write = _display_553_frames()[35]
+    assert len(app_write) == 116
+    header = decode_header_message(app_write)[0][0]
+    assert (header["cmd_func"], header["cmd_id"], header["seq"]) == (241, 102, 106)
+
+    built = build_powerpulse_param_set_display_payload(
+        1,
+        1,
+        100,
+        100,
+        dev_addr=215,
+        dev_sn="XXXXXXXXXXXXXXXX",
+        powerocean_sn="XXXXXXXXXXXXXXXX",
+        seq=106,
+        block_len=32,
+    )
+    assert built == app_write
+
+    def block_of(payload: bytes) -> bytes | None:
+        # A write carries the block directly under pdata f4 (the param set).
+        from ecoflow_energy.ecoflow.parsers.powerpulse_proto import _iter_fields
+
+        pdata = bytes.fromhex(decode_header_message(payload)[0][0]["pdata"])
+        for num, wire, raw in _iter_fields(pdata):
+            if num == 4 and wire == 2:
+                return next(
+                    (
+                        bytes(leaf)
+                        for leaf_num, leaf_wire, leaf in _iter_fields(raw)
+                        if leaf_num == 21 and leaf_wire == 2
+                    ),
+                    None,
+                )
+        return None
+
+    assert block_of(built) == bytes([1, 1, 100, 100, 2]) + bytes(27)
+    default = build_powerpulse_param_set_display_payload(
+        1,
+        0,
+        50,
+        75,
+        dev_addr=215,
+        dev_sn="XXXXXXXXXXXXXXXX",
+        powerocean_sn="XXXXXXXXXXXXXXXX",
+        seq=106,
+    )
+    assert block_of(default) == bytes([1, 0, 50, 75, 0, 0])
+    explicit_six = build_powerpulse_param_set_display_payload(
+        1,
+        0,
+        50,
+        75,
+        dev_addr=215,
+        dev_sn="XXXXXXXXXXXXXXXX",
+        powerocean_sn="XXXXXXXXXXXXXXXX",
+        seq=106,
+        block_len=6,
+    )
+    assert explicit_six == default
+    for bad in (0, 5, 7, 31, 33, True, "32"):
+        with pytest.raises(ValueError):
+            build_powerpulse_param_set_display_payload(
+                1,
+                1,
+                100,
+                100,
+                dev_addr=215,
+                dev_sn="XXXXXXXXXXXXXXXX",
+                powerocean_sn="XXXXXXXXXXXXXXXX",
+                seq=106,
+                block_len=bad,  # type: ignore[arg-type]
+            )
+
+
+def test_display_builder_addresses_the_wallbox_and_the_powerocean_apart() -> None:
+    """With two different serials the frame is the app's frame 35 with the
+    PowerOcean's serial in the header and the wallbox's in `dev_info`.
+
+    Mutation probe: swapping the two serials in the builder fails both the
+    header assertion and the frame comparison.
+    """
+    from ecoflow_energy.ecoflow.energy_stream import (
+        build_powerpulse_param_set_display_payload,
+    )
+    from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+
+    wallbox_sn, ocean_sn = "WALLBOXAAAAAAAAA", "OCEANBBBBBBBBBBB"
+    built = build_powerpulse_param_set_display_payload(
+        1,
+        1,
+        100,
+        100,
+        dev_addr=215,
+        dev_sn=wallbox_sn,
+        powerocean_sn=ocean_sn,
+        seq=106,
+        block_len=32,
+    )
+    header = decode_header_message(built)[0][0]
+    assert header["device_sn"] == ocean_sn
+    pdata = bytes.fromhex(header["pdata"])
+    assert wallbox_sn.encode() in pdata
+    assert ocean_sn.encode() not in pdata
+    app_write = _display_553_frames()[35]
+    masked = b"X" * 16
+    assert app_write.count(masked) == 2
+    assert built.index(wallbox_sn.encode()) < built.index(ocean_sn.encode())
+    assert built == app_write.replace(masked, wallbox_sn.encode(), 1).replace(
+        masked, ocean_sn.encode(), 1
+    )

@@ -1,0 +1,68 @@
+[tool.ruff]
+# The oldest runtime the integration ships to, NOT the CI interpreter. This
+# tells the formatter which syntax it may emit, and 3.14 lets it write PEP 758
+# unparenthesized except clauses, which do not parse on any older Python. HACS
+# declares a minimum of Home Assistant 2025.1.0, which runs on 3.12 and 3.13.
+target-version = "py312"
+line-length = 88
+extend-exclude = ["custom_components/ecoflow_energy/ecoflow/proto/ecocharge_pb2.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RET", "C4"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.14"
+# A function without annotations is not checked leniently, it is not checked at
+# all: the checker walks past it and says nothing. With this on, writing one is
+# itself the finding. The integration reached it with six functions to fix, so
+# it is on here and deliberately not on for the suite, where a thousand test
+# methods still carry no return annotation.
+disallow_untyped_defs = true
+ignore_missing_imports = true
+exclude = "ecocharge_pb2\\.py$"
+
+# Both module names are real. mypy computes `ecoflow_energy.*` when it is
+# pointed at custom_components/, and `custom_components.ecoflow_energy.*` when
+# it reaches the same file through a test that imports it by that path. An
+# override naming only one of them is silently inactive for the other, and the
+# gate then answers differently depending on what it was pointed at.
+[[tool.mypy.overrides]]
+module = [
+    "ecoflow_energy.ecoflow.proto.ecocharge_pb2",
+    "custom_components.ecoflow_energy.ecoflow.proto.ecocharge_pb2",
+]
+follow_imports = "skip"
+ignore_errors = true
+
+# ADR-022 decision 3: this module declares the state the coordinator mixins
+# borrow, purely for the type checker - every method ends in `...` and the
+# file is never imported at runtime. mypy's `empty-body` check flags the
+# four methods whose return type is not `None`; nothing else in the module
+# is exempted.
+[[tool.mypy.overrides]]
+module = [
+    "ecoflow_energy.coordinator._typing",
+    "custom_components.ecoflow_energy.coordinator._typing",
+]
+disable_error_code = ["empty-body"]
+
+# A test replaces a method on an instance to observe what the code under test
+# does with it. That is the point of the test, not a mistake, and it is the
+# only check switched off here: everything else the type checker reports about
+# the suite is fixed rather than silenced.
+[[tool.mypy.overrides]]
+module = ["tests.*", "conftest"]
+disable_error_code = ["method-assign"]
+# The suite still has about a thousand test methods with no return annotation,
+# and requiring them buys almost nothing: what a signature on a test method
+# would say is `-> None`, and nobody reads it.
+#
+# What does matter is the line below. Without it the checker skips the *body*
+# of every unannotated function, so a third of this suite was never looked at
+# and "no issues found" meant "none in the two thirds I read". Measured
+# 2026-09-08: turning it on surfaced ten findings in that invisible third, all
+# of shapes already fixed elsewhere. Coverage comes from here, not from the
+# annotations.
+disallow_untyped_defs = false
+check_untyped_defs = true

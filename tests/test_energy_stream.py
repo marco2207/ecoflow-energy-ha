@@ -1,0 +1,800 @@
+"""Tests for EcoFlow Protobuf encoder - EnergyStreamSwitch and SoC limit SET."""
+
+import pytest
+from ecoflow_energy.ecoflow.energy_stream import (
+    build_backup_event_set_payload,
+    build_energy_stream_activate_payload,
+    build_energy_stream_deactivate_payload,
+    build_feed_mode_set_payload,
+    build_feed_power_set_payload,
+    build_powerocean_soc_set_payload,
+    build_soc_limit_set_payload,
+    build_stream_ac_outlet_payload,
+    build_stream_backup_reserve_payload,
+    build_stream_led_brightness_payload,
+    build_stream_soc_limits_payload,
+    build_work_mode_set_payload,
+    stream_backup_reserve_floor,
+)
+from ecoflow_energy.ecoflow.proto.decoder import decode_header_message
+from ecoflow_energy.ecoflow.proto_encoding import (
+    encode_field_bytes,
+    encode_field_varint,
+    encode_varint,
+)
+
+# ===========================================================================
+# Varint / field primitives
+# ===========================================================================
+
+
+class TestVarintEncoding:
+    def test_single_byte(self):
+        assert encode_varint(0) == b"\x00"
+        assert encode_varint(1) == b"\x01"
+        assert encode_varint(127) == b"\x7f"
+
+    def test_two_bytes(self):
+        assert encode_varint(128) == b"\x80\x01"
+        assert encode_varint(300) == b"\xac\x02"
+
+    def testencode_field_varint(self):
+        # field 1, value 1 → tag=0x08, value=0x01
+        result = encode_field_varint(1, 1)
+        assert result == b"\x08\x01"
+
+    def testencode_field_bytes(self):
+        # field 1, 2-byte payload → tag=0x0a, len=2, data
+        result = encode_field_bytes(1, b"\x08\x01")
+        assert result == b"\x0a\x02\x08\x01"
+
+
+# ===========================================================================
+# EnergyStreamSwitch payloads
+# ===========================================================================
+
+
+class TestEnergyStreamPayload:
+    def test_activate_payload_structure(self):
+        payload = build_energy_stream_activate_payload(seq=12345)
+        assert isinstance(payload, bytes)
+        assert len(payload) > 0
+        # Outer wrapper: field 1 (tag=0x0a) + length-delimited
+        assert payload[0] == 0x0A
+
+    def test_deactivate_payload_structure(self):
+        payload = build_energy_stream_deactivate_payload(seq=12345)
+        assert isinstance(payload, bytes)
+        assert payload[0] == 0x0A
+
+    def test_activate_default_seq_generates_timestamp(self):
+        p1 = build_energy_stream_activate_payload()
+        p2 = build_energy_stream_activate_payload()
+        # Both should succeed (not crash)
+        assert isinstance(p1, bytes)
+        assert isinstance(p2, bytes)
+
+
+# ===========================================================================
+# SoC Limit SET payload (SysBatChgDsgSet, cmd_id=112)
+# ===========================================================================
+
+
+class TestSocLimitSetPayload:
+    def test_payload_structure(self):
+        """Payload is a valid Send_Header_Msg wrapper."""
+        payload = build_soc_limit_set_payload(95, 10, seq=99999)
+        assert isinstance(payload, bytes)
+        # Outer wrapper: field 1 tag = 0x0a
+        assert payload[0] == 0x0A
+
+    def test_deterministic_with_fixed_seq(self):
+        """Same inputs produce identical output when seq is fixed."""
+        p1 = build_soc_limit_set_payload(100, 0, seq=42)
+        p2 = build_soc_limit_set_payload(100, 0, seq=42)
+        assert p1 == p2
+
+    def test_different_values_produce_different_payload(self):
+        p1 = build_soc_limit_set_payload(100, 0, seq=42)
+        p2 = build_soc_limit_set_payload(95, 10, seq=42)
+        assert p1 != p2
+
+    def test_cmd_id_112_present(self):
+        """cmd_id=112 (field 9, varint) must be encoded in the header."""
+        payload = build_soc_limit_set_payload(100, 0, seq=1)
+        # cmd_id=112 → field 9 tag = (9<<3)|0 = 72 = 0x48, value 112 = 0x70
+        assert b"\x48\x70" in payload
+
+    def test_cmd_func_96_present(self):
+        """cmdFunc=96 (field 8, varint) must be encoded in the header."""
+        payload = build_soc_limit_set_payload(100, 0, seq=1)
+        # cmdFunc=96 → field 8 tag = (8<<3)|0 = 64 = 0x40, value 96 = 0x60
+        assert b"\x40\x60" in payload
+
+    def test_payload_contains_soc_values(self):
+        """The inner SysBatChgDsgSet message should contain both SoC fields."""
+        payload = build_soc_limit_set_payload(95, 10, seq=1)
+        # field 1 = 95 (charge upper)
+        inner_field1 = encode_field_varint(1, 95)
+        # field 2 = 10 (discharge lower)
+        inner_field2 = encode_field_varint(2, 10)
+        # Both must appear consecutively in the payload
+        assert inner_field1 + inner_field2 in payload
+
+    def test_payload_with_zero_discharge(self):
+        """Value 0 for min_discharge_soc is correctly encoded."""
+        payload = build_soc_limit_set_payload(100, 0, seq=1)
+        # field 2 = 0 must still be on the wire
+        inner_field2 = encode_field_varint(2, 0)
+        assert inner_field2 in payload
+
+    def test_default_seq_generates_timestamp(self):
+        """Default seq=0 auto-generates from current timestamp."""
+        payload = build_soc_limit_set_payload(100, 0)
+        assert isinstance(payload, bytes)
+        assert len(payload) > 10
+
+    def test_boundary_values_max(self):
+        """Max charge SoC=100 and min discharge SoC=0."""
+        payload = build_soc_limit_set_payload(100, 0, seq=1)
+        assert isinstance(payload, bytes)
+
+    def test_boundary_values_min(self):
+        """Max charge SoC=50 and min discharge SoC=30."""
+        payload = build_soc_limit_set_payload(50, 30, seq=1)
+        assert isinstance(payload, bytes)
+
+    def test_needack_is_set(self):
+        """needAck=1 (field 11, varint) must be present."""
+        payload = build_soc_limit_set_payload(100, 0, seq=1)
+        # field 11 tag = (11<<3)|0 = 88 = 0x58, value 1 = 0x01
+        assert b"\x58\x01" in payload
+
+    def test_is_rw_cmd_3(self):
+        """isRwCmd=3 (field 16, varint) must be present."""
+        payload = build_soc_limit_set_payload(100, 0, seq=1)
+        # field 16 tag = (16<<3)|0 = 128 → varint 0x80 0x01, value 3 = 0x03
+        assert b"\x80\x01\x03" in payload
+
+
+# ===========================================================================
+# PowerOcean 3-field SoC SET payload (cmd_id=112, app-replay format)
+# ===========================================================================
+
+
+class TestPowerOceanSocSetPayload:
+    """3-field SoC SET that replicates the official EcoFlow app payload."""
+
+    def test_payload_structure(self):
+        payload = build_powerocean_soc_set_payload(
+            60, 100, seq=99999, device_sn="HJ31TEST"
+        )
+        assert isinstance(payload, bytes)
+        assert payload[0] == 0x0A
+
+    def test_cmd_id_112_present(self):
+        payload = build_powerocean_soc_set_payload(60, 100, seq=1)
+        assert b"\x48\x70" in payload  # cmd_id=112
+
+    def test_pdata_contains_all_four_fields(self):
+        # field 1=100 (0x64), field 2=60 (0x3c), field 3=100 (0x64), field 4=100 (0x64)
+        # Field 3 = sys_bat_backup_ratio (EMS state, HA-Echo)
+        # Field 4 = dev_soc / socDev (App-UI state, cloud quota)
+        # Both must be set so app and device stay synchronized.
+        payload = build_powerocean_soc_set_payload(60, 100, seq=1)
+        assert b"\x08\x64\x10\x3c\x18\x64\x20\x64" in payload
+
+    def test_solar_surplus_writes_both_field_3_and_field_4(self):
+        # Regression guard: writing solar_surplus to only one of the two
+        # fields desynchronizes app and device. Field 3 alone leaves the
+        # EcoFlow app showing the previous value (cloud cache stale).
+        # Field 4 alone updates the app but leaves the EMS controller on
+        # the old threshold. Both must be present.
+        payload = build_powerocean_soc_set_payload(0, 75, seq=1)
+        # Field 3 varint tag = (3<<3)|0 = 0x18, value 75 = 0x4B
+        assert b"\x18\x4b" in payload
+        # Field 4 varint tag = (4<<3)|0 = 0x20, value 75 = 0x4B
+        assert b"\x20\x4b" in payload
+
+    def test_surplus_field_diagnostic_modes(self):
+        # The surplus_field parameter exists for diagnostic probes only.
+        # Production code paths use the default ("both"); the explicit
+        # variants exist so probe_powerocean_set.py can isolate behavior.
+        only_3 = build_powerocean_soc_set_payload(0, 75, seq=1, surplus_field="field3")
+        only_4 = build_powerocean_soc_set_payload(0, 75, seq=1, surplus_field="field4")
+        both = build_powerocean_soc_set_payload(0, 75, seq=1, surplus_field="both")
+        assert b"\x18\x4b" in only_3 and b"\x20\x4b" not in only_3
+        assert b"\x20\x4b" in only_4 and b"\x18\x4b" not in only_4
+        assert b"\x18\x4b" in both and b"\x20\x4b" in both
+
+    def test_check_type_field7_present(self):
+        # New envelope adds field 7 (check_type) = 3
+        # field 7 tag = (7<<3)|0 = 56 = 0x38, value 3 = 0x03
+        payload = build_powerocean_soc_set_payload(0, 100, seq=1)
+        assert b"\x38\x03" in payload
+
+    def test_from_ios_field23_present(self):
+        # field 23 = "ios" string. tag for length-delimited = (23<<3)|2
+        # = 186 = 0xBA 0x01 (multi-byte varint), then len 3, then "ios"
+        payload = build_powerocean_soc_set_payload(0, 100, seq=1)
+        assert b"\xba\x01\x03ios" in payload
+
+    def test_device_sn_field25_present_when_provided(self):
+        # field 25 = SN string. tag = (25<<3)|2 = 202 = 0xCA 0x01
+        sn = "HJ31TEST"
+        payload = build_powerocean_soc_set_payload(0, 100, seq=1, device_sn=sn)
+        assert b"\xca\x01" + bytes([len(sn)]) + sn.encode() in payload
+
+    def test_device_sn_omitted_when_empty(self):
+        sn_marker = b"\xca\x01"
+        payload_with_sn = build_powerocean_soc_set_payload(0, 100, seq=1, device_sn="X")
+        payload_without = build_powerocean_soc_set_payload(0, 100, seq=1, device_sn="")
+        assert sn_marker in payload_with_sn
+        assert sn_marker not in payload_without
+
+    def test_rejects_backup_above_solar(self):
+        with pytest.raises(ValueError):
+            build_powerocean_soc_set_payload(70, 60)
+
+    def test_rejects_backup_below_zero(self):
+        with pytest.raises(ValueError):
+            build_powerocean_soc_set_payload(-1, 100)
+
+    def test_rejects_solar_above_100(self):
+        with pytest.raises(ValueError):
+            build_powerocean_soc_set_payload(50, 101)
+
+    def test_equal_values_allowed(self):
+        # backup_reserve == solar_surplus is allowed (boundary)
+        payload = build_powerocean_soc_set_payload(50, 50, seq=1)
+        assert isinstance(payload, bytes)
+
+    def test_zero_zero_allowed(self):
+        payload = build_powerocean_soc_set_payload(0, 0, seq=1)
+        assert isinstance(payload, bytes)
+
+    def test_deterministic_with_fixed_seq(self):
+        p1 = build_powerocean_soc_set_payload(60, 100, seq=42, device_sn="X")
+        p2 = build_powerocean_soc_set_payload(60, 100, seq=42, device_sn="X")
+        assert p1 == p2
+
+    def test_different_values_produce_different_payload(self):
+        p1 = build_powerocean_soc_set_payload(0, 100, seq=42)
+        p2 = build_powerocean_soc_set_payload(60, 100, seq=42)
+        assert p1 != p2
+
+    def test_max_charge_field1_always_100(self):
+        # field 1 should always be 100 regardless of inputs
+        payload = build_powerocean_soc_set_payload(0, 0, seq=1)
+        # field 1 tag = 0x08, value 100 = 0x64
+        assert b"\x08\x64" in payload
+
+
+# ===========================================================================
+# Work Mode SET payload (SysWorkModeSet, cmd_id=98)
+# ===========================================================================
+
+
+class TestWorkModeSetPayload:
+    def test_payload_structure(self):
+        payload = build_work_mode_set_payload(0, seq=99999)
+        assert isinstance(payload, bytes)
+        assert payload[0] == 0x0A
+
+    def test_cmd_id_98_present(self):
+        """cmd_id=98 (field 9, varint) must be encoded in the header."""
+        payload = build_work_mode_set_payload(0, seq=1)
+        # field 9 tag = 0x48, value 98 = 0x62
+        assert b"\x48\x62" in payload
+
+    def test_cmd_func_96_present(self):
+        payload = build_work_mode_set_payload(0, seq=1)
+        assert b"\x40\x60" in payload
+
+    def test_payload_contains_work_mode_value(self):
+        # Inner pdata = field 1 varint with mode value
+        payload = build_work_mode_set_payload(2, seq=1)  # BACKUP
+        assert b"\x08\x02" in payload
+
+    def test_self_use_zero_encoded(self):
+        # WorkMode SELFUSE=0 must still be present on the wire
+        payload = build_work_mode_set_payload(0, seq=1)
+        assert b"\x08\x00" in payload
+
+    def test_ai_schedule_value(self):
+        # WorkMode AI_SCHEDULE=12
+        payload = build_work_mode_set_payload(12, seq=1)
+        assert b"\x08\x0c" in payload
+
+    def test_deterministic_with_fixed_seq(self):
+        p1 = build_work_mode_set_payload(1, seq=42)
+        p2 = build_work_mode_set_payload(1, seq=42)
+        assert p1 == p2
+
+    def test_different_modes_produce_different_payload(self):
+        p1 = build_work_mode_set_payload(0, seq=42)
+        p2 = build_work_mode_set_payload(2, seq=42)
+        assert p1 != p2
+
+    def test_rejects_negative(self):
+        with pytest.raises(ValueError):
+            build_work_mode_set_payload(-1)
+
+    def test_rejects_above_13(self):
+        with pytest.raises(ValueError):
+            build_work_mode_set_payload(14)
+
+    def test_default_seq(self):
+        payload = build_work_mode_set_payload(0)
+        assert isinstance(payload, bytes)
+
+
+# ===========================================================================
+# Feed Mode SET payload (SysFeedPowerSet field 2, cmd_id=115)
+# ===========================================================================
+
+
+class TestFeedModeSetPayload:
+    def test_payload_structure(self):
+        payload = build_feed_mode_set_payload(0, seq=99999)
+        assert isinstance(payload, bytes)
+        assert payload[0] == 0x0A
+
+    def test_cmd_id_115_present(self):
+        """cmd_id=115 (field 9, varint) must be encoded in the header."""
+        payload = build_feed_mode_set_payload(0, seq=1)
+        # field 9 tag = 0x48, value 115 = 0x73
+        assert b"\x48\x73" in payload
+
+    def test_payload_contains_feed_mode_field2(self):
+        # Inner pdata = field 2 varint
+        # field 2 varint tag = (2<<3)|0 = 0x10
+        payload = build_feed_mode_set_payload(3, seq=1)  # limit mode
+        assert b"\x10\x03" in payload
+
+    def test_off_mode_zero_encoded(self):
+        payload = build_feed_mode_set_payload(0, seq=1)
+        assert b"\x10\x00" in payload
+
+    def test_zero_feed_mode(self):
+        # mode=2 (zero-feed for RegEnergie 0%)
+        payload = build_feed_mode_set_payload(2, seq=1)
+        assert b"\x10\x02" in payload
+
+    def test_rejects_negative(self):
+        with pytest.raises(ValueError):
+            build_feed_mode_set_payload(-1)
+
+    def test_rejects_above_3(self):
+        with pytest.raises(ValueError):
+            build_feed_mode_set_payload(4)
+
+
+# ===========================================================================
+# Feed Power Limit SET payload (SysFeedPowerSet field 4, cmd_id=115)
+# ===========================================================================
+
+
+class TestFeedPowerSetPayload:
+    def test_payload_structure(self):
+        payload = build_feed_power_set_payload(800, seq=99999)
+        assert isinstance(payload, bytes)
+        assert payload[0] == 0x0A
+
+    def test_cmd_id_115_present(self):
+        payload = build_feed_power_set_payload(800, seq=1)
+        # field 9 tag = 0x48, value 115 = 0x73
+        assert b"\x48\x73" in payload
+
+    def test_payload_contains_feed_power_field4(self):
+        # field 4 varint tag = (4<<3)|0 = 0x20
+        # 800W = varint 0xA0 0x06
+        payload = build_feed_power_set_payload(800, seq=1)
+        assert b"\x20\xa0\x06" in payload
+
+    def test_zero_watts_encoded(self):
+        payload = build_feed_power_set_payload(0, seq=1)
+        assert b"\x20\x00" in payload
+
+    def test_rejects_negative(self):
+        with pytest.raises(ValueError):
+            build_feed_power_set_payload(-1)
+
+    def test_accepts_high_value(self):
+        # 10kW typical inverter ceiling
+        payload = build_feed_power_set_payload(10000, seq=1)
+        assert isinstance(payload, bytes)
+
+
+# ===========================================================================
+# Backup Event SET payload (SysBackupEventSet, cmd_id=99)
+# ===========================================================================
+
+
+class TestBackupEventSetPayload:
+    def test_payload_structure(self):
+        payload = build_backup_event_set_payload(True, 1700000000, 1700003600, seq=1)
+        assert isinstance(payload, bytes)
+        assert payload[0] == 0x0A
+
+    def test_cmd_id_99_present(self):
+        payload = build_backup_event_set_payload(True, 1700000000, 1700003600, seq=1)
+        # field 9 tag = 0x48, value 99 = 0x63
+        assert b"\x48\x63" in payload
+
+    def test_enable_field2_set(self):
+        # field 2 varint tag = 0x10, enable=true (1)
+        payload = build_backup_event_set_payload(True, 1700000000, 1700003600, seq=1)
+        assert b"\x10\x01" in payload
+
+    def test_disable_field2_zero(self):
+        # disable=false (0). start/end_ts can be 0 when disabling.
+        payload = build_backup_event_set_payload(False, 0, 0, seq=1)
+        assert b"\x10\x00" in payload
+
+    def test_rejects_inverted_window(self):
+        # When enabling, start must be < end
+        with pytest.raises(ValueError):
+            build_backup_event_set_payload(True, 1700003600, 1700000000)
+
+    def test_rejects_negative_timestamp(self):
+        with pytest.raises(ValueError):
+            build_backup_event_set_payload(True, -1, 1700000000)
+
+    def test_disable_with_zero_window_allowed(self):
+        # Disabling doesn't require valid window
+        payload = build_backup_event_set_payload(False, 0, 0, seq=1)
+        assert isinstance(payload, bytes)
+
+
+# ===========================================================================
+# Stream AC Pro Backup-Reserve SET payload (ConfigWrite field 102, cmd_id=17)
+# ===========================================================================
+
+
+def _decode_header_fields(payload: bytes) -> dict[int, list]:
+    """Decode the outer-wrapped Stream SET frame into a field-number map.
+
+    The builder returns encode_field_bytes(1, header). Unwrap field 1, then
+    walk the inner header collecting varint values and length-delimited bytes
+    per field number. Returns {field_num: [values...]} so assertions target
+    fields, not fragile raw byte offsets.
+    """
+    mv = memoryview(payload)
+    pos = 0
+    # Outer field 1 (length-delimited): tag 0x0a, then len, then header bytes.
+    tag, pos = _read_test_varint(mv, pos)
+    assert (tag >> 3) == 1 and (tag & 0x07) == 2
+    length, pos = _read_test_varint(mv, pos)
+    header = mv[pos : pos + length]
+
+    fields: dict[int, list] = {}
+    hpos = 0
+    while hpos < len(header):
+        htag, hpos = _read_test_varint(header, hpos)
+        fnum = htag >> 3
+        wtype = htag & 0x07
+        if wtype == 0:
+            val, hpos = _read_test_varint(header, hpos)
+            fields.setdefault(fnum, []).append(val)
+        elif wtype == 2:
+            flen, hpos = _read_test_varint(header, hpos)
+            fields.setdefault(fnum, []).append(header[hpos : hpos + flen].tobytes())
+            hpos += flen
+        else:  # pragma: no cover - unexpected wire type in test frame
+            raise AssertionError(f"unexpected wire type {wtype} for field {fnum}")
+    return fields
+
+
+def _read_test_varint(mv, pos: int):
+    """Minimal varint reader for the header-decode test helper."""
+    shift = 0
+    value = 0
+    while True:
+        byte = mv[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+class TestStreamBackupReservePayload:
+    """ConfigWrite { cfg_backup_reverse_soc=102 } in a cmd_func=254/cmd_id=17
+    header on the /app/ WSS topic. cmd_id=17 is the ConfigWrite SET; cmd_id=18
+    is the device reply/ack (its field-102 read-back is mapped in
+    stream_proto.py). Observed app MQTT traffic confirms the write goes out on
+    cmd_id=17 with the full ConfigWrite header (see #98)."""
+
+    # Dummy SN: 4-char prefix convention, never a real serial.
+    SN = "BK31TESTSN0000000"
+
+    def _inner_pdata(self, payload: bytes) -> bytes:
+        """Extract the inner pdata (header field 1) from a built frame."""
+        header = _decode_header_fields(payload)
+        return header[1][0]
+
+    def test_payload_structure(self):
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        assert isinstance(payload, bytes)
+        # Outer wrapper: field 1 (tag=0x0a) length-delimited
+        assert payload[0] == 0x0A
+
+    def test_cmd_id_17_present(self):
+        """cmd_id=17 (field 9, varint) must be encoded in the header (#98)."""
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert header[9] == [17]
+
+    def test_cmd_id_is_not_18_regression(self):
+        """Regression guard for #98: the SET must NOT go out on the reply id 18.
+
+        cmd_id=18 was the beta.3 regression - it is the device's reply/ack id,
+        so the device silently ignored the write. The app-verified backup
+        reserve write path is the ConfigWrite SET, cmd_id=17.
+        """
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert 18 not in header[9]
+        assert header[9] == [17]
+
+    def test_full_config_write_header_present(self):
+        """The SET must carry the complete ConfigWrite header (#98).
+
+        The Stream write reuses the hardware-verified Delta 3 ConfigWrite
+        frame, so the routing/versioning fields that were missing in the
+        earlier frame must all be present with the verified values:
+          4  d_src = 1      7  check_type = 3   17 payload_ver = 1
+          5  d_dest = 1    16  version = 3
+        """
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert header[4] == [1]  # d_src
+        assert header[5] == [1]  # d_dest
+        assert header[7] == [3]  # check_type
+        assert header[16] == [3]  # version
+        assert header[17] == [1]  # payload_ver
+
+    def test_cmd_func_254_present(self):
+        """cmd_func=254 (field 8, varint) must be encoded in the header."""
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert header[8] == [254]
+
+    def test_payload_contains_backup_soc(self):
+        """Field 102 in the pdata carries the requested backup_soc value."""
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        pdata = self._inner_pdata(payload)
+        # field 102 varint: tag = (102<<3)|0 = 816 = varint 0xb0 0x06, value 50
+        assert encode_field_varint(102, 50) in pdata
+
+    def test_device_sn_field25_present(self):
+        """device_sn is encoded as field 25 (string) in the header."""
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert header[25] == [self.SN.encode("ascii")]
+
+    def test_pdata_field_102_decodes_to_value(self):
+        """The pdata field 102 decodes back to the requested backup value.
+
+        The SET is emitted on cmd_id=17 (the ConfigWrite write path), so it is
+        deliberately NOT recognized by the (254, 18) reply read-map in
+        stream_proto.py. Verify the write value at the pdata level instead:
+        walk the inner pdata and confirm field 102 (varint) equals 50.
+        """
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        pdata = memoryview(self._inner_pdata(payload))
+        pos = 0
+        tag, pos = _read_test_varint(pdata, pos)
+        assert (tag >> 3) == 102  # field number
+        assert (tag & 0x07) == 0  # varint wire type
+        value, pos = _read_test_varint(pdata, pos)
+        assert value == 50
+        assert pos == len(pdata)  # field 102 is the only pdata content
+
+    def test_field_102_encodes_value(self):
+        """Different backup_soc values encode on field 102."""
+        payload = build_stream_backup_reserve_payload(80, self.SN, seq=1)
+        pdata = self._inner_pdata(payload)
+        assert encode_field_varint(102, 80) in pdata
+
+    def test_boundary_values(self):
+        """backup_soc=0 and =100 both produce valid payloads with field 102."""
+        for soc in (0, 100):
+            payload = build_stream_backup_reserve_payload(soc, self.SN, seq=1)
+            assert isinstance(payload, bytes)
+            pdata = self._inner_pdata(payload)
+            assert encode_field_varint(102, soc) in pdata
+
+    def test_need_ack_set(self):
+        """need_ack=1 (field 11, varint) must be present."""
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert header[11] == [1]
+
+    def test_src_and_dest_present(self):
+        """src=32 (field 2) and dest=2 (field 3) routing fields present."""
+        payload = build_stream_backup_reserve_payload(50, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+        assert header[2] == [32]
+        assert header[3] == [2]
+
+    def test_deterministic_with_fixed_seq(self):
+        p1 = build_stream_backup_reserve_payload(50, self.SN, seq=42)
+        p2 = build_stream_backup_reserve_payload(50, self.SN, seq=42)
+        assert p1 == p2
+
+    def test_different_values_produce_different_payload(self):
+        p1 = build_stream_backup_reserve_payload(50, self.SN, seq=42)
+        p2 = build_stream_backup_reserve_payload(80, self.SN, seq=42)
+        assert p1 != p2
+
+    def test_rejects_out_of_range(self):
+        with pytest.raises(ValueError):
+            build_stream_backup_reserve_payload(150, self.SN)
+        with pytest.raises(ValueError):
+            build_stream_backup_reserve_payload(-1, self.SN)
+
+
+class TestStreamBackupReserveFloor:
+    """The lowest reserve the device accepts follows the discharge limit.
+
+    Measured on a BK31 (#264): the reserve sits three points above the
+    discharge limit and rises with it. The declared floor of 3 is what the
+    entity offers, and it is the correct answer only while the limit reads 0.
+    """
+
+    def test_the_floor_sits_three_points_above_the_reported_limit(self) -> None:
+        assert stream_backup_reserve_floor(20, 3, 95) == 23
+
+    def test_the_floor_moves_with_the_limit(self) -> None:
+        floors = [stream_backup_reserve_floor(limit, 3, 95) for limit in (10, 40, 62)]
+
+        assert floors == [13, 43, 65]
+
+    def test_a_limit_at_the_bottom_reproduces_the_declared_floor(self) -> None:
+        """Which is where the declared 3 came from: three points above zero."""
+        assert stream_backup_reserve_floor(0, 3, 95) == 3
+
+    @pytest.mark.parametrize("reported", [None, "20"])
+    def test_an_unreported_limit_leaves_the_declared_floor(self, reported) -> None:
+        """Before the first telemetry frame there is nothing to derive from,
+        and a control pinned shut looks broken to the user."""
+        assert stream_backup_reserve_floor(reported, 3, 95) == 3
+
+    def test_a_reading_that_is_not_a_whole_percent_leaves_it_too(self) -> None:
+        """A different case from an absent reading, and kept apart from it.
+
+        The caller normalises with `as_known_int`, which carries an in-flight
+        40.0 through as 40 and stops only at a fraction that no percentage the
+        device reports can have.
+        """
+        assert stream_backup_reserve_floor(20.5, 3, 95) == 3
+
+    def test_the_floor_never_passes_the_ceiling(self) -> None:
+        """A discharge limit at the top of its own range would otherwise put
+        the floor above the ceiling, and Home Assistant refuses every value on
+        an inverted range."""
+        assert stream_backup_reserve_floor(95, 3, 95) == 95
+
+
+class TestStreamLedBrightnessPayload:
+    """Hardware-confirmed LED ConfigWrite shape from the AC Pro app path."""
+
+    SN = "BK31TESTSN0000000"
+
+    @pytest.mark.parametrize("brightness", [0, 10, 70, 100])
+    def test_field_384_and_ios_source(self, brightness: int) -> None:
+        payload = build_stream_led_brightness_payload(brightness, self.SN, seq=1)
+        header = _decode_header_fields(payload)
+
+        assert header[8] == [254]
+        assert header[9] == [17]
+        assert header[23] == [b"ios"]
+        assert header[1] == [encode_field_varint(384, brightness)]
+
+    @pytest.mark.parametrize("brightness", [-1, 101])
+    def test_rejects_out_of_range(self, brightness: int) -> None:
+        with pytest.raises(ValueError):
+            build_stream_led_brightness_payload(brightness, self.SN, seq=1)
+
+
+class TestStreamSocLimitsPayload:
+    """Grouped Stream SoC fields confirmed from an app MQTT capture."""
+
+    SN = "BK31TESTSN0000000"
+
+    def test_matches_the_confirmed_group_shape(self):
+        payload = build_stream_soc_limits_payload(
+            95, 20, 23, self.SN, seq=1, timestamp=1_723_456_789
+        )
+        header = _decode_header_fields(payload)
+        pdata = header[1][0]
+
+        assert header[8] == [254]
+        assert header[9] == [17]
+        assert header[23] == [b"ios"]
+        assert pdata == b"".join(
+            (
+                encode_field_varint(6, 1_723_456_789),
+                encode_field_varint(33, 95),
+                encode_field_varint(34, 20),
+                encode_field_varint(102, 23),
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("charge", "discharge", "backup"),
+        [
+            (101, 20, 23),
+            (95, -1, 23),
+            (95, 20, 101),
+            (19, 20, 23),
+        ],
+    )
+    def test_rejects_groups_the_wire_format_cannot_carry(
+        self, charge: int, discharge: int, backup: int
+    ) -> None:
+        with pytest.raises(ValueError):
+            build_stream_soc_limits_payload(
+                charge, discharge, backup, self.SN, seq=1, timestamp=1
+            )
+
+    @pytest.mark.parametrize(
+        ("charge", "discharge", "backup"),
+        [
+            (95, 20, 20),
+            (95, 20, 3),
+            (22, 20, 23),
+            (100, 0, 100),
+        ],
+    )
+    def test_accepts_any_in_range_combination_of_the_three(
+        self, charge: int, discharge: int, backup: int
+    ) -> None:
+        """Backup reserve travels as a companion, and nothing observed relates
+        it to either limit. Inventing a relation here would refuse writes the
+        device accepts."""
+        payload = build_stream_soc_limits_payload(
+            charge, discharge, backup, self.SN, seq=1, timestamp=1
+        )
+        pdata = _decode_header_fields(payload)[1][0]
+
+        assert encode_field_varint(33, charge) in pdata
+        assert encode_field_varint(34, discharge) in pdata
+        assert encode_field_varint(102, backup) in pdata
+
+    @pytest.mark.parametrize("timestamp", [-1, 0x1_0000_0000])
+    def test_rejects_non_uint32_timestamp(self, timestamp: int) -> None:
+        with pytest.raises(ValueError):
+            build_stream_soc_limits_payload(
+                95, 20, 23, self.SN, seq=1, timestamp=timestamp
+            )
+
+
+class TestStreamAcOutletPayload:
+    """ConfigWrite AC outlet fields confirmed from app MQTT captures."""
+
+    SN = "BK31TESTSN0000000"
+
+    def test_ac_outlet_1_on_field_380(self):
+        payload = build_stream_ac_outlet_payload(1, True, self.SN, seq=1)
+        assert b"\x40\xfe\x01" in payload
+        assert b"\x48\x11" in payload
+        assert b"\xe0\x17\x01" in payload
+        assert b"\xba\x01\x03ios" in payload
+        headers, _ = decode_header_message(payload)
+        assert headers[0]["from"] == "ios"
+        assert headers[0]["data_len"] == 3
+
+    def test_ac_outlet_2_on_field_381(self):
+        payload = build_stream_ac_outlet_payload(2, True, self.SN, seq=1)
+        assert b"\xe8\x17\x01" in payload
+
+    def test_ac_outlet_off_encodes_zero(self):
+        payload = build_stream_ac_outlet_payload(1, False, self.SN, seq=1)
+        assert b"\xe0\x17\x00" in payload
+
+    def test_rejects_invalid_outlet(self):
+        with pytest.raises(ValueError):
+            build_stream_ac_outlet_payload(3, True, self.SN, seq=1)

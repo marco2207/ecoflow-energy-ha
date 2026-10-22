@@ -1,0 +1,196 @@
+# Stream - Entity Reference
+
+Full list of all entities created for Stream devices.
+
+**Models:** Stream AC Pro (`BK31`), Stream Ultra (`BK11`), Stream Max (`BK41`), Stream AC (`BK51`), Stream Ultra X (`BK61`). All five share the sensor and binary-sensor set below; the hardware-confirmed writable controls are limited to the AC Pro.
+
+**The Stream Micro (`BK01`) does not.** It is a grid-tie inverter with two solar strings and no battery, and it gets a reduced set. See [Stream Micro (BK01)](#stream-micro-bk01) at the end of this page.
+
+**Totals:** 60 sensors, 2 binary sensors, 1 number. Stream AC Pro (`BK31`) adds 2 switches and 3 numbers. Eight of the 60 are *accessory* entities (PV 3 and PV 4, power, voltage, current and energy) and exist only on a unit that reports those strings.
+
+> Entities marked with *disabled* are available but hidden by default. Enable them in **Settings > Devices > EcoFlow Stream > Entities** (click the filter icon and show disabled entities).
+
+> **Both modes are supported.** Standard Mode polls the official Developer API (~30 s), Enhanced Mode uses the real-time connection (~3 s). Writable numbers require Enhanced Mode. The difference is solar detail: Standard Mode reports all four strings, Enhanced Mode reports PV 1 and PV 2 with their input voltage and current, plus the power, voltage and current of strings 3 and 4. One owner compared them with the app and reports that string 3 and string 4 are the right way round.
+
+> **Entities marked *accessory* are created only once the device actually reports that reading**, and they appear on their own the moment it does, without a restart. Solar strings 3 and 4 carry that mark: only the larger units drive them, so listing them for everyone would leave most owners with entities that can never fill. They wait for a reading above zero, because a Stream AC Pro has no such inputs and still sends both as 0. The voltage and the current wait for a non-zero reading of their own as well. A unit with an idle string input can read about 2.6 V on it, so it can show a disabled PV 3 or PV 4 Voltage entity, but no current or power for that string until it carries load. A string that is dark when Home Assistant starts shows up with its first daylight reading.
+
+---
+
+## Sensors - Battery
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| Battery SOC | % | - | enabled | State of charge (shown in device header). On two units joined by a parallel cable this is the system figure the app shows for the pair. A linked unit that does not compute the system figure shows its own battery |
+| Unit Battery SOC | % | diagnostic | disabled | This unit's own battery state of charge. On a single unit it repeats Battery SOC, which is why it is off by default |
+| Battery SOC (Precise) | % | diagnostic | disabled | High-resolution SoC |
+| Battery SoH | % | - | enabled | State of health |
+| Battery Cycles | - | - | enabled | Charge cycles the BMS has counted for this unit's pack. It tracks the lifetime energy through the pack divided by its capacity. **Enhanced Mode only.** |
+| Battery Power | W | - | enabled | This unit's own battery, positive = charging, negative = discharging. Measured at the battery (DC side) and updated about once a minute. On linked units each unit shows its own battery, not the group |
+| Battery Charge Power | W | - | enabled | Charging power of this unit's battery (always >= 0) |
+| Battery Discharge Power | W | - | enabled | Discharging power of this unit's battery (always >= 0) |
+| Battery Voltage | V | - | enabled | Pack voltage |
+| Battery Temp | C | - | enabled | Battery temperature |
+| Backup Reserve | % | diagnostic | enabled | Current reserve level (mirrors the number) |
+| Battery Charge/Discharge State | - | diagnostic | disabled | `standby`, `charging` or `discharging` |
+
+## Sensors - Solar
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| PV 1 Power | W | - | enabled | Solar string 1 |
+| PV 2 Power | W | - | enabled | Solar string 2 |
+| PV 3 Power | W | - | *accessory*, disabled | Solar string 3, larger units only. In Enhanced Mode one owner reports strings 3 and 4 match the app |
+| PV 4 Power | W | - | *accessory*, disabled | Solar string 4, larger units only. In Enhanced Mode one owner reports strings 3 and 4 match the app |
+| Solar Power | W | diagnostic | disabled | Total solar input, meter-dependent. In Enhanced Mode on linked units, only the unit that computes the system reports it, the others show unknown |
+| PV Voltage | V | diagnostic | disabled | Input voltage of string 1 |
+| PV Current | A | diagnostic | disabled | Input current of string 1 |
+| PV 2 Voltage | V | diagnostic | disabled | Input voltage of string 2 |
+| PV 2 Current | A | diagnostic | disabled | Input current of string 2 |
+| PV 3 Voltage | V | diagnostic | *accessory*, disabled | Input voltage of string 3, larger units only. Enhanced Mode only; an unused string input can read about 2.6 V |
+| PV 3 Current | A | diagnostic | *accessory*, disabled | Input current of string 3, larger units only. Enhanced Mode only |
+| PV 4 Voltage | V | diagnostic | *accessory*, disabled | Input voltage of string 4, larger units only. Enhanced Mode only; an unused string input can read about 2.6 V |
+| PV 4 Current | A | diagnostic | *accessory*, disabled | Input current of string 4, larger units only. Enhanced Mode only |
+
+## Sensors - Power Flow
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| AC Grid Connection Power | W | - | enabled | Signed grid connection ("Netz-Anschluss": negative = input, positive = output/feed-in). In Enhanced Mode on linked units, the unit that computes the system shows the system's figure and the others their own; an update that carries no system figure shows the unit's own |
+| Home Power | W | diagnostic | disabled | Total home consumption, meter-dependent. In Enhanced Mode on linked units, only the unit that computes the system reports it, the others show unknown |
+| Grid Power | W | diagnostic | disabled | Net grid power, meter-dependent. In Enhanced Mode on linked units, only the unit that computes the system reports it, the others show unknown |
+| Home From Solar | W | diagnostic | disabled | Home consumption covered by solar |
+| Home From Battery | W | diagnostic | disabled | Home consumption covered by the battery. In Enhanced Mode on linked units, only the unit that computes the system reports it, the others show unknown |
+| Home From Grid | W | diagnostic | disabled | Home consumption covered by the grid. In Enhanced Mode on linked units, only the unit that computes the system reports it, the others show unknown |
+| Grid Connection Power | W | diagnostic | disabled | Raw grid connection reading |
+| System Grid Connection Power | W | diagnostic | disabled | System-level grid connection reading. In Enhanced Mode on linked units, only the unit that computes the system reports it, the others show unknown |
+
+## Sensors - AC Output
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| AC Voltage | V | - | enabled | AC line voltage |
+| AC Current | A | - | enabled | AC line current |
+| AC Frequency | Hz | - | enabled | AC line frequency |
+| Grid Connection State | - | diagnostic | enabled | `feed_grid`, `grid_in`, `not_online` or `invalid` |
+| Feed-in Power Limit | W | diagnostic | enabled | The feed-in cap configured in the EcoFlow app (read-only here) |
+| AC Outlet 1 Power | W | diagnostic | disabled | Power drawn by outlet 1 |
+| AC Outlet 2 Power | W | diagnostic | disabled | Power drawn by outlet 2 |
+| LED Brightness | % | diagnostic | disabled | Current LED brightness |
+
+## Sensors - Device Diagnostics
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| WiFi Signal | dBm | diagnostic | disabled | Signal strength of the device's WiFi module (negative, closer to zero is better) |
+
+## Sensors - Battery Diagnostics
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| Design Capacity | mAh | diagnostic | disabled | Nominal pack capacity |
+| Remaining Capacity | mAh | - | disabled | Remaining capacity |
+| Full Capacity | mAh | - | disabled | Full charge capacity |
+| Max Cell Temp / Min Cell Temp | C | diagnostic | disabled | Cell temperature range |
+| Max MOSFET Temp | C | diagnostic | disabled | MOSFET temperature |
+| Max Cell Voltage / Min Cell Voltage | mV | diagnostic | disabled | Cell voltage range |
+
+## Sensors - Energy Dashboard
+
+| Entity | Unit | Default | Dashboard Section |
+|:---|:---:|:---:|:---|
+| Battery Charge Energy | kWh | enabled | Battery charge |
+| Battery Discharge Energy | kWh | enabled | Battery discharge |
+| Solar Energy | kWh | disabled | Solar production (needs a paired meter) |
+| Home Energy | kWh | disabled | Home consumption (needs a paired meter) |
+| PV 1 Energy to PV 4 Energy | kWh | disabled | Per-string solar production. The counters for strings 3 and 4 follow their power readings: *accessory*, so they exist only on a unit that reports those strings |
+
+Also available as disabled diagnostics: **Battery Charge Capacity** and **Battery Discharge Capacity** (Ah). These are cumulative charge counters, not energy, and are not suitable for the Energy Dashboard.
+
+> The Stream is modeled as an AC-coupled battery. For normal use select the two battery energy sensors. Solar and home energy only report meaningful values when an EcoFlow-compatible meter is paired in the app, which is why they ship disabled.
+
+---
+
+## Binary Sensors
+
+| Entity | Default | Description |
+|:---|:---:|:---|
+| AC Outlet 1 | enabled | Outlet 1 on/off state (read-only) |
+| AC Outlet 2 | enabled | Outlet 2 on/off state (read-only) |
+
+---
+
+## Switches
+
+Stream AC Pro (`BK31`) only: two switches, `AC Outlet 1` and `AC Outlet 2`, confirmed writable on live hardware. The other four models keep the read-only binary sensors above, since nothing confirms their write path.
+
+| Entity | Default | Description |
+|:---|:---:|:---|
+| AC Outlet 1 | enabled | Outlet 1 on/off control (BK31 only) |
+| AC Outlet 2 | enabled | Outlet 2 on/off control (BK31 only) |
+
+---
+
+## Numbers
+
+| Entity | Unit | Range | Step | Models | Description |
+|:---|:---:|:---:|:---:|:---|:---|
+| Max Charge SoC | % | 3 - 100 | 1 | Stream AC Pro (`BK31`) | Maximum charging SoC. **Enhanced Mode only.** |
+| Min Discharge SoC | % | 0 - 95 | 1 | Stream AC Pro (`BK31`) | Minimum discharging SoC. **Enhanced Mode only.** |
+| LED Brightness | % | 0 - 100 | 5 | Stream AC Pro (`BK31`) | LED brightness. **Enhanced Mode only.** |
+| Backup Reserve | % | 3 - 95 | 1 | All battery Stream models | Minimum SoC the system keeps in reserve. **Enhanced Mode only.** |
+
+The AC Pro holds both limits and Backup Reserve as one grouped setting, so every write carries all three. The two values you did not change are sent back exactly as the device last reported them, never as a default, and a write is refused until all three have arrived. A combination where the limits cross is rejected instead of silently changing another setting.
+
+The capture baseline showed Max Charge SoC 95%, Min Discharge SoC 20% and Backup Reserve 23% in the app, matching raw ConfigWrite fields `33=95`, `34=20` and `102=23`. Both Home Assistant controls were then exercised on the live AC Pro and confirmed in the EcoFlow app and in the telemetry the device sent afterwards. The device's immediate reply can name field `33` even when field `34` was the value that changed, so it is the telemetry that follows, not the reply, that confirms a write.
+
+The LED control reproduces the hardware-confirmed app ConfigWrite field `384` with its `from="ios"` header. The immediate reply carries the requested target, so only the subsequent live telemetry field `994` is treated as the actual brightness state.
+
+---
+
+## Notes
+
+- Every device additionally exposes 2 universal diagnostic sensors (connection status and active mode) that are not included in the totals above.
+- Solar strings 3 and 4 are reported in both modes. In Enhanced Mode they also carry input voltage and current. One owner compared them with the app and reports that string 3 and string 4 are the right way round.
+- Home, grid and total solar values depend on an EcoFlow-compatible meter being paired in the app. Without one they may be absent or misleading, so they ship as disabled diagnostics.
+- The Standard Mode values are read as plain watts. If a power reading looks off by a constant factor compared to the EcoFlow app, please report it with a diagnostics download so the scaling can be corrected.
+- Switching a device between Standard and Enhanced Mode does not duplicate entities, since both paths produce the same entity keys.
+
+---
+
+## Stream Micro (`BK01`)
+
+The Stream Micro is a grid-tie solar inverter: two solar strings, one single-phase grid connection, no battery and no AC outlets. It speaks the same protocol as the rest of the Stream family and shares this parser, but not the whole entity set.
+
+**Totals:** 25 sensor definitions, no binary sensors, no numbers. 17 are listed in the table below; the other 8 are the PV 3/4 power, voltage, current and energy sensors, which stay in the shared Stream definition list and are created only for a string that reports a reading - see the note after the table.
+
+**Enhanced Mode only.** The Stream Micro is not exposed through the EcoFlow Developer API, so it needs the EcoFlow account sign-in.
+
+## Sensors - Stream Micro (`BK01`)
+
+| Entity | Unit | Category | Default | Description |
+|:---|:---:|:---:|:---:|:---|
+| PV 1 Power | W | - | enabled | Solar string 1 |
+| PV 2 Power | W | - | enabled | Solar string 2 |
+| PV Voltage | V | diagnostic | disabled | Input voltage of string 1 |
+| PV Current | A | diagnostic | disabled | Input current of string 1 |
+| PV 2 Voltage | V | diagnostic | disabled | Input voltage of string 2 |
+| PV 2 Current | A | diagnostic | disabled | Input current of string 2 |
+| AC Voltage | V | - | enabled | AC line voltage |
+| AC Current | A | - | enabled | AC line current |
+| AC Frequency | Hz | - | enabled | AC line frequency |
+| AC Grid Connection Power | W | - | enabled | Signed grid connection ("Netz-Anschluss": negative = input, positive = output/feed-in) |
+| Grid Connection Power | W | diagnostic | disabled | Raw grid connection reading |
+| Grid Connection State | - | diagnostic | enabled | `feed_grid`, `grid_in`, `not_online` or `invalid` |
+| Feed-in Power Limit | W | diagnostic | enabled | The feed-in cap configured in the EcoFlow app (read-only here) |
+| WiFi Signal | dBm | diagnostic | disabled | Signal strength of the device's WiFi module (negative, closer to zero is better) |
+| LED Brightness | % | diagnostic | disabled | Current LED brightness |
+| PV 1 Energy | kWh | diagnostic | disabled | Per-string solar production, disabled by default (enable it for **Solar production**) |
+| PV 2 Energy | kWh | diagnostic | disabled | Per-string solar production, disabled by default (enable it for **Solar production**) |
+
+PV 3 and PV 4 are not listed here, whether power, voltage, current or energy. They are *accessory* entities across the whole Stream family, so they exist only for a string the unit reports a reading for.
+
+### What it deliberately does not get
+
+No battery entities (state of charge, health, power, voltage, temperature, capacity, charge and discharge energy), no backup reserve sensor and no backup reserve number, no AC outlet binary sensors or outlet power, and none of the meter-dependent house flow values (Solar Power, Home Power, Grid Power, Home From Solar / Battery / Grid, Home Energy, Solar Energy).
+
+Home Assistant keeps an entity in the registry once it has been created, even if a later release stops creating it. An entity this device can never fill would therefore sit at "unknown" forever on that installation, so it is not created in the first place.

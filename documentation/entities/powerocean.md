@@ -1,0 +1,413 @@
+# PowerOcean - Entity Reference
+
+Full list of all entities created for PowerOcean devices.
+
+**Serial prefixes:** `HJ31`, `HJ32`, `HJ35`, `HJ36`, `HJ37` (standard) · `J32B`, `J327`, `J329`, `J32D`, `J32E` (European variants) · `R371`, `R372`, `R373`, `R374`, `HJ3C` (PowerOcean Plus) · `HC31` (PowerOcean DC Fit, recorded in Enhanced Mode, Standard Mode untested). All share the entity set below. The HC31 may leave some grid and phase entities empty until an owner confirms what it reports.
+
+A Local (Modbus/TCP) entry for a three-phase PowerOcean creates only these shared sensors: Solar Power, Home Power, Grid Power, Battery Power, Battery Charge Power, Battery Discharge Power, Grid Import Power, Grid Export Power, Battery SOC, Battery Charge Energy, Battery Discharge Energy, Grid Frequency, Battery Packs Online (EMS), MPPT String 1 and 2 Voltage and Current, Feed Power Limit, EMS Backup Ratio and Total Battery Capacity. It has no shared binary sensors, numbers or switches. The sections marked Local Modbus Only below come on top. The serial prefix does not decide whether Local works: the inverter reports its own model, and only the three-phase PowerOcean is accepted.
+
+> **Note:** The European variants (`J327`, `J32D`, `J32E`) and the PowerOcean Plus units (`R371`, `R372`, `R373`, `R374`, `HJ3C`) are currently not exposed through the EcoFlow Developer API and therefore require Enhanced Mode. In Standard Mode these devices report error 1006 and all entities stay unavailable. Single-phase variants (`J327`, `J329`, `J32E`) report only the phases that are physically present; the remaining phase entities stay empty. Whether `J32B` and `J329` can be linked to an API key has not been tested, so Standard Mode is unproven for those prefixes.
+
+> **The heating rod readings are optional and work in Standard and Enhanced
+> Mode, not on a Local entry.** They belong to the PowerGlow accessory, so they
+> are only created once your system actually reports a heating rod. A
+> PowerOcean without one gets no heating rod entities. They are enabled by
+> default since 1.25.0; one you had disabled before stays disabled.
+> In Standard Mode they come from the API quota. With EcoFlow
+> account sign-in they arrive on the PowerOcean's real-time stream instead, in
+> one report roughly every seventeen seconds, so a PowerGlow attached to a unit
+> that only works in Enhanced Mode (`J327`, `J32D`, `J32E`, and the PowerOcean
+> Plus prefixes) should be readable as well - those units run the same parser,
+> though no capture from one with a heating rod exists yet. A rod that is off reports 0 W rather than
+> nothing, so an idle reading is a real one. If you ran an earlier 1.16.0 beta,
+> the four entities were created on every PowerOcean; leftover ones are removed
+> automatically as soon as your system reports data without a heating rod,
+> unless you had enabled them, in which case they are kept along with their
+> history.
+
+> **The wallbox readings are optional and need Enhanced Mode.** They belong to
+> a PowerPulse 1 wallbox coupled to your PowerOcean, so they are only created once
+> your system actually reports a charging session. A PowerOcean without a
+> wallbox gets no wallbox entities. Coupled to a PowerOcean the wallbox reports
+> its session through the PowerOcean rather than on its own, and that message
+> does not reach the Developer API, so it needs the EcoFlow account sign-in. All
+> five readings describe the **current charging session** and reset when the next
+> one starts, so the session energy is not a meter and is not meant for the
+> Energy Dashboard. There are no wallbox controls.
+>
+> **The PowerPulse 2 is a device of its own** and is not listed here. It
+> reports straight from the box on its own channel and needs no PowerOcean
+> at all - see [PowerPulse 2](powerpulse-2.md).
+
+> **The schedule readings are optional and need Enhanced Mode.** A PowerOcean
+> only has a schedule if you created one yourself in the EcoFlow app, and most
+> systems never do, so having no schedule entities at all is the normal case
+> and not a fault. Four entities appear for each schedule your system reports:
+> a switch that turns it on and off, its power, the time of day it runs
+> and whether it is running right now. This holds for both kinds of schedule
+> the app offers, the charge schedule and the feed-to-grid schedule, each
+> with its own entities. Every change is confirmed against the list the
+> PowerOcean sends back, so the switch shows what the device did and not
+> merely what was asked of it. The list travels on the PowerOcean's real-time
+> stream, which is why these entities need the EcoFlow account sign-in.
+>
+> **Creating and deleting a schedule stays in the EcoFlow app.** Home Assistant
+> can operate a schedule you made there, not invent one: without a way to
+> create, a delete from Home Assistant would be a one-way door. Delete one in
+> the app and its entities go back to unknown rather than staying on their last
+> value, and a write against it is refused with a message saying the schedule
+> is gone.
+>
+> Where the settings live in the app: **Settings > Automation > Schedule
+> charging and discharging**. Peak shaving sits on the same page and is a
+> different function; it limits what you draw from the grid and creates no
+> schedule.
+
+> **PowerOcean Plus** units report more of the same entity set than a standard PowerOcean: per-phase reactive power (var) and apparent power (VA), plus MPPT strings 3 and 4. Those entities are disabled by default, so enable the ones you need after adding a Plus device.
+
+**Totals:** an account entry (Standard or Enhanced Mode) has 249 sensors, 21 binary sensors, 20 numbers, 16 switches and 2 selects. A Local (Modbus/TCP) entry has 28 sensors (20 of the sensors below plus the 8 in the Local-only section), 4 binary sensors, 2 numbers and 1 switch.
+
+> Entities marked with *disabled* are available but hidden by default. Enable them in **Settings > Devices > EcoFlow PowerOcean > Entities** (click the filter icon and show disabled entities).
+
+---
+
+## Sensors - Core Power
+
+| Entity | Unit | Description |
+|:---|:---:|:---|
+| Solar Power | W | Total solar input |
+| Home Power | W | Total home consumption |
+| Grid Power | W | Net grid power (positive = import, negative = export) |
+| Battery Power | W | Net battery power (positive = charge, negative = discharge) |
+| Battery Charge Power | W | Battery charging power (always >= 0) |
+| Battery Discharge Power | W | Battery discharging power (always >= 0) |
+| Grid Import Power | W | Power drawn from grid (always >= 0) |
+| Grid Export Power | W | Power fed to grid (always >= 0) |
+
+## Sensors - Battery
+
+| Entity | Unit | Description |
+|:---|:---:|:---|
+| Battery SOC | % | State of charge (shown in device header) |
+| Battery SOH | % | State of health |
+| Battery Cycles | - | Charge cycle count (total increasing) |
+| Battery Remaining Capacity | Wh | Remaining energy across all packs |
+
+## Sensors - Energy Dashboard
+
+These sensors are pre-configured for the HA Energy Dashboard (`total_increasing`, kWh).
+
+| Entity | Dashboard Section |
+|:---|:---|
+| Solar Energy | Solar production |
+| Home Energy | Home consumption |
+| Grid Import Energy | Grid consumption |
+| Grid Export Energy | Return to grid |
+| Battery Charge Energy | Battery systems (charge) |
+| Battery Discharge Energy | Battery systems (discharge) |
+
+> **Tip:** Select "Two sensors" for battery power in the Energy Dashboard for higher accuracy.
+
+## Sensors - Battery Diagnostics (disabled)
+
+| Entity | Unit | Description |
+|:---|:---:|:---|
+| Battery Voltage | V | Pack voltage |
+| Battery Current | A | Pack current |
+| Battery Max Cell Temp | C | Highest cell temperature |
+| Battery Min Cell Temp | C | Lowest cell temperature |
+| Battery Environment Temp | C | Ambient temperature |
+| Battery Max MOSFET Temp | C | Highest MOSFET temperature |
+| Battery Cell Max Voltage | mV | Highest cell voltage |
+| Battery Cell Min Voltage | mV | Lowest cell voltage |
+| Battery Real SOC | % | Internal SOC (before calibration) |
+| Battery Real SOH | % | Internal SOH (before calibration) |
+| Battery Min SOC Limit | % | Configured minimum discharge limit |
+| Battery Max SOC Limit | % | Configured maximum charge limit |
+
+## Sensors - Grid (3-Phase)
+
+| Entity | Unit | Category | Default |
+|:---|:---:|:---:|:---:|
+| Grid Phase A/B/C Voltage | V | diagnostic | enabled |
+| Grid Phase A/B/C Active Power | W | diagnostic | enabled |
+| Grid Phase A/B/C Current | A | diagnostic | enabled |
+| Grid Phase A/B/C Reactive Power | var | diagnostic | disabled |
+| Grid Phase A/B/C Apparent Power | VA | diagnostic | disabled |
+| Grid Frequency | Hz | diagnostic | enabled |
+
+## Sensors - MPPT (Solar Strings)
+
+| Entity | Unit | Category |
+|:---|:---:|:---:|
+| MPPT String 1 Power | W | diagnostic |
+| MPPT String 1 Voltage | V | diagnostic |
+| MPPT String 1 Current | A | diagnostic |
+| MPPT String 2 Power | W | diagnostic |
+| MPPT String 2 Voltage | V | diagnostic |
+| MPPT String 2 Current | A | diagnostic |
+| MPPT String 3 Power | W | diagnostic (disabled) |
+| MPPT String 3 Voltage | V | diagnostic (disabled) |
+| MPPT String 3 Current | A | diagnostic (disabled) |
+| MPPT String 4 Power | W | diagnostic (disabled) |
+| MPPT String 4 Voltage | V | diagnostic (disabled) |
+| MPPT String 4 Current | A | diagnostic (disabled) |
+
+> **MPPT String 3 and 4** only carry data on PowerOcean Plus units (`R371`, `R372`, `R373`, `R374`, `HJ3C`), which have more than two PV inputs. They are disabled by default because ordinary PowerOcean units report two strings and would leave these entities empty.
+| PV Inverter Power | W | diagnostic (disabled) |
+
+## Sensors - EMS / System (diagnostic)
+
+| Entity | Description | Default |
+|:---|:---|:---:|
+| EMS Feed Mode | Current feed-in mode | enabled |
+| EMS Work Mode | Current operating mode | enabled |
+| Grid Status | Explicit EMS connection state: `ok` (shown as On-grid) when the grid is connected, `not_detected` (shown as Off-grid) when the system runs off-grid; unknown codes remain unknown | enabled |
+| Battery Charge/Discharge State | Current battery direction | enabled |
+| PCS Running State | Inverter running state | disabled |
+| Power Factor | Grid power factor | disabled |
+| Feed Power Limit | Max feed-in power. The effective limit the system applies after its own safety rules, also read in Local (Modbus/TCP) mode | disabled |
+| Feed Ratio | Feed-in ratio | disabled |
+| EMS Charge Upper Limit | Configured max charge SOC | disabled |
+| EMS Discharge Lower Limit | Configured min discharge SOC | disabled |
+| EMS Keep SoC | Keep-alive SoC target | disabled |
+| EMS Backup Ratio | Backup reserve ratio | disabled |
+| MPPT 1/2 Fault Code | A raw code from the device, passed through unchanged. EcoFlow publishes no meaning for the values, so nothing here translates them, and "fault" is their field name rather than a verdict. An owner tracing one unit found the code following sunrise and sunset with no alert in the EcoFlow app, which points at a producing / not producing state rather than an error. Read it as unlabelled: for automations the power reading of the string itself is the better signal. | disabled |
+| PCS AC/DC Error Code | Inverter error codes | disabled |
+| PCS AC Warning Code | Inverter warnings | disabled |
+| WiFi/Ethernet/4G Status | Connectivity status | disabled |
+| EMS LED Brightness | LED brightness setting | disabled |
+| EMS Work State | Internal work state | disabled |
+| Total Battery Capacity | System battery capacity | disabled |
+| PCS Max Output/Input Power | Inverter power limits | disabled |
+| Battery Max Charge/Discharge Power | Battery power limits | disabled |
+| Battery Packs Online | Number of packs currently reporting | disabled |
+| Battery Packs Online (EMS) | Pack count as reported by the EMS | disabled |
+| Heating Rod Power | Power drawn by an attached PowerGlow heating rod, in watts. Reported through the PowerOcean itself, so no separate device is needed. Only created on systems that report a heating rod (see note above). | enabled |
+| Heating Rod Water Temperature | Current water temperature at the heating rod, in whole degrees. | enabled |
+| Heating Rod Target Power | The power limit configured for the heating rod, in watts. | enabled |
+| Heating Rod Target Temperature | The water temperature the heating rod is set to reach. | enabled |
+| EMS Max Internal Temp | Highest of the internal temperature probes | enabled |
+| MPPT 1/2 Warning Code | MPPT warnings, separate from the fault codes. Unlabelled in the same way, and only reported on the real-time connection. | disabled |
+| AFCI Self-Test Result | Result of the arc-fault detector self-test | disabled |
+| EMS Self-Check State | Result of the system self-check | disabled |
+| System Heating State | Whether the system is heating itself | disabled |
+| SoC Calibration State | Whether a battery calibration run is active | disabled |
+| Parallel Mode | Parallel-operation topology reported by the unit | disabled |
+| Battery Limit Reason | Why the system is limiting the battery | disabled |
+| SG Ready State | Current SG Ready operating state | disabled |
+
+---
+
+## Scheduled Charge Tasks (accessory, Enhanced Mode)
+
+Created only for the schedules your system actually reports, up to eight. See the note at the top.
+
+| Entity | Type | Description | Default |
+|:---|:---:|:---|:---:|
+| Schedule 1 Enabled | Switch | Turns the schedule on and off. Reads back from the list the device sends, so it shows the state the PowerOcean actually holds | enabled |
+| Schedule 1 Charge Power | Number | The maximum power the schedule uses, in watts | enabled |
+| Schedule 1 Window | Sensor | The time of day the schedule runs, written as `20:00-20:30` | enabled |
+| Schedule 1 Running | Binary sensor | Whether the schedule is running right now. Stays off while the schedule exists but its window has not opened yet | enabled |
+
+Further schedules follow the same pattern: Schedule 2 Enabled, Schedule 2 Charge Power, and so on up to Schedule 8. The EcoFlow app itself lets you create six schedules, so six is the number a system can actually reach.
+
+Charge Power takes the same range the app offers for the same setting. It moves in steps of 100 W, its minimum is 100 W for every online battery pack your system reports (200 W with two packs), and its maximum comes from the model: 10000 W on the three-phase 10 kW unit, 8000 W on the 8 kW one, 12000 W on the 12 kW one, 6000 W on the 6 kW and single-phase units, and 29900 W on a PowerOcean Plus. A value outside that range, or one that is not a multiple of 100, is refused rather than quietly rounded.
+
+A schedule set in the app to run loads from the battery rather than to charge it keeps the same four entities, and its power is the discharge limit. Which direction a schedule has is set in the app and is not shown as an entity.
+
+---
+
+## Sensors - Parallel Pair, per Inverter (accessory, Enhanced Mode)
+
+Two PowerOcean inverters running as a parallel pair appear as one device, and Solar Power, Battery Power and Battery SOC above show the whole system. The pair also reports each inverter's own share, and these sensors carry it. They are created once the pair has reported them, so a single PowerOcean never gets them.
+
+| Entity | Unit | Description |
+|:---|:---:|:---|
+| Inverter 1 Solar Power | W | Solar input of the first inverter. Reads 0 on an inverter with no panels connected |
+| Inverter 1 Battery Power | W | Battery power of the first inverter (positive = charge, negative = discharge) |
+| Inverter 1 Battery SOC | % | Charge level of the batteries on the first inverter |
+| Inverter 2 Solar Power | W | Same for the second inverter |
+| Inverter 2 Battery Power | W | Same for the second inverter |
+| Inverter 2 Battery SOC | % | Same for the second inverter |
+
+The two inverters are numbered in the order of their serial numbers, so each keeps its number across restarts. Inverter 1 is the one whose serial sorts first; the serials are listed in the EcoFlow app.
+
+There is no grid sensor per inverter. The grid figure the pair reports per inverter is the power flowing between the two inverters, not the connection to the grid, and Grid Power stays the sensor for that.
+
+---
+
+## Sensors - Local Modbus Only
+
+These sensors exist only in a Local (Modbus/TCP) entry. Standard Mode and Enhanced Mode never create them. A three-phase PowerOcean gets the first eight; a single-phase PowerOcean (including the OCEAN 2 Single-Phase Hybrid Inverter) gets Fault Count, System Alerts and the last five, see [Single-phase PowerOcean](#single-phase-powerocean-local). The three energy counters are the device's own lifetime counters, read as the device reports them. System Battery Voltage, System Battery Current and System Battery Temp describe the whole battery system, not a single pack. System Battery Current is positive while the system charges and negative while it discharges, and System Battery Temp is the average over the battery packs.
+
+| Entity | Unit | Category | Default |
+|:---|:---:|:---:|:---:|
+| Solar Lifetime Energy | kWh | - | enabled |
+| Grid Import Lifetime Energy | kWh | - | enabled |
+| Grid Export Lifetime Energy | kWh | - | enabled |
+| Fault Count | - | diagnostic | enabled |
+| System Battery Voltage | V | - | enabled |
+| System Battery Current | A | - | enabled |
+| System Battery Temp | °C | - | enabled |
+| System Alerts | - | diagnostic | enabled |
+| Grid Voltage | V | - | enabled |
+| Grid Current | A | - | enabled |
+| Grid Net Energy Today | kWh | - | enabled |
+| Inverter Net Energy Today | kWh | - | enabled |
+| Battery Net Energy Today | kWh | - | enabled |
+
+### Single-phase PowerOcean (Local)
+
+A single-phase unit is read with the registers of EcoFlow's single-phase Modbus table only. It reports solar, home, grid and battery power, the charge level, backup reserve, battery capacity, the maximum feed power as set, the number of batteries online, the fault count, System Alerts and the three status binary sensors. Grid Voltage and Grid Current are the one phase the unit is connected to.
+
+The three "Net Energy Today" sensors are the device's own figures for the running day, net and signed as the device reports them: Grid Net Energy Today is positive for energy fed in, Inverter Net Energy Today positive for AC to DC, Battery Net Energy Today positive for charge. They are not meters, so the Energy Dashboard does not offer them; use Home Assistant's Integral helper on the power sensors there.
+
+The single-phase table has no lifetime energy counters, no grid frequency, no solar string readings, no whole-system battery voltage, current or temperature and no control heartbeat, so these entities, the Modbus Control switch and Modbus Control Active are not created.
+
+System Alerts lists the alerts the PowerOcean reports as codes separated by commas, in a fixed order and without spaces, for example `fan_failure,battery_overheating`. It shows `none` while no alert is active, and stays unknown until the PowerOcean has reported its alert state. The codes are system_shutdown, upgrade_shutdown, epo_triggered, low_power_mode, fan_failure, system_failure, battery_reverse_connection, battery_disconnected, auxiliary_power_failure, pcs_timeout, pcs_failure, igbt_self_test_failure, high_temperature_protection, battery_overheating, ntc_circuit_failure, system_reset, hardware_version_error, parallel_sync_error, low_temperature_protection, parallel_master_slave_conflict, parallel_slave_setting_error, parallel_inverter_error and parallel_meter_fault. An alert this integration does not know yet shows as `bit_` and its number. When so many alerts are active that the list would not fit in a Home Assistant state, the first ones are listed and the rest are counted at the end, for example `...,high_temperature_protection,+10`. Use it to send a notification when the state is not `none`.
+
+---
+
+## Binary Sensors - Local Modbus Only
+
+A Local (Modbus/TCP) entry also creates these three binary sensors. Standard Mode and Enhanced Mode never create them. All three come from the system status the PowerOcean reports over Modbus, so they work without the EcoFlow cloud and stay unknown until the PowerOcean has reported that status.
+
+| Entity | Description | Category | Default |
+|:---|:---|:---:|:---:|
+| Off-Grid | On while the PowerOcean runs off-grid, off while it is connected to the grid. Not a diagnostic entity, so it is available for outage automations | - | enabled |
+| System Abnormal | On while the PowerOcean reports its system status as abnormal, off while it reports normal | diagnostic | enabled |
+| Battery Connection | On while the PowerOcean reports its battery management system as connected, off while it reports it as not connected | diagnostic | enabled |
+
+---
+
+## Controls - Local Modbus Only
+
+A Local (Modbus/TCP) entry also creates these four entities. Standard Mode and Enhanced Mode never create them.
+
+| Entity | Type | Description | Default |
+|:---|:---:|:---|:---:|
+| Modbus Control | Switch | Takes control of the PowerOcean over Modbus. While it is on, the EcoFlow app is locked and does not accept changes. After you switch it off, the app stays locked for about a minute before the PowerOcean hands control back. The switch is always off after Home Assistant or the integration restarts, and it turns itself off when the PowerOcean stops answering the keep-alive messages | enabled |
+| Backup Reserve | Number | The battery charge level kept in reserve, from 0 to 100 %. It works with Modbus Control off. Home Assistant shows the value the PowerOcean holds after the write, so a change the PowerOcean does not take leaves the old value in place and reports an error | enabled |
+| Indicator Brightness | Number | The brightness of the PowerOcean's indicator light, from 0 to 100 %. Listed as a configuration entity. It works with Modbus Control off and confirms a change the same way as Backup Reserve | enabled |
+| Modbus Control Active | Binary sensor | Whether the PowerOcean itself reports that Modbus Control is active. A diagnostic entity, unknown until the PowerOcean has reported it | enabled |
+
+Backup Reserve and Indicator Brightness keep the value you wrote after Modbus Control ends. Switching Modbus Control off does not undo them. The sensor EMS Backup Ratio and the number Backup Reserve show the same device value.
+
+The PowerOcean accepts one Modbus client at a time. While this integration holds that connection, another Modbus client, for example a second integration, cannot connect. Two integrations can share the device only when both use Home Assistant's shared Modbus connection and enter the same host string.
+
+---
+
+## Feed-to-Grid Schedules (accessory, Enhanced Mode)
+
+Created only for the feed-to-grid schedules your system actually reports, up to eight. These are the schedules the app calls "feed power to grid": a time of day during which the PowerOcean exports a set power from the battery to the grid. They are a separate list from the charge schedules above, numbered on their own, so Feed Schedule 3 and Schedule 3 are two different schedules. See the note at the top.
+
+| Entity | Type | Description | Default |
+|:---|:---:|:---|:---:|
+| Feed Schedule 1 Enabled | Switch | Turns the feed-to-grid schedule on and off. Reads back from the list the device sends, so it shows the state the PowerOcean actually holds | enabled |
+| Feed Schedule 1 Export Power | Number | The power the schedule exports to the grid, in watts | enabled |
+| Feed Schedule 1 Window | Sensor | The time of day the schedule runs, written as `21:00-21:30`. A feed-to-grid schedule can have two windows, shown as `21:00-21:30, 22:00-23:00` | enabled |
+| Feed Schedule 1 Running | Binary sensor | Whether the schedule is exporting right now. Stays off while the schedule exists but its window has not opened yet | enabled |
+
+Further schedules follow the same pattern: Feed Schedule 2 Enabled, Feed Schedule 2 Export Power, and so on up to Feed Schedule 8.
+
+Export Power moves in steps of 100 W from a minimum of 100 W. Its maximum is your system's own **Feed Power Limit** once the PowerOcean has reported it (the same ceiling the app applies to this setting); until that reading arrives the slider shows 5000 W, and a write is refused rather than sent against an unknown limit. A value outside the range, or one that is not a multiple of 100, is refused rather than quietly rounded. To export nothing, switch the schedule off rather than setting the power to zero, which is a value the app never sends.
+
+The PowerOcean confirms a changed power or repeat setting with a fresh list right away. After a plain on or off it has not been seen to send one on its own, so the switch keeps the state it was set to until the next list arrives, and that list is the device's word. The days a schedule repeats on, or the single date it runs on, are set in the app and are not shown as an entity.
+
+---
+
+## Binary Sensors (diagnostic)
+
+These come from the Enhanced Mode telemetry only. All are disabled by default,
+because they say nothing while the system is healthy.
+
+| Entity | Description | Default |
+|:---|:---|:---:|
+| AFCI Fault String 1 | Arc fault detected on solar string 1 | disabled |
+| AFCI Fault String 2 | Arc fault detected on solar string 2 | disabled |
+| Battery Line Disconnected | Battery line reported as disconnected | disabled |
+| Battery Relay Fault | Battery relay failed to close | disabled |
+| SG Ready Enabled | Whether SG Ready is switched on | disabled |
+
+## Sensors - Battery Packs (up to 5x BP5000)
+
+Each battery pack creates 24 sensors (7 core + 17 diagnostic). Pack 1 core sensors are enabled by default, all others are disabled.
+
+**Core sensors per pack:**
+
+| Entity | Unit | Description |
+|:---|:---:|:---|
+| Pack N SoC | % | State of charge |
+| Pack N Power | W | Charge/discharge power |
+| Pack N SoH | % | State of health |
+| Pack N Cycles | - | Charge cycle count |
+| Pack N Voltage | V | Pack voltage |
+| Pack N Current | A | Pack current |
+| Pack N Remaining Capacity | Wh | Remaining energy |
+
+**Diagnostic sensors per pack (all disabled):**
+
+| Entity | Unit |
+|:---|:---:|
+| Pack N Max/Min Cell Temp | C |
+| Pack N Environment Temp | C |
+| Pack N Calendar/Cycle SoH | % |
+| Pack N Lifetime Charge/Discharge Energy | kWh |
+| Pack N Max MOSFET / HV MOSFET / LV MOSFET Temp | C |
+| Pack N Bus Voltage | V |
+| Pack N PTC Heater Temp | C |
+| Pack N Max/Min Cell Voltage | mV |
+| Pack N Design/Full Capacity | mAh |
+| Pack N Error Code | - |
+
+> **Multi-pack users:** Enable additional pack sensors in the entity list. Each physical BP5000 pack maps to Pack 1, Pack 2, etc.
+
+---
+
+## Heating Rod Controls (accessory, Enhanced Mode)
+
+Created once the PowerOcean reports a PowerGlow heating rod, and only with account sign-in. They are configuration entities on the PowerOcean device. Each change waits until the heating rod reports the new value back. If that report does not arrive within 20 seconds, Home Assistant shows an error and keeps the reported value. Switching from Off to Solar or Manual is two steps with 20 seconds each.
+
+| Entity | Type | Description | Default |
+|:---|:---:|:---|:---:|
+| Heating Rod Target Power | Number | The heating power the rod is limited to, in watts. The upper end follows the rod: 9000 W on an `HF33`, 6000 W on an `HF32`, 3500 W on other models | enabled |
+| Heating Rod Target Temperature | Number | The water temperature the rod heats to, from 10 to 80 °C | enabled |
+| Heating Rod Mode | Select | Off, Solar or Manual. Switching from Off to Solar or Manual sets the mode first and then switches the rod on | enabled |
+
+---
+
+## Sensors - PowerPulse Wallbox (accessory, Enhanced Mode)
+
+Created only once a coupled wallbox reports a charging session. See the note at the top. These are the PowerPulse 1; the PowerPulse 2 has [its own page](powerpulse-2.md).
+
+| Entity | Description | Default |
+|---|---|---|
+| Wallbox Charging Power | Power currently going into the vehicle, in watts | enabled |
+| Wallbox Session Energy | Energy delivered in the current charging session, in watt hours. Resets when the next session starts, so it is not a lifetime counter | enabled |
+| Wallbox Session Duration | How long the current session has been running, in seconds | enabled |
+| Wallbox Charging Status | Available, preparing, charging, paused by charger, paused by vehicle, finishing, or fault | enabled |
+| Wallbox Vehicle | The vehicle the charger has recognized. Empty until a car is identified | enabled |
+
+---
+
+## Controls
+
+| Entity | Type | Range / Options | Mode |
+|:---|:---:|:---:|:---|
+| Backup Reserve | Number | 0 - 100 % | Enhanced only |
+| Solar Surplus Threshold | Number | 0 - 100 % | Enhanced only |
+| Work Mode | Select | Self-use / AI Schedule | Enhanced only |
+| Heating Rod Target Power | Number | 0 - 9000 W (by model) | Enhanced only |
+| Heating Rod Target Temperature | Number | 10 - 80 °C | Enhanced only |
+| Heating Rod Mode | Select | Off / Solar / Manual | Enhanced only |
+
+---
+
+## Notes
+
+- All power sensors show integers (no decimal places) for clean dashboard display
+- Energy sensors show 2 decimal places (0.01 kWh resolution)
+- Enhanced Mode (~3s updates) unlocks every control (20 numbers, 16 switches, 2 selects) and faster data
+- Standard Mode (~30s polling) provides the sensors the Developer API reports. Some readings need Enhanced Mode, for example the schedules, the wallbox, the parallel pair and several diagnostics.
+- Local (Modbus/TCP, three-phase only) refreshes every 2 seconds, needs no account, and creates the shared sensors and Local-only entities listed above.
